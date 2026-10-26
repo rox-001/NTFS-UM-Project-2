@@ -1,6 +1,7 @@
 """
 alerter.py - Alert Generation & Policy Violation Notification
 Writes alerts to logs/alerts.log and prints to console (colorama).
+Supports desktop toast notification callbacks when running in Desktop App mode.
 Entirely local — no network dependency. Safe on Windows cp1252.
 """
 
@@ -23,6 +24,15 @@ _LEVEL_STYLE = {
     "CRITICAL": (Fore.RED,    "[CRIT] "),
 }
 
+# Optional desktop notification callback (registered by desktop app)
+_desktop_notifier = None
+
+
+def register_desktop_notifier(callback):
+    """Register a callback function to display native OS notifications."""
+    global _desktop_notifier
+    _desktop_notifier = callback
+
 
 def trigger_alert(level: str, message: str, event_data: dict = None):
     """
@@ -31,6 +41,7 @@ def trigger_alert(level: str, message: str, event_data: dict = None):
     - Writes to logs/alerts.log (JSON-line format)
     - Prints a formatted, color-coded message to the console
     - Prints a full banner for CRITICAL alerts
+    - Dispatches native OS notification if desktop mode is active
 
     Args:
         level:      'INFO', 'WARNING', or 'CRITICAL'
@@ -61,6 +72,13 @@ def trigger_alert(level: str, message: str, event_data: dict = None):
             print(out)
         except UnicodeEncodeError:
             print(out.encode("ascii", errors="replace").decode("ascii"))
+
+    # Native desktop toast notification for policy violations
+    if level in ("WARNING", "CRITICAL") and _desktop_notifier:
+        try:
+            _desktop_notifier(level, message, event_data or {})
+        except Exception:
+            pass
 
 
 def _print_critical_banner(message: str, event_data: dict, ts: str):
