@@ -22,8 +22,9 @@ A Python-based Blue Team security tool designed to monitor filesystem activity i
   - **System Tray Icon (`pystray`):** Runs continuously in the background near the clock; closing the window minimizes to the tray.
   - **Native Toast Notifications:** Displays Windows slide-in alert notifications for `WARNING` and `CRITICAL` events.
   - Right-click tray menu to open dashboard, pause/resume monitoring, or export audit reports.
-- **SPLUNK-Style Local Dashboard:**
+- **SPLUNK-Style Local Dashboard with Vertical Chat Reports:**
   - Local Flask web UI (`http://127.0.0.1:5000`) with auto-refreshing telemetry, searchable/filterable logs, and live alert feeds.
+  - **Interactive Incident Chat Drawer:** Clicking any log event row opens a vertical report in chat block form (System alert, Telemetry breakdown, SHA-256 hash inspection, and SOC blue-team advice).
   - Zero external network dependencies (100% localhost).
 - **Noise Suppression & Write-Burst Debouncing:**
   - Eliminates duplicate operating system write-buffer flushes during large file transfers.
@@ -74,7 +75,7 @@ A Python-based Blue Team security tool designed to monitor filesystem activity i
 ├── assets/                   # Application icons (icon.png, icon.ico)
 ├── dashboard/
 │   ├── app.py                # Local Flask server providing REST API endpoints
-│   ├── templates/index.html  # SPLUNK-inspired dashboard UI
+│   ├── templates/index.html  # SPLUNK-inspired dashboard UI with vertical chat drawer
 │   └── static/style.css      # Dark-mode dashboard stylesheet
 ├── logs/                     # Audit & alert logs (audit.log, alerts.log)
 ├── reports/                  # Generated summary and violation reports
@@ -118,6 +119,7 @@ python app_desktop.py
 * Adds a shield icon to the **Windows System Tray** (near the taskbar clock).
 * Minimizing or closing the window keeps monitoring active in the background.
 * Triggers native **Windows Toast Notifications** whenever a suspicious file event occurs.
+* Clicking any log row opens the **Vertical Incident Report Drawer in chat block form**.
 
 ### 2. Start Headless Monitoring (Console Only)
 ```bash
@@ -139,6 +141,27 @@ Compiles a structured report in the `reports/` directory containing summary metr
 ### 5. Verify Single File Hash
 ```bash
 python main.py --test-hash "path/to/file.docx"
+```
+
+---
+
+## 🛑 How to Stop / Exit the Program
+
+### When Running the Desktop App (`--desktop`):
+Because security monitors are designed to protect files continuously, clicking the window's close (`X`) button **minimizes the app to the system tray** instead of killing it.
+
+To fully quit:
+1. Locate the **FileSentinel shield icon** in the Windows Taskbar Notification Tray (bottom-right near the clock; click `^` if hidden).
+2. Right-click the shield icon and select **Exit FileSentinel**.
+3. *(Or press `Ctrl + C` in the PowerShell/terminal window where you launched it).*
+
+### When Running in Terminal Mode (`--monitor`):
+* Press **`Ctrl + C`** in your PowerShell or Command Prompt window. The watchdog observer will flush any remaining logs and shut down gracefully.
+
+### Emergency Force-Stop:
+If you need to force-terminate all running Python monitoring processes from PowerShell:
+```powershell
+Stop-Process -Name python -Force
 ```
 
 ---
