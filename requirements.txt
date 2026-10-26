@@ -1,0 +1,8 @@
+# Secure File Transfer Monitoring System - Dependencies
+# hashlib is a Python built-in - NOT listed here, no install needed
+
+watchdog>=3.0.0        # Filesystem event monitoring
+psutil>=5.9.0          # Process tracking (optional - for process name lookup)
+flask>=3.0.0           # Local web dashboard (no internet required)
+tabulate>=0.9.0        # Formatted tables in reports
+colorama>=0.4.6        # Colored console output (always-on, works without network)

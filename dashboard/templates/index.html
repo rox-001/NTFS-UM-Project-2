@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>SecureMonitor — File Transfer Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+
+<!-- ═══════════════════════════════ TOP NAV ═══════════════════════════════ -->
+<header class="top-bar">
+  <div class="top-bar-inner">
+    <div class="logo-area">
+      <span class="logo-icon">🛡</span>
+      <span class="logo-text">SecureMonitor</span>
+      <span class="logo-sub">File Transfer DLP</span>
+    </div>
+    <div class="status-area">
+      <span class="status-dot" id="statusDot"></span>
+      <span class="status-label" id="statusLabel">Connecting…</span>
+      <span class="refresh-label">Auto-refresh: 5s</span>
+    </div>
+  </div>
+</header>
+
+<!-- ═══════════════════════════════ MAIN LAYOUT ═══════════════════════════ -->
+<div class="layout">
+
+  <!-- ─── LEFT SIDEBAR: Alerts ─── -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <span>🚨 Live Alerts</span>
+      <span class="badge" id="alertCount">0</span>
+    </div>
+    <div class="alert-feed" id="alertFeed">
+      <div class="alert-empty">No alerts yet.</div>
+    </div>
+  </aside>
+
+  <!-- ─── MAIN CONTENT ─── -->
+  <main class="main-content">
+
+    <!-- Stats Cards -->
+    <section class="stats-row">
+      <div class="stat-card total">
+        <div class="stat-icon">📋</div>
+        <div class="stat-body">
+          <div class="stat-value" id="statTotal">0</div>
+          <div class="stat-label">Total Events</div>
+        </div>
+      </div>
+      <div class="stat-card info">
+        <div class="stat-icon">ℹ</div>
+        <div class="stat-body">
+          <div class="stat-value" id="statInfo">0</div>
+          <div class="stat-label">INFO</div>
+        </div>
+      </div>
+      <div class="stat-card warning">
+        <div class="stat-icon">⚠</div>
+        <div class="stat-body">
+          <div class="stat-value" id="statWarning">0</div>
+          <div class="stat-label">WARNINGS</div>
+        </div>
+      </div>
+      <div class="stat-card critical">
+        <div class="stat-icon">🔴</div>
+        <div class="stat-body">
+          <div class="stat-value" id="statCritical">0</div>
+          <div class="stat-label">CRITICAL</div>
+        </div>
+      </div>
+      <div class="stat-card tampered">
+        <div class="stat-icon">🔐</div>
+        <div class="stat-body">
+          <div class="stat-value" id="statTampered">0</div>
+          <div class="stat-label">Tampered</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Filter Bar -->
+    <section class="filter-bar">
+      <input type="text"  id="searchInput"  class="filter-input" placeholder="🔍  Search source, destination, event type…" />
+      <select id="levelFilter" class="filter-select">
+        <option value="">All Levels</option>
+        <option value="INFO">INFO</option>
+        <option value="WARNING">WARNING</option>
+        <option value="CRITICAL">CRITICAL</option>
+      </select>
+      <button class="btn-refresh" id="btnRefresh" onclick="fetchAll()">↺ Refresh</button>
+    </section>
+
+    <!-- Log Table -->
+    <section class="table-section">
+      <div class="table-header-row">
+        <span class="table-title">Event Log</span>
+        <span class="table-meta" id="tableMeta">Loading…</span>
+      </div>
+      <div class="table-wrapper">
+        <table id="logTable">
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Level</th>
+              <th>Event</th>
+              <th>Source</th>
+              <th>Destination</th>
+              <th>User</th>
+              <th>Hash Pre</th>
+              <th>Hash Post</th>
+              <th>Integrity</th>
+            </tr>
+          </thead>
+          <tbody id="logBody">
+            <tr><td colspan="9" class="empty-row">No events yet. Start monitoring to see data.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Pagination -->
+      <div class="pagination" id="pagination"></div>
+    </section>
+
+  </main>
+</div>
+
+<!-- ═════════════════════════════ JAVASCRIPT ══════════════════════════════ -->
+<script>
+  let currentPage   = 1;
+  let refreshTimer  = null;
+  let isConnected   = false;
+
+  // ── Fetch everything ────────────────────────────────────────────────────
+  async function fetchAll() {
+    await Promise.all([fetchStats(), fetchLogs(), fetchAlerts()]);
+  }
+
+  // ── Stats ────────────────────────────────────────────────────────────────
+  async function fetchStats() {
+    try {
+      const res  = await fetch("/api/stats");
+      const data = await res.json();
+      document.getElementById("statTotal").textContent    = data.total    ?? 0;
+      document.getElementById("statInfo").textContent     = data.info     ?? 0;
+      document.getElementById("statWarning").textContent  = data.warning  ?? 0;
+      document.getElementById("statCritical").textContent = data.critical  ?? 0;
+      document.getElementById("statTampered").textContent = data.integrity_tampered ?? 0;
+      setConnected(true);
+    } catch (e) {
+      setConnected(false);
+    }
+  }
+
+  // ── Logs ─────────────────────────────────────────────────────────────────
+  async function fetchLogs(page = currentPage) {
+    const level   = document.getElementById("levelFilter").value;
+    const keyword = document.getElementById("searchInput").value.trim();
+    let url = `/api/logs?page=${page}`;
+    if (level)   url += `&level=${encodeURIComponent(level)}`;
+    if (keyword) url += `&keyword=${encodeURIComponent(keyword)}`;
+
+    try {
+      const res  = await fetch(url);
+      const data = await res.json();
+      renderLogs(data.logs);
+      renderPagination(data.page, data.total_pages, data.total);
+      document.getElementById("tableMeta").textContent =
+        `Showing ${data.logs.length} of ${data.total} events`;
+    } catch (e) {
+      document.getElementById("tableMeta").textContent = "Could not load logs.";
+    }
+  }
+
+  function renderLogs(logs) {
+    const tbody = document.getElementById("logBody");
+    if (!logs || logs.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="9" class="empty-row">No matching events.</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = logs.map(e => `
+      <tr class="row-${(e.alert_level||"INFO").toLowerCase()}">
+        <td class="mono ts">${(e.timestamp||"").slice(0,19).replace("T"," ")}</td>
+        <td><span class="badge-level ${(e.alert_level||"INFO").toLowerCase()}">${e.alert_level||"—"}</span></td>
+        <td><span class="event-type">${e.event_type||"—"}</span></td>
+        <td class="mono path" title="${e.source||""}">${truncate(e.source||"", 45)}</td>
+        <td class="mono path" title="${e.destination||""}">${truncate(e.destination||"—", 35)}</td>
+        <td>${e.user||"—"}</td>
+        <td class="mono hash" title="${e.hash_pre||""}">${shortHash(e.hash_pre)}</td>
+        <td class="mono hash" title="${e.hash_post||""}">${shortHash(e.hash_post)}</td>
+        <td><span class="integrity-badge ${(e.integrity_status||"").toLowerCase()}">${e.integrity_status||"—"}</span></td>
+      </tr>
+    `).join("");
+  }
+
+  function renderPagination(page, totalPages, total) {
+    currentPage = page;
+    const el = document.getElementById("pagination");
+    if (totalPages <= 1) { el.innerHTML = ""; return; }
+
+    let html = "";
+    if (page > 1) html += `<button onclick="fetchLogs(${page-1})">‹ Prev</button>`;
+    html += `<span class="page-info">Page ${page} / ${totalPages}</span>`;
+    if (page < totalPages) html += `<button onclick="fetchLogs(${page+1})">Next ›</button>`;
+    el.innerHTML = html;
+  }
+
+  // ── Alerts ───────────────────────────────────────────────────────────────
+  async function fetchAlerts() {
+    try {
+      const res    = await fetch("/api/alerts?limit=30");
+      const alerts = await res.json();
+      const feed   = document.getElementById("alertFeed");
+      document.getElementById("alertCount").textContent = alerts.length;
+
+      if (alerts.length === 0) {
+        feed.innerHTML = `<div class="alert-empty">No alerts yet.</div>`;
+        return;
+      }
+      feed.innerHTML = alerts.map(a => `
+        <div class="alert-item ${(a.level||"INFO").toLowerCase()}">
+          <div class="alert-ts">${(a.timestamp||"").slice(0,19).replace("T"," ")}</div>
+          <div class="alert-level">${a.level||""}</div>
+          <div class="alert-msg">${a.message||""}</div>
+          ${a.event_data && a.event_data.source ? `<div class="alert-src">${truncate(a.event_data.source,40)}</div>` : ""}
+        </div>
+      `).join("");
+    } catch (e) { /* sidebar alert failure is non-critical */ }
+  }
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
+  function truncate(str, n) {
+    if (!str) return "—";
+    return str.length > n ? "…" + str.slice(-(n-1)) : str;
+  }
+
+  function shortHash(h) {
+    if (!h || h === "N/A") return "N/A";
+    return h.length > 12 ? h.slice(0, 8) + "…" + h.slice(-4) : h;
+  }
+
+  function setConnected(ok) {
+    isConnected = ok;
+    document.getElementById("statusDot").className   = "status-dot " + (ok ? "online" : "offline");
+    document.getElementById("statusLabel").textContent = ok ? "Monitoring Active" : "Disconnected";
+  }
+
+  // ── Search / filter listeners ─────────────────────────────────────────────
+  let searchDebounce;
+  document.getElementById("searchInput").addEventListener("input", () => {
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(() => fetchLogs(1), 400);
+  });
+  document.getElementById("levelFilter").addEventListener("change", () => fetchLogs(1));
+
+  // ── Auto-refresh every 5 seconds ──────────────────────────────────────────
+  function startRefresh() {
+    fetchAll();
+    refreshTimer = setInterval(fetchAll, 5000);
+  }
+
+  startRefresh();
+</script>
+</body>
+</html>

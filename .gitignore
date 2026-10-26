@@ -1,0 +1,19 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Application runtime logs and reports
+logs/*.log
+reports/*.txt
+
+# OS metadata
+desktop.ini
+thumbs.db
+.DS_Store
+
+# Virtual environment / IDE
+venv/
+.env
+.vscode/
+.idea/
