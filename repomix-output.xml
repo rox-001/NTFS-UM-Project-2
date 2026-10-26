@@ -1,0 +1,2620 @@
+This file is a merged representation of the codebase, packed into a single document by Repomix format.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily readable by AI systems for analysis, code review,
+documentation, or automated task evaluation.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. File summary
+2. Directory structure
+3. Multiple file entries, each with file path and full content
+</file_format>
+
+<usage_guidelines>
+- Use this consolidated document to understand repository architecture, implementation details, and test suites.
+</usage_guidelines>
+</file_summary>
+
+<directory_structure>
+NTFS UM Project 2/
+├── .gitignore
+├── README.md
+├── repomix.config.json
+├── requirements.txt
+├── config.py
+├── main.py
+├── monitor.py
+├── detector.py
+├── hasher.py
+├── logger.py
+├── alerter.py
+├── reporter.py
+├── dashboard/
+│   ├── __init__.py
+│   ├── app.py
+│   ├── static/
+│   │   └── style.css
+│   └── templates/
+│       └── index.html
+└── tests/
+    ├── __init__.py
+    ├── test_detector.py
+    ├── test_hasher.py
+    └── test_integration.py
+</directory_structure>
+
+<files>
+<file path="README.md">
+# Secure File Transfer Monitoring System (Blue Team DLP & Integrity Checker)
+
+A Python-based Blue Team security tool designed to monitor filesystem activity in real time, detect unauthorized movement of sensitive or restricted files, verify file integrity via cryptographic hashing (SHA-256), generate policy alerts, and stream security telemetry to a local SPLUNK-style dashboard.
+
+---
+
+## 🎯 Objectives & Capabilities
+
+- **Real-Time Filesystem Monitoring:** Tracks `CREATED`, `MODIFIED`, `MOVED`, and `DELETED` file events across configured target directories.
+- **Unauthorized Movement & Exfiltration Detection:**
+  - Maintains strict policy lists of sensitive directories and high-risk file types.
+  - Detects suspicious outbound transfer vectors (USB / removable media, UNC network shares, cloud storage sync folders).
+- **Cryptographic File Integrity Verification:**
+  - Computes pre- and post-transfer hash digests (SHA-256 / SHA-512 / MD5) using Python's built-in `hashlib`.
+  - Flags tampering, corruption, or unexpected content alterations (`INTACT` vs `TAMPERED`).
+- **Telemetry, Alerting & Audit Logging:**
+  - 3-tier severity classification: `INFO`, `WARNING`, `CRITICAL`.
+  - Structured, machine-readable JSON-line audit logs in `logs/audit.log`.
+  - Real-time terminal alerts via `colorama` with high-visibility banners for policy violations.
+- **SPLUNK-Style Local Dashboard:**
+  - Local Flask web UI (`http://127.0.0.1:5000`) with auto-refreshing telemetry, searchable/filterable logs, and live alert feeds.
+  - Zero external network dependencies (100% localhost).
+- **Noise Suppression & Write-Burst Debouncing:**
+  - Eliminates duplicate operating system write-buffer flushes during large file transfers.
+  - Prevents recursive log feedback loops.
+
+---
+
+## 🏗️ Architecture & Workflow
+
+```
+[ Filesystem Event ] (watchdog)
+        │
+        ▼
+[ Noise & Internal Filter ] ──> Ignore own logs, .git, OS metadata (~$*, .tmp, desktop.ini)
+        │
+        ▼
+[ Write-Burst Debounce ] ────> Suppress rapid OS buffer flushes within debounce window
+        │
+        ▼
+[ Event Classification ] ────> Check Sensitive Extensions / Directories & Suspicious Destinations
+        │                       ├── CRITICAL: Sensitive file moved to USB/Cloud/Network or Deleted
+        │                       ├── WARNING : Sensitive file Created/Modified
+        │                       └── INFO    : Normal file activity
+        │
+        ▼
+[ Integrity Hashing ] ───────> Compute SHA-256 (pre/post transfer comparison)
+        │
+        ├───> [ Structured Logger ] ───> logs/audit.log (JSON Lines) + Console
+        ├───> [ Alerter ] ─────────────> logs/alerts.log + Terminal Banner
+        └───> [ Web Dashboard ] ────────> http://localhost:5000 (Live SPLUNK View)
+```
+
+---
+
+## 📁 Project Structure
+
+```
+├── config.py                 # Central configuration (monitored paths, policies, thresholds)
+├── monitor.py                # Watchdog filesystem observer & debouncing pipeline
+├── detector.py               # Classification logic for sensitive files and exfiltration paths
+├── hasher.py                 # Cryptographic hashing & pre/post transfer integrity verification
+├── logger.py                 # Structured JSON audit logging & console output
+├── alerter.py                # Policy violation alerting & banner generation
+├── reporter.py               # Automated audit report generator
+├── main.py                   # Central CLI entry point
+├── dashboard/
+│   ├── app.py                # Local Flask server providing REST API endpoints
+│   ├── templates/index.html  # SPLUNK-inspired dashboard UI
+│   └── static/style.css      # Dark-mode dashboard stylesheet
+├── logs/                     # Audit & alert logs (audit.log, alerts.log)
+├── reports/                  # Generated summary and violation reports
+├── tests/                    # Automated test suite (43 unit & integration tests)
+└── requirements.txt          # Python dependencies
+```
+
+---
+
+## 🚀 Installation & Requirements
+
+### Prerequisites
+- Python 3.9+ (Python 3.10+ recommended)
+- Standard pip package manager
+
+### Setup
+```bash
+# Clone the repository
+git clone https://github.com/rox-001/NTFS-UM-Project-2.git
+cd NTFS-UM-Project-2
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+> **Note:** Cryptographic hashing relies on Python's built-in `hashlib` standard library module, requiring zero third-party downloads or external API access.
+
+---
+
+## ⚙️ Configuration
+
+All monitoring rules and policies are customized in [`config.py`](config.py):
+
+### 1. Monitored Target Folders
+```python
+MONITORED_DIRECTORIES = [
+    os.path.expanduser("~/Desktop"),
+    os.path.expanduser("~/Documents"),
+    os.path.expanduser("~/Downloads"),
+    # Add custom directories:
+    # r"C:\Data\Transfers",
+]
+```
+
+### 2. Sensitive File Criteria
+```python
+SENSITIVE_EXTENSIONS = [
+    ".key", ".pem", ".pfx", ".docx", ".xlsx", ".pdf",
+    ".db", ".sqlite", ".sql", ".csv", ".json", ".env",
+]
+
+SENSITIVE_DIRECTORIES = [
+    # Dedicated restricted directories:
+    # r"C:\ConfidentialData",
+]
+```
+
+### 3. Suspicious Exfiltration Destinations
+```python
+SUSPICIOUS_DRIVE_LETTERS = ["D:\\", "E:\\", "F:\\", "G:\\"]  # Removable drives
+SUSPICIOUS_PATH_KEYWORDS = ["OneDrive", "Dropbox", "Google Drive", "iCloud", "Temp"]
+SUSPICIOUS_NETWORK_PREFIXES = ["\\\\"]  # UNC network shares
+```
+
+---
+
+## 💻 Usage
+
+### 1. Start Monitoring (Terminal Only)
+```bash
+python main.py --monitor
+```
+
+### 2. Start Monitoring with SPLUNK-Style Web Dashboard
+```bash
+python main.py --monitor --dashboard
+```
+Open your browser and navigate to:
+```
+http://127.0.0.1:5000
+```
+Features:
+- Real-time event log table with color-coded severity badges.
+- Live alert feed in the side panel.
+- Summary telemetry cards: Total Events, INFO, WARNINGS, CRITICAL, Tampered Files.
+- Instant search and severity filtering without reloading the page.
+
+### 3. Generate Security Audit Report
+```bash
+python main.py --report
+```
+Compiles a structured report in the `reports/` directory containing summary metrics, policy violation breakdown, and chronological logs.
+
+### 4. Verify Single File Hash
+```bash
+python main.py --test-hash "path/to/file.docx"
+```
+
+---
+
+## 🧪 Testing
+
+Run the automated test suite (43 unit & integration tests):
+```bash
+python -m pytest tests -v
+```
+
+---
+
+## 🛡️ Blue Team Security Techniques Implemented
+
+- **Data Loss Prevention (DLP):** Tracks unauthorized movement of corporate and confidential file types to external endpoints.
+- **Tamper Detection:** Computes cryptographic pre/post hashes to verify that transferred files have not been modified or corrupted in transit.
+- **Insider Threat Monitoring:** Captures operating system username and triggering process metadata for every file transfer event.
+- **Air-Gapped & Offline Ready:** Built completely self-contained with no external cloud API dependencies.
+
+</file>
+
+<file path="requirements.txt">
+# Secure File Transfer Monitoring System - Dependencies
+# hashlib is a Python built-in - NOT listed here, no install needed
+
+watchdog>=3.0.0        # Filesystem event monitoring
+psutil>=5.9.0          # Process tracking (optional - for process name lookup)
+flask>=3.0.0           # Local web dashboard (no internet required)
+tabulate>=0.9.0        # Formatted tables in reports
+colorama>=0.4.6        # Colored console output (always-on, works without network)
+
+</file>
+
+<file path="repomix.config.json">
+{
+  "$schema": "https://repomix.com/schemas/repomix.config.json",
+  "output": {
+    "filePath": "repomix-output.xml",
+    "style": "xml",
+    "removeComments": false,
+    "removeEmptyLines": false,
+    "showLineNumbers": true,
+    "topFiles": [
+      "README.md",
+      "main.py",
+      "config.py",
+      "monitor.py",
+      "detector.py",
+      "hasher.py",
+      "logger.py",
+      "alerter.py",
+      "reporter.py",
+      "dashboard/app.py",
+      "requirements.txt"
+    ]
+  },
+  "include": [
+    "**/*"
+  ],
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      "logs/**",
+      "reports/**",
+      "__pycache__/**",
+      "*.pyc",
+      "desktop.ini",
+      "thumbs.db"
+    ]
+  }
+}
+
+</file>
+
+<file path="config.py">
+"""
+config.py - Central Configuration for Secure File Transfer Monitoring System
+Adjust these values to match your environment before running.
+"""
+
+import os
+
+# =============================================================================
+# MONITORING TARGETS
+# Directories to watch for file events. Add all paths you want monitored.
+# =============================================================================
+MONITORED_DIRECTORIES = [
+    os.path.expanduser("~/Desktop"),
+    os.path.expanduser("~/Documents"),
+    os.path.expanduser("~/Downloads"),
+    # Add more paths as needed, e.g.:
+    # "C:\\SensitiveData",
+    # "D:\\Projects",
+]
+
+# =============================================================================
+# SENSITIVE FILE CRITERIA
+# Files matching these extensions or located in dedicated sensitive directories
+# are treated as sensitive and will trigger higher-severity alerts (WARNING / CRITICAL).
+# =============================================================================
+SENSITIVE_EXTENSIONS = [
+    ".key", ".pem", ".pfx", ".p12",          # Cryptographic keys / certs
+    ".docx", ".xlsx", ".pptx", ".pdf",       # Office documents
+    ".db", ".sqlite", ".sql",                 # Databases
+    ".csv", ".json", ".xml",                  # Data files
+    ".py", ".sh", ".bat", ".ps1",            # Scripts
+    ".zip", ".rar", ".tar", ".gz", ".7z",   # Archives (potential exfil containers)
+    ".env", ".cfg", ".ini", ".conf",         # Config / secrets
+    ".bak", ".backup",                        # Backup files
+]
+
+# Dedicated directories containing confidential or restricted data.
+# Note: Do NOT list your entire general Desktop or user root here,
+# otherwise every non-sensitive file inside it will trigger sensitivity alerts.
+SENSITIVE_DIRECTORIES = [
+    # Add your specific high-security folders here, for example:
+    # "C:\\SensitiveData",
+    # os.path.expanduser("~/Documents/Confidential"),
+]
+
+# =============================================================================
+# IGNORED FILES & SYSTEM NOISE
+# These files/patterns are automatically ignored to prevent log flooding.
+# =============================================================================
+IGNORED_EXTENSIONS = [
+    ".tmp", ".crdownload", ".part", ".lock", ".swp",
+]
+
+IGNORED_FILENAMES = [
+    "desktop.ini", "thumbs.db", ".ds_store",
+]
+
+# =============================================================================
+# SUSPICIOUS DESTINATIONS
+# Transfers to these destinations trigger CRITICAL alerts.
+# These represent common data exfiltration vectors.
+# =============================================================================
+SUSPICIOUS_DRIVE_LETTERS = ["D:\\", "E:\\", "F:\\", "G:\\", "H:\\"]  # USB / external drives
+
+SUSPICIOUS_PATH_KEYWORDS = [
+    "OneDrive", "Dropbox", "Google Drive", "iCloud",  # Cloud sync folders
+    "RECYCLER", "$Recycle.Bin",                         # Recycle bin (deletion hiding)
+    "Temp", "tmp",                                       # Temp (staging for exfil)
+]
+
+SUSPICIOUS_NETWORK_PREFIXES = [
+    "\\\\",     # UNC network paths (\\server\share)
+]
+
+# =============================================================================
+# ALERT LEVELS
+# =============================================================================
+ALERT_LEVELS = {
+    "INFO":     "INFO",
+    "WARNING":  "WARNING",
+    "CRITICAL": "CRITICAL",
+}
+
+# =============================================================================
+# LOGGING & OUTPUT PATHS
+# =============================================================================
+BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR         = os.path.join(BASE_DIR, "logs")
+REPORT_DIR      = os.path.join(BASE_DIR, "reports")
+
+AUDIT_LOG_PATH  = os.path.join(LOG_DIR, "audit.log")
+ALERT_LOG_PATH  = os.path.join(LOG_DIR, "alerts.log")
+
+# =============================================================================
+# HASHING
+# hashlib is a Python built-in module — no installation required.
+# Supported algorithms: 'sha256', 'sha512', 'md5'
+# =============================================================================
+HASH_ALGORITHM  = "sha256"   # Recommended: sha256
+HASH_CHUNK_SIZE = 65536      # 64KB chunks for reading large files efficiently
+
+# =============================================================================
+# DASHBOARD SETTINGS
+# Flask runs completely locally on localhost — no internet required.
+# =============================================================================
+DASHBOARD_ENABLED   = True
+DASHBOARD_HOST      = "127.0.0.1"
+DASHBOARD_PORT      = 5000
+DASHBOARD_DEBUG     = False
+LOGS_PER_PAGE       = 50     # Number of log entries shown per page
+
+# =============================================================================
+# PROCESS TRACKING (requires psutil)
+# If psutil is unavailable, process name is logged as 'N/A'
+# =============================================================================
+ENABLE_PROCESS_TRACKING = True
+
+</file>
+
+<file path="main.py">
+"""
+main.py - Secure File Transfer Monitoring System — Entry Point
+Usage:
+  python main.py --monitor              # Monitor + colorama console (no dashboard)
+  python main.py --monitor --dashboard  # Monitor + console + SPLUNK web dashboard
+  python main.py --dashboard-only       # Dashboard only (view existing logs)
+  python main.py --report               # Generate text audit report
+  python main.py --test-hash <file>     # Compute and print hash of a file
+"""
+
+import argparse
+import sys
+import os
+import threading
+import time
+
+# Ensure parent directory is importable
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from logger import print_banner
+from monitor import FileMonitor
+from hasher import compute_hash
+from reporter import generate_report
+from config import DASHBOARD_HOST, DASHBOARD_PORT, HASH_ALGORITHM
+
+
+def cmd_monitor(with_dashboard: bool):
+    """Start filesystem monitoring with optional dashboard."""
+    print_banner()
+    monitor = FileMonitor()
+
+    if with_dashboard:
+        _launch_dashboard_thread()
+
+    try:
+        monitor.start()
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        monitor.stop()
+        print("\n  Logs saved. Run 'python main.py --report' for a full audit report.")
+
+
+def cmd_dashboard_only():
+    """Launch dashboard without starting the file monitor."""
+    print_banner()
+    print("  [Dashboard-only mode] File monitoring is NOT active.\n")
+    _launch_dashboard_blocking()
+
+
+def cmd_report():
+    """Generate and print a text audit report."""
+    print_banner()
+    generate_report()
+
+
+def cmd_test_hash(filepath: str):
+    """Compute and display the hash of a single file."""
+    if not os.path.isfile(filepath):
+        print(f"  [ERROR] File not found: {filepath}")
+        sys.exit(1)
+
+    digest = compute_hash(filepath, HASH_ALGORITHM)
+    size   = os.path.getsize(filepath)
+    print(f"\n  File      : {filepath}")
+    print(f"  Size      : {size:,} bytes")
+    print(f"  Algorithm : {HASH_ALGORITHM.upper()}")
+    print(f"  Hash      : {digest}\n")
+
+
+def _launch_dashboard_thread():
+    """Start the Flask dashboard in a background daemon thread."""
+    try:
+        from dashboard.app import run_dashboard
+        thread = threading.Thread(
+            target=run_dashboard,
+            kwargs={"host": DASHBOARD_HOST, "port": DASHBOARD_PORT},
+            daemon=True,
+        )
+        thread.start()
+        time.sleep(1)  # Brief pause to let Flask bind before monitor prints
+    except ImportError as e:
+        print(f"  [WARNING] Dashboard skipped: {e}")
+        print("  Run 'pip install flask' to enable the dashboard.")
+
+
+def _launch_dashboard_blocking():
+    """Start the Flask dashboard (blocking — main thread)."""
+    try:
+        from dashboard.app import run_dashboard
+        run_dashboard(host=DASHBOARD_HOST, port=DASHBOARD_PORT)
+    except ImportError:
+        print("  [ERROR] Flask is not installed. Run 'pip install flask' first.")
+        sys.exit(1)
+
+
+# ── CLI Argument Parser ───────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        prog="SecureMonitor",
+        description="Secure File Transfer Monitoring & DLP System",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py --monitor                  # Console monitoring only
+  python main.py --monitor --dashboard      # Monitor + web dashboard
+  python main.py --dashboard-only           # View logs in browser
+  python main.py --report                   # Generate audit report
+  python main.py --test-hash secret.docx   # Hash a specific file
+        """,
+    )
+
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--monitor",        action="store_true", help="Start filesystem monitoring")
+    group.add_argument("--dashboard-only", action="store_true", help="Launch dashboard without monitoring")
+    group.add_argument("--report",         action="store_true", help="Generate audit report")
+    group.add_argument("--test-hash",      metavar="FILE",      help="Compute SHA256 hash of a file")
+
+    parser.add_argument("--dashboard", action="store_true",
+                        help="[with --monitor] Also launch the web dashboard")
+
+    args = parser.parse_args()
+
+    if args.monitor:
+        cmd_monitor(with_dashboard=args.dashboard)
+    elif args.dashboard_only:
+        cmd_dashboard_only()
+    elif args.report:
+        cmd_report()
+    elif args.test_hash:
+        cmd_test_hash(args.test_hash)
+
+
+if __name__ == "__main__":
+    main()
+
+</file>
+
+<file path="monitor.py">
+"""
+monitor.py - Filesystem Event Monitor (Watchdog-based)
+Detects file create/modify/move/delete events across configured directories.
+Orchestrates the full pipeline: detect → hash → log → alert.
+Includes noise-filtering and write-burst debouncing to prevent event flooding.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+import getpass
+import threading
+
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
+from config import (
+    MONITORED_DIRECTORIES,
+    ENABLE_PROCESS_TRACKING,
+    BASE_DIR,
+    IGNORED_EXTENSIONS,
+    IGNORED_FILENAMES,
+)
+import hasher
+import detector
+import logger
+import alerter
+
+
+# Pre-calculate normalized base project path to ignore internal project files
+_PROJECT_BASE_NORM = os.path.normcase(os.path.normpath(os.path.abspath(BASE_DIR)))
+_IGNORED_EXTS_SET = frozenset(ext.lower() for ext in IGNORED_EXTENSIONS)
+_IGNORED_NAMES_SET = frozenset(name.lower() for name in IGNORED_FILENAMES)
+
+# ── Debounce & Burst Filtering ───────────────────────────────────────────────
+# When copying/saving a file, the OS flushes buffers in chunks, firing dozens
+# of MODIFIED events. We track recent creations and modifications to eliminate noise.
+_DEBOUNCE_WINDOW = 2.0        # Seconds to suppress identical events for same file
+_RECENT_CREATION_WINDOW = 3.0 # Seconds to suppress MODIFIED events after CREATED
+
+_recent_events: dict[str, float] = {}       # key: "EVENT_TYPE:norm_path" -> timestamp
+_recent_creations: dict[str, float] = {}    # key: "norm_path" -> timestamp
+_debounce_lock = threading.Lock()
+
+
+def _should_ignore_path(path: str) -> bool:
+    """
+    Return True if the file should be ignored:
+      - Inside the project's own folder (audit.log, alerts.log, reports, pycache)
+      - Temporary / lock files (~$doc.docx, .tmp, .crdownload, .part)
+      - OS system files (desktop.ini, thumbs.db)
+      - Version control / package directories (.git, __pycache__, node_modules)
+    """
+    if not path:
+        return True
+
+    norm = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+    # 1. CRITICAL: Ignore own project directory to prevent log recursion loops
+    if norm.startswith(_PROJECT_BASE_NORM):
+        return True
+
+    # 2. Ignore common version control & cache directories
+    if any(segment in norm for segment in ("\\.git", "/.git", "__pycache__", "node_modules", ".vscode")):
+        return True
+
+    basename = os.path.basename(norm).lower()
+
+    # 3. Ignore system filenames
+    if basename in _IGNORED_NAMES_SET:
+        return True
+
+    # 4. Ignore temporary Office lock files and hidden temp markers
+    if basename.startswith("~$") or basename.startswith(".~"):
+        return True
+
+    # 5. Ignore temporary / partial download extensions
+    _, ext = os.path.splitext(norm)
+    if ext.lower() in _IGNORED_EXTS_SET:
+        return True
+
+    return False
+
+
+def _is_burst_duplicate(event_type: str, path: str) -> bool:
+    """
+    Filter out duplicate/burst events:
+      - If file was CREATED within the last 3s, suppress subsequent MODIFIED events.
+      - Suppress identical event_type on same path within 2s.
+    """
+    norm_path = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    now = time.monotonic()
+
+    with _debounce_lock:
+        # If this is a MODIFIED event right after a CREATED event for the same file, suppress it.
+        # (This is just Windows writing the file content after creation).
+        if event_type == "MODIFIED":
+            last_created = _recent_creations.get(norm_path)
+            if last_created is not None and (now - last_created) < _RECENT_CREATION_WINDOW:
+                return True
+
+        # Check general debounce for the exact event_type + path
+        event_key = f"{event_type}:{norm_path}"
+        last_seen = _recent_events.get(event_key)
+        if last_seen is not None and (now - last_seen) < _DEBOUNCE_WINDOW:
+            return True
+
+        # Record this event
+        _recent_events[event_key] = now
+        if event_type == "CREATED":
+            _recent_creations[norm_path] = now
+
+        # Periodic cleanup when table grows large
+        if len(_recent_events) > 600:
+            cutoff = now - 15.0
+            stale_keys = [k for k, t in _recent_events.items() if t < cutoff]
+            for k in stale_keys:
+                del _recent_events[k]
+
+            stale_creations = [p for p, t in _recent_creations.items() if t < cutoff]
+            for p in stale_creations:
+                del _recent_creations[p]
+
+    return False
+
+
+def _get_current_user() -> str:
+    """Return the current OS username."""
+    try:
+        return getpass.getuser()
+    except Exception:
+        return "unknown"
+
+
+def _get_process_name() -> str:
+    """
+    Attempt to retrieve the name of the process that triggered the event.
+    Falls back to 'N/A' if psutil is unavailable or lookup fails.
+    """
+    if not ENABLE_PROCESS_TRACKING or not PSUTIL_AVAILABLE:
+        return "N/A"
+    try:
+        return psutil.Process(os.getpid()).name()
+    except Exception:
+        return "N/A"
+
+
+class SecureTransferEventHandler(FileSystemEventHandler):
+    """
+    Custom watchdog event handler that processes all filesystem events
+    through the full security pipeline.
+    """
+
+    def _process_event(self, event_type: str, src_path: str, dest_path: str = ""):
+        """
+        Core pipeline for each filesystem event:
+          1. Ignore filter check (system noise & project internal logs)
+          2. Debounce & burst suppression
+          3. Classify event severity
+          4. Compute integrity hashes
+          5. Log the event
+          6. Trigger alert if needed
+        """
+        # Step 1: Filter out system noise and internal log files
+        if _should_ignore_path(src_path):
+            return
+        if dest_path and _should_ignore_path(dest_path):
+            return
+
+        # Step 2: Burst & duplicate suppression
+        target_path = dest_path if (event_type == "MOVED" and dest_path) else src_path
+        if _is_burst_duplicate(event_type, target_path):
+            return
+
+        user    = _get_current_user()
+        process = _get_process_name()
+
+        # Step 3: Classify severity (INFO / WARNING / CRITICAL)
+        level = detector.classify_event(event_type, src_path, dest_path)
+
+        # Step 4: Integrity hashing
+        pre_hash = hasher.snapshot_file(src_path) if os.path.exists(src_path) else None
+
+        if event_type == "MOVED" and dest_path and os.path.exists(dest_path):
+            post_hash = hasher.compute_hash(dest_path)
+        elif event_type not in ("DELETED", "MOVED") and os.path.exists(src_path):
+            post_hash = hasher.compute_hash(src_path)
+        else:
+            post_hash = None
+
+        _, integrity_status = hasher.verify_integrity(pre_hash, post_hash)
+
+        # Step 5: Log event to audit.log and console
+        logger.log_event(
+            event_type       = event_type,
+            source           = src_path,
+            destination      = dest_path,
+            user             = user,
+            process          = process,
+            hash_pre         = pre_hash,
+            hash_post        = post_hash,
+            integrity_status = integrity_status,
+            alert_level      = level,
+        )
+
+        # Step 6: Trigger alert if policy violation (WARNING or CRITICAL)
+        if level in ("WARNING", "CRITICAL"):
+            description = detector.describe_event(event_type, src_path, dest_path)
+            alerter.trigger_alert(
+                level      = level,
+                message    = description,
+                event_data = {
+                    "source":      src_path,
+                    "destination": dest_path,
+                    "user":        user,
+                    "process":     process,
+                },
+            )
+
+    # ── Watchdog callbacks ───────────────────────────────────────────────────
+
+    def on_created(self, event):
+        if not event.is_directory:
+            self._process_event("CREATED", event.src_path)
+
+    def on_modified(self, event):
+        if not event.is_directory:
+            self._process_event("MODIFIED", event.src_path)
+
+    def on_deleted(self, event):
+        if not event.is_directory:
+            self._process_event("DELETED", event.src_path)
+
+    def on_moved(self, event):
+        if not event.is_directory:
+            self._process_event("MOVED", event.src_path, event.dest_path)
+
+
+class FileMonitor:
+    """
+    Manages one or more watchdog Observer instances for all
+    configured directories.
+    """
+
+    def __init__(self, directories: list[str] | None = None):
+        self.observer = Observer()
+        self._running = False
+        self.event_handler = SecureTransferEventHandler()
+        self.directories = directories if directories is not None else MONITORED_DIRECTORIES
+
+    def start(self):
+        """Schedule watchers for all configured directories and start the observer."""
+        scheduled = 0
+        for directory in self.directories:
+            directory = os.path.expandvars(directory)
+            if os.path.isdir(directory):
+                self.observer.schedule(
+                    self.event_handler,
+                    path      = directory,
+                    recursive = True,
+                )
+                print(f"  [+] Watching: {directory}")
+                scheduled += 1
+            else:
+                print(f"  [-] Skipped (not found): {directory}")
+
+        if scheduled == 0:
+            print("[WARNING] No valid directories to monitor. Edit config.py to add paths.")
+            return
+
+        self.observer.start()
+        self._running = True
+        print(f"\n  Monitoring {scheduled} director(ies). Press Ctrl+C to stop.\n")
+
+    def stop(self):
+        """Gracefully stop the observer."""
+        if self._running:
+            self.observer.stop()
+            self.observer.join()
+            self._running = False
+            print("\n  Monitor stopped. Goodbye.")
+
+    def is_running(self) -> bool:
+        return self._running
+
+</file>
+
+<file path="detector.py">
+"""
+detector.py - Event Classification & Unauthorized Movement Detection
+Classifies each filesystem event as NORMAL, WARNING, or CRITICAL.
+"""
+
+from __future__ import annotations   # PEP 563: compatible with Python 3.7+
+
+import os
+from config import (
+    SENSITIVE_EXTENSIONS,
+    SENSITIVE_DIRECTORIES,
+    SUSPICIOUS_DRIVE_LETTERS,
+    SUSPICIOUS_PATH_KEYWORDS,
+    SUSPICIOUS_NETWORK_PREFIXES,
+)
+
+# FIX: Precompute as a frozenset at module load time — avoids rebuilding on every call.
+_SENSITIVE_EXT_SET = frozenset(e.lower() for e in SENSITIVE_EXTENSIONS)
+
+
+def is_sensitive_file(path: str) -> bool:
+    """
+    Return True if the file path has a sensitive extension
+    or resides inside a sensitive directory.
+    """
+    if not path:
+        return False
+
+    # Check extension against precomputed set (O(1) lookup)
+    _, ext = os.path.splitext(path)
+    if ext.lower() in _SENSITIVE_EXT_SET:
+        return True
+
+    # Edge case: dotfiles like ".env", ".cfg" — os.path.splitext treats the
+    # whole filename as the stem with no extension, so we check the basename directly.
+    basename = os.path.basename(path).lower()
+    if basename in _SENSITIVE_EXT_SET:
+        return True
+
+    # Check if path is inside a sensitive directory
+    norm_path = os.path.normpath(path).lower()
+    for sensitive_dir in SENSITIVE_DIRECTORIES:
+        if norm_path.startswith(os.path.normpath(sensitive_dir).lower()):
+            return True
+
+    return False
+
+
+def is_suspicious_destination(path: str) -> bool:
+    """
+    Return True if the destination path represents a suspicious
+    exfiltration vector: USB drives, network shares, or cloud-sync folders.
+    """
+    if not path:
+        return False
+
+    norm = os.path.normpath(path)
+
+    # Check USB / external drive letters
+    for drive in SUSPICIOUS_DRIVE_LETTERS:
+        if norm.lower().startswith(drive.lower()):
+            return True
+
+    # Check UNC network paths (\\server\share) — must check original path
+    for prefix in SUSPICIOUS_NETWORK_PREFIXES:
+        if path.startswith(prefix):
+            return True
+
+    # Check for cloud-sync or temp keywords in path
+    norm_lower = norm.lower()
+    for keyword in SUSPICIOUS_PATH_KEYWORDS:
+        if keyword.lower() in norm_lower:
+            return True
+
+    return False
+
+
+def classify_event(event_type: str, src_path: str, dest_path: str = "") -> str:
+    """
+    Classify a filesystem event and return an alert level string.
+
+    Classification logic:
+    - CRITICAL: Any file transferred to a suspicious destination
+    - CRITICAL: Sensitive file MOVED or DELETED
+    - WARNING:  Sensitive file CREATED or MODIFIED
+    - INFO:     Normal files in normal locations
+
+    Args:
+        event_type: 'CREATED', 'MODIFIED', 'MOVED', 'DELETED'
+        src_path:   Source file path
+        dest_path:  Destination path (for MOVED events)
+
+    Returns:
+        'CRITICAL', 'WARNING', or 'INFO'
+    """
+    src_sensitive   = is_sensitive_file(src_path)
+    dest_suspicious = is_suspicious_destination(dest_path) if dest_path else False
+
+    # Highest severity: anything going to a suspicious destination
+    if dest_suspicious:
+        return "CRITICAL"
+
+    # High sensitivity: sensitive file being touched
+    if src_sensitive:
+        if event_type in ("MOVED", "DELETED"):
+            return "CRITICAL"   # Moving or deleting sensitive files = high risk
+        return "WARNING"        # Created / modified sensitive = suspicious but less severe
+
+    # Default
+    return "INFO"
+
+
+def describe_event(event_type: str, src_path: str, dest_path: str = "") -> str:
+    """
+    Generate a human-readable description of the event for logs and alerts.
+    """
+    basename = os.path.basename(src_path)
+    descriptions = {
+        "CREATED":  f"File created: '{basename}'",
+        "MODIFIED": f"File modified: '{basename}'",
+        "DELETED":  f"File deleted: '{basename}'",
+        "MOVED":    f"File moved: '{basename}' \u2192 '{dest_path}'",
+    }
+    return descriptions.get(event_type, f"Unknown event on '{basename}'")
+
+</file>
+
+<file path="hasher.py">
+"""
+hasher.py - File Integrity Hashing Module
+Uses Python's built-in hashlib — no installation required.
+Supports SHA256, SHA512, and MD5 algorithms.
+"""
+
+from __future__ import annotations   # PEP 563: compatible with Python 3.7+
+
+import hashlib
+import os
+from config import HASH_ALGORITHM, HASH_CHUNK_SIZE
+
+# In-memory snapshot: {filepath: hash_digest}
+# Populated before a transfer for pre/post comparison.
+_hash_snapshot: dict[str, str] = {}
+
+
+def compute_hash(filepath: str, algorithm: str = HASH_ALGORITHM) -> str | None:
+    """
+    Compute the hash of a file using the specified algorithm.
+
+    Args:
+        filepath:  Absolute path to the file.
+        algorithm: Hash algorithm name ('sha256', 'sha512', 'md5').
+
+    Returns:
+        Hex digest string, or None if the file cannot be read.
+    """
+    try:
+        h = hashlib.new(algorithm)
+        with open(filepath, "rb") as f:
+            while chunk := f.read(HASH_CHUNK_SIZE):
+                h.update(chunk)
+        return h.hexdigest()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+
+
+def verify_integrity(pre_hash: str | None, post_hash: str | None) -> tuple[bool, str]:
+    """
+    Compare pre- and post-transfer hashes.
+
+    Returns:
+        (True, "INTACT")       if hashes match
+        (False, "TAMPERED")    if hashes differ
+        (False, "UNAVAILABLE") if either hash is None
+    """
+    if pre_hash is None or post_hash is None:
+        return False, "UNAVAILABLE"
+    if pre_hash == post_hash:
+        return True, "INTACT"
+    return False, "TAMPERED"
+
+
+def snapshot_file(filepath: str) -> str | None:
+    """
+    Compute and store the hash of a file in the snapshot dict.
+    Call this BEFORE a transfer occurs.
+
+    Returns:
+        The computed hash, or None on failure.
+    """
+    digest = compute_hash(filepath)
+    if digest:
+        _hash_snapshot[filepath] = digest
+    return digest
+
+
+def check_against_snapshot(filepath: str) -> tuple[bool, str, str | None, str | None]:
+    """
+    Compare a file's current hash against its stored snapshot.
+    Call this AFTER a transfer/modification occurs.
+
+    Returns:
+        (integrity_ok, status, pre_hash, post_hash)
+    """
+    pre_hash  = _hash_snapshot.get(filepath)
+    post_hash = compute_hash(filepath)
+    ok, status = verify_integrity(pre_hash, post_hash)
+    return ok, status, pre_hash, post_hash
+
+
+def clear_snapshot(filepath: str = None):
+    """Remove a specific file from the snapshot, or clear all."""
+    if filepath:
+        _hash_snapshot.pop(filepath, None)
+    else:
+        _hash_snapshot.clear()
+
+
+def get_snapshot() -> dict:
+    """Return a copy of the current hash snapshot."""
+    return dict(_hash_snapshot)
+
+</file>
+
+<file path="logger.py">
+"""
+logger.py - Structured Audit Logging Module
+Writes JSON-line entries to logs/audit.log.
+Also provides colored console output via colorama (always available, no network needed).
+"""
+
+from __future__ import annotations   # PEP 563: compatible with Python 3.7+
+
+import json
+import os
+import sys
+from datetime import datetime
+
+from colorama import Fore, Style, init as colorama_init
+
+from config import AUDIT_LOG_PATH, LOG_DIR, HASH_ALGORITHM
+
+# Initialize colorama (autoreset=True resets color after each print)
+colorama_init(autoreset=True)
+
+# Ensure log directory exists
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Color map for alert levels
+_LEVEL_COLORS = {
+    "INFO":     Fore.CYAN,
+    "WARNING":  Fore.YELLOW,
+    "CRITICAL": Fore.RED,
+    "NORMAL":   Fore.GREEN,
+}
+
+_LEVEL_PREFIX = {
+    "INFO":     "[INFO]    ",
+    "WARNING":  "[WARNING] ",
+    "CRITICAL": "[CRITICAL]",
+    "NORMAL":   "[NORMAL]  ",
+}
+
+
+def _console_print(level: str, message: str):
+    """Print a color-coded line to the console safely across all Windows code pages."""
+    color  = _LEVEL_COLORS.get(level, Fore.WHITE)
+    prefix = _LEVEL_PREFIX.get(level, "[?]       ")
+    ts     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    out    = f"{color}{ts} {prefix} {message}{Style.RESET_ALL}"
+    try:
+        print(out)
+    except UnicodeEncodeError:
+        print(out.encode("ascii", errors="replace").decode("ascii"))
+
+
+def log_event(
+    event_type: str,
+    source: str,
+    destination: str,
+    user: str,
+    process: str,
+    hash_pre: str | None,
+    hash_post: str | None,
+    integrity_status: str,
+    alert_level: str,
+    extra: dict = None,
+):
+    """
+    Write a structured JSON log entry to audit.log and print to console.
+
+    Args:
+        event_type:        Type of FS event (CREATED, MODIFIED, MOVED, DELETED).
+        source:            Source file path.
+        destination:       Destination path (empty string if not applicable).
+        user:              OS username performing the action.
+        process:           Name of the triggering process (or 'N/A').
+        hash_pre:          Hash before event (or None).
+        hash_post:         Hash after event (or None).
+        integrity_status:  'INTACT', 'TAMPERED', or 'UNAVAILABLE'.
+        alert_level:       'INFO', 'WARNING', or 'CRITICAL'.
+        extra:             Optional dict of additional fields.
+    """
+    entry = {
+        "timestamp":        datetime.now().isoformat(),
+        "event_type":       event_type,
+        "source":           source,
+        "destination":      destination,
+        "user":             user,
+        "process":          process,
+        "hash_algorithm":   HASH_ALGORITHM,
+        "hash_pre":         hash_pre or "N/A",
+        "hash_post":        hash_post or "N/A",
+        "integrity_status": integrity_status,
+        "alert_level":      alert_level,
+    }
+    if extra:
+        entry.update(extra)
+
+    # Write to audit log file (always utf-8)
+    with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+    # Print to console with colors (using ASCII -> arrow)
+    dest_str = f" -> {destination}" if destination else ""
+    msg = f"{event_type:10} | {os.path.basename(source)}{dest_str} | {integrity_status}"
+    _console_print(alert_level, msg)
+
+
+def load_logs(limit: int = None, level_filter: str = None, keyword: str = None) -> list[dict]:
+    """
+    Read and parse audit.log entries with optional filtering.
+
+    Args:
+        limit:        Maximum number of recent entries to return. None = all.
+        level_filter: Filter by alert level string ('INFO', 'WARNING', 'CRITICAL').
+        keyword:      Filter entries where keyword appears in source or destination.
+
+    Returns:
+        List of log entry dicts, most recent last.
+    """
+    if not os.path.exists(AUDIT_LOG_PATH):
+        return []
+
+    entries = []
+    with open(AUDIT_LOG_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                # Apply filters
+                if level_filter and entry.get("alert_level") != level_filter:
+                    continue
+                if keyword:
+                    kw = keyword.lower()
+                    if kw not in entry.get("source", "").lower() \
+                       and kw not in entry.get("destination", "").lower() \
+                       and kw not in entry.get("event_type", "").lower():
+                        continue
+                entries.append(entry)
+            except json.JSONDecodeError:
+                continue
+
+    if limit:
+        entries = entries[-limit:]
+    return entries
+
+
+def get_stats() -> dict:
+    """Return summary statistics from the audit log."""
+    entries = load_logs()
+    stats = {
+        "total":              len(entries),
+        "info":               sum(1 for e in entries if e.get("alert_level") == "INFO"),
+        "warning":            sum(1 for e in entries if e.get("alert_level") == "WARNING"),
+        "critical":           sum(1 for e in entries if e.get("alert_level") == "CRITICAL"),
+        "integrity_tampered": sum(1 for e in entries if e.get("integrity_status") == "TAMPERED"),
+        "integrity_ok":       sum(1 for e in entries if e.get("integrity_status") == "INTACT"),
+    }
+    return stats
+
+
+def print_banner():
+    """Print styled startup banner to the console safely across Windows terminals."""
+    line = "=" * 62
+    banner = f"""
+{Fore.CYAN}+{line}+
+|       SECURE FILE TRANSFER MONITORING SYSTEM                 |
+|       Blue Team DLP & Integrity Checker  |  v1.0             |
++{line}+{Style.RESET_ALL}
+"""
+    try:
+        print(banner)
+    except UnicodeEncodeError:
+        print(banner.encode("ascii", errors="replace").decode("ascii"))
+
+</file>
+
+<file path="alerter.py">
+"""
+alerter.py - Alert Generation & Policy Violation Notification
+Writes alerts to logs/alerts.log and prints to console (colorama).
+Entirely local — no network dependency. Safe on Windows cp1252.
+"""
+
+import json
+import os
+import sys
+from datetime import datetime
+
+from colorama import Fore, Back, Style, init as colorama_init
+
+from config import ALERT_LOG_PATH, LOG_DIR
+
+colorama_init(autoreset=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Console display prefix per level (pure ASCII safe)
+_LEVEL_STYLE = {
+    "INFO":     (Fore.CYAN,   "[INFO] "),
+    "WARNING":  (Fore.YELLOW, "[WARN] "),
+    "CRITICAL": (Fore.RED,    "[CRIT] "),
+}
+
+
+def trigger_alert(level: str, message: str, event_data: dict = None):
+    """
+    Generate an alert at the specified severity level.
+
+    - Writes to logs/alerts.log (JSON-line format)
+    - Prints a formatted, color-coded message to the console
+    - Prints a full banner for CRITICAL alerts
+
+    Args:
+        level:      'INFO', 'WARNING', or 'CRITICAL'
+        message:    Human-readable alert summary
+        event_data: Optional dict of event context (source, destination, etc.)
+    """
+    ts = datetime.now().isoformat()
+    alert_entry = {
+        "timestamp":  ts,
+        "level":      level,
+        "message":    message,
+        "event_data": event_data or {},
+    }
+
+    # Write to alerts log
+    with open(ALERT_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(alert_entry) + "\n")
+
+    # Console output
+    color, icon = _LEVEL_STYLE.get(level, (Fore.WHITE, "[ALERT]"))
+    ts_short = datetime.now().strftime("%H:%M:%S")
+
+    if level == "CRITICAL":
+        _print_critical_banner(message, event_data, ts_short)
+    else:
+        out = f"{color}{ts_short} {icon} [{level}] {message}{Style.RESET_ALL}"
+        try:
+            print(out)
+        except UnicodeEncodeError:
+            print(out.encode("ascii", errors="replace").decode("ascii"))
+
+
+def _print_critical_banner(message: str, event_data: dict, ts: str):
+    """Print a loud CRITICAL alert banner to the console."""
+    src  = event_data.get("source", "N/A")      if event_data else "N/A"
+    dest = event_data.get("destination", "N/A") if event_data else "N/A"
+    user = event_data.get("user", "N/A")        if event_data else "N/A"
+
+    line = "=" * 62
+    banner = f"""
+{Fore.RED}{Back.BLACK}
++{line}+
+|  [!]  CRITICAL SECURITY ALERT  {ts:>29}  |
++{line}+
+|  {message[:60]:<60}  |
+|  User   : {user[:52]:<52}  |
+|  Source : {src[:52]:<52}  |
+|  Dest   : {dest[:52]:<52}  |
++{line}+
+{Style.RESET_ALL}"""
+    try:
+        print(banner)
+    except UnicodeEncodeError:
+        print(banner.encode("ascii", errors="replace").decode("ascii"))
+
+
+def load_alerts(limit: int = 50) -> list[dict]:
+    """
+    Read the most recent alert entries from alerts.log.
+
+    Args:
+        limit: Maximum number of alerts to return.
+
+    Returns:
+        List of alert dicts, most recent last.
+    """
+    if not os.path.exists(ALERT_LOG_PATH):
+        return []
+
+    alerts = []
+    with open(ALERT_LOG_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                alerts.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    return alerts[-limit:]
+
+</file>
+
+<file path="reporter.py">
+"""
+reporter.py - Audit Report Generator
+Reads audit.log and produces a formatted text report with summary stats and event table.
+"""
+
+import os
+from datetime import datetime
+from tabulate import tabulate
+
+from config import REPORT_DIR, AUDIT_LOG_PATH
+from logger import load_logs, get_stats
+
+os.makedirs(REPORT_DIR, exist_ok=True)
+
+
+def generate_report(output_path: str = None) -> str:
+    """
+    Generate a comprehensive audit report from the current audit.log.
+
+    Args:
+        output_path: Optional custom file path. Defaults to
+                     reports/audit_report_<timestamp>.txt
+
+    Returns:
+        Absolute path to the generated report file.
+    """
+    if not output_path:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(REPORT_DIR, f"audit_report_{ts}.txt")
+
+    entries = load_logs()
+    stats   = get_stats()
+    now     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    lines = []
+
+    # ─── Header ───────────────────────────────────────────────────────────────
+    lines.append("=" * 72)
+    lines.append("  SECURE FILE TRANSFER MONITORING SYSTEM — AUDIT REPORT")
+    lines.append("=" * 72)
+    lines.append(f"  Generated : {now}")
+    lines.append(f"  Log file  : {AUDIT_LOG_PATH}")
+    lines.append("=" * 72)
+    lines.append("")
+
+    # ─── Summary Statistics ───────────────────────────────────────────────────
+    lines.append("[ SUMMARY STATISTICS ]")
+    lines.append("")
+    summary_table = [
+        ["Total Events",            stats["total"]],
+        ["INFO",                    stats["info"]],
+        ["WARNING",                 stats["warning"]],
+        ["CRITICAL",                stats["critical"]],
+        ["Integrity OK",            stats["integrity_ok"]],
+        ["Integrity TAMPERED",      stats["integrity_tampered"]],
+    ]
+    lines.append(tabulate(summary_table, headers=["Metric", "Count"], tablefmt="grid"))
+    lines.append("")
+
+    # ─── Top Suspicious Sources ───────────────────────────────────────────────
+    critical_entries = [e for e in entries if e.get("alert_level") == "CRITICAL"]
+    warning_entries  = [e for e in entries if e.get("alert_level") == "WARNING"]
+
+    if critical_entries or warning_entries:
+        lines.append("[ POLICY VIOLATIONS ]")
+        lines.append("")
+        violations = []
+        for e in (critical_entries + warning_entries):
+            violations.append([
+                e.get("timestamp", "")[:19],
+                e.get("alert_level", ""),
+                e.get("event_type", ""),
+                _truncate(e.get("source", ""), 35),
+                _truncate(e.get("destination", ""), 25),
+                e.get("user", ""),
+                e.get("integrity_status", ""),
+            ])
+        headers = ["Timestamp", "Level", "Event", "Source", "Destination", "User", "Integrity"]
+        lines.append(tabulate(violations, headers=headers, tablefmt="grid"))
+        lines.append("")
+
+    # ─── Full Event Log ───────────────────────────────────────────────────────
+    lines.append("[ FULL EVENT LOG ]")
+    lines.append("")
+    if not entries:
+        lines.append("  No events recorded.")
+    else:
+        rows = []
+        for e in entries[-100:]:   # Last 100 entries in report
+            rows.append([
+                e.get("timestamp", "")[:19],
+                e.get("alert_level", ""),
+                e.get("event_type", ""),
+                _truncate(e.get("source", ""), 40),
+                _truncate(e.get("destination", ""), 30),
+                e.get("user", ""),
+                e.get("integrity_status", ""),
+            ])
+        headers = ["Timestamp", "Level", "Event", "Source", "Destination", "User", "Integrity"]
+        lines.append(tabulate(rows, headers=headers, tablefmt="simple"))
+
+    lines.append("")
+    lines.append("=" * 72)
+    lines.append("  END OF REPORT")
+    lines.append("=" * 72)
+
+    report_text = "\n".join(lines)
+
+    # Write to file
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(report_text)
+
+    print(report_text)
+    print(f"\n  Report saved → {output_path}")
+    return output_path
+
+
+def _truncate(text: str, max_len: int) -> str:
+    """Truncate a string to max_len characters, adding '…' if cut."""
+    if not text:
+        return ""
+    return text if len(text) <= max_len else text[:max_len - 1] + "…"
+
+</file>
+
+<file path="dashboard/__init__.py">
+# Empty init — makes dashboard/ a proper Python package so that
+# "from dashboard.app import run_dashboard" resolves correctly.
+
+</file>
+
+<file path="dashboard/app.py">
+"""
+dashboard/app.py - SPLUNK-style Local Web Dashboard
+Serves a real-time log viewer at http://localhost:5000
+100% LOCAL — no internet, no external APIs, reads only from local log files.
+"""
+
+import sys
+import os
+
+# Allow imports from parent directory
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from flask import Flask, render_template, jsonify, request
+import logger
+import alerter
+from config import DASHBOARD_HOST, DASHBOARD_PORT, DASHBOARD_DEBUG, LOGS_PER_PAGE
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def index():
+    """Serve the main dashboard page."""
+    return render_template("index.html")
+
+
+@app.route("/api/logs")
+def api_logs():
+    """
+    Return paginated, filterable log entries as JSON.
+    Query params:
+      - level:   Filter by alert level (INFO / WARNING / CRITICAL)
+      - keyword: Search in source/destination/event_type
+      - page:    Page number (1-indexed)
+    """
+    level   = request.args.get("level", "").upper() or None
+    keyword = request.args.get("keyword", "") or None
+    page    = max(1, int(request.args.get("page", 1)))
+
+    entries  = logger.load_logs(level_filter=level, keyword=keyword)
+    total    = len(entries)
+    # Most recent first for display
+    entries  = list(reversed(entries))
+    start    = (page - 1) * LOGS_PER_PAGE
+    end      = start + LOGS_PER_PAGE
+    page_entries = entries[start:end]
+
+    return jsonify({
+        "logs":       page_entries,
+        "total":      total,
+        "page":       page,
+        "per_page":   LOGS_PER_PAGE,
+        "total_pages": max(1, (total + LOGS_PER_PAGE - 1) // LOGS_PER_PAGE),
+    })
+
+
+@app.route("/api/stats")
+def api_stats():
+    """Return summary statistics."""
+    return jsonify(logger.get_stats())
+
+
+@app.route("/api/alerts")
+def api_alerts():
+    """Return the most recent alerts."""
+    limit  = int(request.args.get("limit", 20))
+    alerts = alerter.load_alerts(limit=limit)
+    return jsonify(list(reversed(alerts)))  # Most recent first
+
+
+def run_dashboard(host: str = DASHBOARD_HOST, port: int = DASHBOARD_PORT):
+    """Start the Flask development server (blocking call)."""
+    print(f"\n  Dashboard → http://{host}:{port}  (local only, no internet needed)")
+    app.run(host=host, port=port, debug=DASHBOARD_DEBUG, use_reloader=False)
+
+</file>
+
+<file path="dashboard/templates/index.html">
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>SecureMonitor — File Transfer Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+
+<!-- ═══════════════════════════════ TOP NAV ═══════════════════════════════ -->
+<header class="top-bar">
+  <div class="top-bar-inner">
+    <div class="logo-area">
+      <span class="logo-icon">🛡</span>
+      <span class="logo-text">SecureMonitor</span>
+      <span class="logo-sub">File Transfer DLP</span>
+    </div>
+    <div class="status-area">
+      <span class="status-dot" id="statusDot"></span>
+      <span class="status-label" id="statusLabel">Connecting…</span>
+      <span class="refresh-label">Auto-refresh: 5s</span>
+    </div>
+  </div>
+</header>
+
+<!-- ═══════════════════════════════ MAIN LAYOUT ═══════════════════════════ -->
+<div class="layout">
+
+  <!-- ─── LEFT SIDEBAR: Alerts ─── -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <span>🚨 Live Alerts</span>
+      <span class="badge" id="alertCount">0</span>
+    </div>
+    <div class="alert-feed" id="alertFeed">
+      <div class="alert-empty">No alerts yet.</div>
+    </div>
+  </aside>
+
+  <!-- ─── MAIN CONTENT ─── -->
+  <main class="main-content">
+
+    <!-- Stats Cards -->
+    <section class="stats-row">
+      <div class="stat-card total">
+        <div class="stat-icon">📋</div>
+        <div class="stat-body">
+          <div class="stat-value" id="statTotal">0</div>
+          <div class="stat-label">Total Events</div>
+        </div>
+      </div>
+      <div class="stat-card info">
+        <div class="stat-icon">ℹ</div>
+        <div class="stat-body">
+          <div class="stat-value" id="statInfo">0</div>
+          <div class="stat-label">INFO</div>
+        </div>
+      </div>
+      <div class="stat-card warning">
+        <div class="stat-icon">⚠</div>
+        <div class="stat-body">
+          <div class="stat-value" id="statWarning">0</div>
+          <div class="stat-label">WARNINGS</div>
+        </div>
+      </div>
+      <div class="stat-card critical">
+        <div class="stat-icon">🔴</div>
+        <div class="stat-body">
+          <div class="stat-value" id="statCritical">0</div>
+          <div class="stat-label">CRITICAL</div>
+        </div>
+      </div>
+      <div class="stat-card tampered">
+        <div class="stat-icon">🔐</div>
+        <div class="stat-body">
+          <div class="stat-value" id="statTampered">0</div>
+          <div class="stat-label">Tampered</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Filter Bar -->
+    <section class="filter-bar">
+      <input type="text"  id="searchInput"  class="filter-input" placeholder="🔍  Search source, destination, event type…" />
+      <select id="levelFilter" class="filter-select">
+        <option value="">All Levels</option>
+        <option value="INFO">INFO</option>
+        <option value="WARNING">WARNING</option>
+        <option value="CRITICAL">CRITICAL</option>
+      </select>
+      <button class="btn-refresh" id="btnRefresh" onclick="fetchAll()">↺ Refresh</button>
+    </section>
+
+    <!-- Log Table -->
+    <section class="table-section">
+      <div class="table-header-row">
+        <span class="table-title">Event Log</span>
+        <span class="table-meta" id="tableMeta">Loading…</span>
+      </div>
+      <div class="table-wrapper">
+        <table id="logTable">
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Level</th>
+              <th>Event</th>
+              <th>Source</th>
+              <th>Destination</th>
+              <th>User</th>
+              <th>Hash Pre</th>
+              <th>Hash Post</th>
+              <th>Integrity</th>
+            </tr>
+          </thead>
+          <tbody id="logBody">
+            <tr><td colspan="9" class="empty-row">No events yet. Start monitoring to see data.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Pagination -->
+      <div class="pagination" id="pagination"></div>
+    </section>
+
+  </main>
+</div>
+
+<!-- ═════════════════════════════ JAVASCRIPT ══════════════════════════════ -->
+<script>
+  let currentPage   = 1;
+  let refreshTimer  = null;
+  let isConnected   = false;
+
+  // ── Fetch everything ────────────────────────────────────────────────────
+  async function fetchAll() {
+    await Promise.all([fetchStats(), fetchLogs(), fetchAlerts()]);
+  }
+
+  // ── Stats ────────────────────────────────────────────────────────────────
+  async function fetchStats() {
+    try {
+      const res  = await fetch("/api/stats");
+      const data = await res.json();
+      document.getElementById("statTotal").textContent    = data.total    ?? 0;
+      document.getElementById("statInfo").textContent     = data.info     ?? 0;
+      document.getElementById("statWarning").textContent  = data.warning  ?? 0;
+      document.getElementById("statCritical").textContent = data.critical  ?? 0;
+      document.getElementById("statTampered").textContent = data.integrity_tampered ?? 0;
+      setConnected(true);
+    } catch (e) {
+      setConnected(false);
+    }
+  }
+
+  // ── Logs ─────────────────────────────────────────────────────────────────
+  async function fetchLogs(page = currentPage) {
+    const level   = document.getElementById("levelFilter").value;
+    const keyword = document.getElementById("searchInput").value.trim();
+    let url = `/api/logs?page=${page}`;
+    if (level)   url += `&level=${encodeURIComponent(level)}`;
+    if (keyword) url += `&keyword=${encodeURIComponent(keyword)}`;
+
+    try {
+      const res  = await fetch(url);
+      const data = await res.json();
+      renderLogs(data.logs);
+      renderPagination(data.page, data.total_pages, data.total);
+      document.getElementById("tableMeta").textContent =
+        `Showing ${data.logs.length} of ${data.total} events`;
+    } catch (e) {
+      document.getElementById("tableMeta").textContent = "Could not load logs.";
+    }
+  }
+
+  function renderLogs(logs) {
+    const tbody = document.getElementById("logBody");
+    if (!logs || logs.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="9" class="empty-row">No matching events.</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = logs.map(e => `
+      <tr class="row-${(e.alert_level||"INFO").toLowerCase()}">
+        <td class="mono ts">${(e.timestamp||"").slice(0,19).replace("T"," ")}</td>
+        <td><span class="badge-level ${(e.alert_level||"INFO").toLowerCase()}">${e.alert_level||"—"}</span></td>
+        <td><span class="event-type">${e.event_type||"—"}</span></td>
+        <td class="mono path" title="${e.source||""}">${truncate(e.source||"", 45)}</td>
+        <td class="mono path" title="${e.destination||""}">${truncate(e.destination||"—", 35)}</td>
+        <td>${e.user||"—"}</td>
+        <td class="mono hash" title="${e.hash_pre||""}">${shortHash(e.hash_pre)}</td>
+        <td class="mono hash" title="${e.hash_post||""}">${shortHash(e.hash_post)}</td>
+        <td><span class="integrity-badge ${(e.integrity_status||"").toLowerCase()}">${e.integrity_status||"—"}</span></td>
+      </tr>
+    `).join("");
+  }
+
+  function renderPagination(page, totalPages, total) {
+    currentPage = page;
+    const el = document.getElementById("pagination");
+    if (totalPages <= 1) { el.innerHTML = ""; return; }
+
+    let html = "";
+    if (page > 1) html += `<button onclick="fetchLogs(${page-1})">‹ Prev</button>`;
+    html += `<span class="page-info">Page ${page} / ${totalPages}</span>`;
+    if (page < totalPages) html += `<button onclick="fetchLogs(${page+1})">Next ›</button>`;
+    el.innerHTML = html;
+  }
+
+  // ── Alerts ───────────────────────────────────────────────────────────────
+  async function fetchAlerts() {
+    try {
+      const res    = await fetch("/api/alerts?limit=30");
+      const alerts = await res.json();
+      const feed   = document.getElementById("alertFeed");
+      document.getElementById("alertCount").textContent = alerts.length;
+
+      if (alerts.length === 0) {
+        feed.innerHTML = `<div class="alert-empty">No alerts yet.</div>`;
+        return;
+      }
+      feed.innerHTML = alerts.map(a => `
+        <div class="alert-item ${(a.level||"INFO").toLowerCase()}">
+          <div class="alert-ts">${(a.timestamp||"").slice(0,19).replace("T"," ")}</div>
+          <div class="alert-level">${a.level||""}</div>
+          <div class="alert-msg">${a.message||""}</div>
+          ${a.event_data && a.event_data.source ? `<div class="alert-src">${truncate(a.event_data.source,40)}</div>` : ""}
+        </div>
+      `).join("");
+    } catch (e) { /* sidebar alert failure is non-critical */ }
+  }
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
+  function truncate(str, n) {
+    if (!str) return "—";
+    return str.length > n ? "…" + str.slice(-(n-1)) : str;
+  }
+
+  function shortHash(h) {
+    if (!h || h === "N/A") return "N/A";
+    return h.length > 12 ? h.slice(0, 8) + "…" + h.slice(-4) : h;
+  }
+
+  function setConnected(ok) {
+    isConnected = ok;
+    document.getElementById("statusDot").className   = "status-dot " + (ok ? "online" : "offline");
+    document.getElementById("statusLabel").textContent = ok ? "Monitoring Active" : "Disconnected";
+  }
+
+  // ── Search / filter listeners ─────────────────────────────────────────────
+  let searchDebounce;
+  document.getElementById("searchInput").addEventListener("input", () => {
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(() => fetchLogs(1), 400);
+  });
+  document.getElementById("levelFilter").addEventListener("change", () => fetchLogs(1));
+
+  // ── Auto-refresh every 5 seconds ──────────────────────────────────────────
+  function startRefresh() {
+    fetchAll();
+    refreshTimer = setInterval(fetchAll, 5000);
+  }
+
+  startRefresh();
+</script>
+</body>
+</html>
+
+</file>
+
+<file path="dashboard/static/style.css">
+/* ═══════════════════════════════════════════════════════════════════════
+   SecureMonitor Dashboard — SPLUNK-inspired Dark Theme
+   Pure CSS, zero external dependencies
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── Reset & Variables ──────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg-base:       #0d1117;
+  --bg-elevated:   #161b22;
+  --bg-card:       #1c2128;
+  --bg-table-row:  #1a1f26;
+  --bg-hover:      #22272e;
+  --border:        #30363d;
+  --border-subtle: #21262d;
+
+  --text-primary:  #e6edf3;
+  --text-secondary:#8b949e;
+  --text-muted:    #6e7681;
+
+  /* Level Colors */
+  --info-color:    #58a6ff;
+  --info-bg:       #0d2847;
+  --warn-color:    #d29922;
+  --warn-bg:       #2d1f0a;
+  --crit-color:    #f85149;
+  --crit-bg:       #3b0d0c;
+  --ok-color:      #3fb950;
+  --ok-bg:         #0a2f16;
+  --accent:        #58a6ff;
+
+  --font-main:  'Inter', system-ui, sans-serif;
+  --font-mono:  'JetBrains Mono', 'Cascadia Code', monospace;
+  --radius:     6px;
+  --radius-lg:  10px;
+  --shadow:     0 4px 20px rgba(0,0,0,0.5);
+}
+
+html, body {
+  height: 100%;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-main);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* ── Top Navigation Bar ─────────────────────────────────────────────────── */
+.top-bar {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(8px);
+}
+.top-bar-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  height: 56px;
+}
+.logo-area { display: flex; align-items: center; gap: 10px; }
+.logo-icon  { font-size: 22px; }
+.logo-text  { font-size: 16px; font-weight: 700; color: var(--accent); letter-spacing: -0.3px; }
+.logo-sub   { font-size: 11px; color: var(--text-muted); background: var(--bg-card);
+               padding: 2px 8px; border-radius: 20px; border: 1px solid var(--border); }
+
+.status-area { display: flex; align-items: center; gap: 10px; }
+.status-dot  { width: 9px; height: 9px; border-radius: 50%; background: var(--text-muted);
+                transition: background 0.3s; box-shadow: 0 0 0 0 transparent; }
+.status-dot.online  { background: var(--ok-color); box-shadow: 0 0 8px var(--ok-color); animation: pulse 2s infinite; }
+.status-dot.offline { background: var(--crit-color); }
+.status-label { font-size: 13px; font-weight: 500; color: var(--text-secondary); }
+.refresh-label { font-size: 11px; color: var(--text-muted); background: var(--bg-card);
+                  padding: 2px 8px; border-radius: 20px; border: 1px solid var(--border); }
+
+@keyframes pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(63,185,80,0.5); }
+  70%  { box-shadow: 0 0 0 8px rgba(63,185,80,0); }
+  100% { box-shadow: 0 0 0 0 rgba(63,185,80,0); }
+}
+
+/* ── Layout ──────────────────────────────────────────────────────────────── */
+.layout {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  height: calc(100vh - 56px);
+  overflow: hidden;
+}
+
+/* ── Sidebar ─────────────────────────────────────────────────────────────── */
+.sidebar {
+  background: var(--bg-elevated);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  font-weight: 600;
+  font-size: 13px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-primary);
+}
+.badge {
+  background: var(--crit-bg);
+  color: var(--crit-color);
+  border: 1px solid var(--crit-color);
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 7px;
+  min-width: 22px;
+  text-align: center;
+}
+
+.alert-feed {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.alert-feed::-webkit-scrollbar { width: 4px; }
+.alert-feed::-webkit-scrollbar-track { background: transparent; }
+.alert-feed::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+.alert-empty { color: var(--text-muted); font-size: 12px; text-align: center; padding: 24px 0; }
+
+.alert-item {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  transition: border-color 0.2s;
+}
+.alert-item:hover { border-color: var(--border); }
+.alert-item.info     { border-left: 3px solid var(--info-color); }
+.alert-item.warning  { border-left: 3px solid var(--warn-color); }
+.alert-item.critical { border-left: 3px solid var(--crit-color); background: #1c0f0f; }
+
+.alert-ts    { font-size: 10px; color: var(--text-muted); font-family: var(--font-mono); }
+.alert-level { font-size: 10px; font-weight: 700; letter-spacing: 0.5px; margin: 2px 0; }
+.alert-item.info     .alert-level { color: var(--info-color); }
+.alert-item.warning  .alert-level { color: var(--warn-color); }
+.alert-item.critical .alert-level { color: var(--crit-color); }
+.alert-msg  { font-size: 12px; color: var(--text-primary); word-break: break-word; }
+.alert-src  { font-size: 10px; color: var(--text-muted); font-family: var(--font-mono); margin-top: 4px;
+               word-break: break-all; }
+
+/* ── Main Content ────────────────────────────────────────────────────────── */
+.main-content {
+  overflow-y: auto;
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.main-content::-webkit-scrollbar { width: 6px; }
+.main-content::-webkit-scrollbar-track { background: transparent; }
+.main-content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+/* ── Stats Cards ─────────────────────────────────────────────────────────── */
+.stats-row {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 14px;
+}
+.stat-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 16px 18px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  transition: transform 0.15s, border-color 0.2s;
+}
+.stat-card:hover { transform: translateY(-2px); border-color: var(--border); }
+.stat-icon  { font-size: 24px; filter: grayscale(0.2); }
+.stat-value { font-size: 26px; font-weight: 700; line-height: 1; }
+.stat-label { font-size: 11px; color: var(--text-muted); font-weight: 500; margin-top: 2px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+.stat-card.total    { border-top: 2px solid var(--accent); }
+.stat-card.info     { border-top: 2px solid var(--info-color); }
+.stat-card.info     .stat-value { color: var(--info-color); }
+.stat-card.warning  { border-top: 2px solid var(--warn-color); }
+.stat-card.warning  .stat-value { color: var(--warn-color); }
+.stat-card.critical { border-top: 2px solid var(--crit-color); }
+.stat-card.critical .stat-value { color: var(--crit-color); }
+.stat-card.tampered { border-top: 2px solid #a371f7; }
+.stat-card.tampered .stat-value { color: #a371f7; }
+
+/* ── Filter Bar ──────────────────────────────────────────────────────────── */
+.filter-bar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+.filter-input {
+  flex: 1;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  padding: 8px 14px;
+  font-family: var(--font-main);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+.filter-input:focus { border-color: var(--accent); }
+.filter-input::placeholder { color: var(--text-muted); }
+
+.filter-select {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  padding: 8px 12px;
+  font-size: 13px;
+  outline: none;
+  cursor: pointer;
+  min-width: 140px;
+  transition: border-color 0.2s;
+}
+.filter-select:focus { border-color: var(--accent); }
+
+.btn-refresh {
+  background: var(--accent);
+  color: #000;
+  border: none;
+  border-radius: var(--radius);
+  padding: 8px 18px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s, transform 0.1s;
+}
+.btn-refresh:hover  { opacity: 0.85; transform: scale(1.02); }
+.btn-refresh:active { transform: scale(0.98); }
+
+/* ── Log Table Section ───────────────────────────────────────────────────── */
+.table-section {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 300px;
+}
+.table-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 18px;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+}
+.table-title { font-weight: 600; font-size: 14px; }
+.table-meta  { font-size: 12px; color: var(--text-muted); }
+
+.table-wrapper { overflow-x: auto; flex: 1; }
+.table-wrapper::-webkit-scrollbar { height: 4px; }
+.table-wrapper::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+thead tr { background: var(--bg-base); }
+th {
+  text-align: left;
+  padding: 10px 14px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+td {
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  vertical-align: middle;
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+tbody tr { transition: background 0.1s; }
+tbody tr:hover { background: var(--bg-hover); }
+tbody tr:last-child td { border-bottom: none; }
+
+/* Row tinting by level */
+.row-info     { }
+.row-warning  { background: rgba(210,153,34,0.04); }
+.row-critical { background: rgba(248,81,73,0.06); }
+
+.empty-row { text-align: center; color: var(--text-muted); padding: 40px; }
+
+/* ── Inline Badges ───────────────────────────────────────────────────────── */
+.badge-level {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  padding: 2px 8px;
+  border-radius: 20px;
+  text-transform: uppercase;
+}
+.badge-level.info     { background: var(--info-bg);  color: var(--info-color);  border: 1px solid var(--info-color);  }
+.badge-level.warning  { background: var(--warn-bg);  color: var(--warn-color);  border: 1px solid var(--warn-color);  }
+.badge-level.critical { background: var(--crit-bg);  color: var(--crit-color);  border: 1px solid var(--crit-color);  }
+
+.integrity-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 20px;
+}
+.integrity-badge.intact      { background: var(--ok-bg);   color: var(--ok-color);   border: 1px solid var(--ok-color);   }
+.integrity-badge.tampered    { background: var(--crit-bg); color: var(--crit-color); border: 1px solid var(--crit-color); }
+.integrity-badge.unavailable { background: var(--bg-base); color: var(--text-muted); border: 1px solid var(--border);     }
+
+.event-type { font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary); }
+.mono  { font-family: var(--font-mono); }
+.hash  { font-size: 11px; color: var(--text-muted); cursor: default; }
+.ts    { font-size: 11px; color: var(--text-muted); }
+.path  { color: var(--text-primary); }
+
+/* ── Pagination ──────────────────────────────────────────────────────────── */
+.pagination {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border-top: 1px solid var(--border-subtle);
+}
+.pagination button {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  padding: 5px 14px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 12px;
+  transition: border-color 0.15s, background 0.15s;
+}
+.pagination button:hover { background: var(--bg-hover); border-color: var(--accent); }
+.page-info { font-size: 12px; color: var(--text-muted); }
+
+</file>
+
+<file path="tests/__init__.py">
+# Empty init to make tests/ a package
+
+</file>
+
+<file path="tests/test_hasher.py">
+"""
+tests/test_hasher.py - Unit Tests for hasher.py
+Uses Python's built-in unittest module — no extra install needed.
+"""
+
+import os
+import sys
+import tempfile
+import unittest
+import hashlib
+
+# Allow imports from parent directory
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import hasher
+
+
+class TestComputeHash(unittest.TestCase):
+    """Tests for hasher.compute_hash()"""
+
+    def setUp(self):
+        """Create a temporary file with known content for testing."""
+        self.tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="wb")
+        self.tmp.write(b"SecureMonitor Test File - 12345")
+        self.tmp.close()
+        self.filepath = self.tmp.name
+
+    def tearDown(self):
+        os.unlink(self.filepath)
+        hasher.clear_snapshot()
+
+    def test_sha256_returns_hex_string(self):
+        result = hasher.compute_hash(self.filepath, "sha256")
+        self.assertIsInstance(result, str)
+        self.assertEqual(len(result), 64)   # SHA256 produces 64-char hex
+
+    def test_md5_returns_hex_string(self):
+        result = hasher.compute_hash(self.filepath, "md5")
+        self.assertIsInstance(result, str)
+        self.assertEqual(len(result), 32)   # MD5 produces 32-char hex
+
+    def test_sha512_returns_hex_string(self):
+        result = hasher.compute_hash(self.filepath, "sha512")
+        self.assertIsInstance(result, str)
+        self.assertEqual(len(result), 128)  # SHA512 produces 128-char hex
+
+    def test_hash_matches_manual_calculation(self):
+        """Verify compute_hash matches a direct hashlib calculation."""
+        expected = hashlib.sha256(b"SecureMonitor Test File - 12345").hexdigest()
+        result   = hasher.compute_hash(self.filepath, "sha256")
+        self.assertEqual(result, expected)
+
+    def test_nonexistent_file_returns_none(self):
+        result = hasher.compute_hash("C:\\nonexistent\\path\\file.txt")
+        self.assertIsNone(result)
+
+    def test_same_file_same_hash(self):
+        h1 = hasher.compute_hash(self.filepath)
+        h2 = hasher.compute_hash(self.filepath)
+        self.assertEqual(h1, h2)
+
+    def test_different_content_different_hash(self):
+        # Modify file content
+        with open(self.filepath, "wb") as f:
+            f.write(b"MODIFIED CONTENT")
+        h_modified = hasher.compute_hash(self.filepath)
+
+        tmp2 = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="wb")
+        tmp2.write(b"ORIGINAL CONTENT")
+        tmp2.close()
+        h_original = hasher.compute_hash(tmp2.name)
+        os.unlink(tmp2.name)
+
+        self.assertNotEqual(h_modified, h_original)
+
+
+class TestVerifyIntegrity(unittest.TestCase):
+    """Tests for hasher.verify_integrity()"""
+
+    def test_matching_hashes_are_intact(self):
+        ok, status = hasher.verify_integrity("abc123", "abc123")
+        self.assertTrue(ok)
+        self.assertEqual(status, "INTACT")
+
+    def test_different_hashes_are_tampered(self):
+        ok, status = hasher.verify_integrity("abc123", "xyz789")
+        self.assertFalse(ok)
+        self.assertEqual(status, "TAMPERED")
+
+    def test_none_pre_hash_is_unavailable(self):
+        ok, status = hasher.verify_integrity(None, "xyz789")
+        self.assertFalse(ok)
+        self.assertEqual(status, "UNAVAILABLE")
+
+    def test_none_post_hash_is_unavailable(self):
+        ok, status = hasher.verify_integrity("abc123", None)
+        self.assertFalse(ok)
+        self.assertEqual(status, "UNAVAILABLE")
+
+    def test_both_none_is_unavailable(self):
+        ok, status = hasher.verify_integrity(None, None)
+        self.assertFalse(ok)
+        self.assertEqual(status, "UNAVAILABLE")
+
+
+class TestSnapshot(unittest.TestCase):
+    """Tests for snapshot functionality."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="wb")
+        self.tmp.write(b"Snapshot test data")
+        self.tmp.close()
+        hasher.clear_snapshot()
+
+    def tearDown(self):
+        os.unlink(self.tmp.name)
+        hasher.clear_snapshot()
+
+    def test_snapshot_stores_hash(self):
+        digest = hasher.snapshot_file(self.tmp.name)
+        self.assertIsNotNone(digest)
+        snapshot = hasher.get_snapshot()
+        self.assertIn(self.tmp.name, snapshot)
+        self.assertEqual(snapshot[self.tmp.name], digest)
+
+    def test_check_against_snapshot_intact(self):
+        hasher.snapshot_file(self.tmp.name)
+        ok, status, pre, post = hasher.check_against_snapshot(self.tmp.name)
+        self.assertTrue(ok)
+        self.assertEqual(status, "INTACT")
+
+    def test_check_against_snapshot_tampered(self):
+        hasher.snapshot_file(self.tmp.name)
+        # Modify file after snapshot
+        with open(self.tmp.name, "wb") as f:
+            f.write(b"TAMPERED CONTENT - completely different")
+        ok, status, pre, post = hasher.check_against_snapshot(self.tmp.name)
+        self.assertFalse(ok)
+        self.assertEqual(status, "TAMPERED")
+
+    def test_clear_snapshot(self):
+        hasher.snapshot_file(self.tmp.name)
+        hasher.clear_snapshot(self.tmp.name)
+        self.assertNotIn(self.tmp.name, hasher.get_snapshot())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+</file>
+
+<file path="tests/test_detector.py">
+"""
+tests/test_detector.py - Unit Tests for detector.py
+Uses Python's built-in unittest module.
+"""
+
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import detector
+
+
+class TestIsSensitiveFile(unittest.TestCase):
+
+    def test_sensitive_extension_docx(self):
+        self.assertTrue(detector.is_sensitive_file("C:\\Reports\\budget.docx"))
+
+    def test_sensitive_extension_pem(self):
+        self.assertTrue(detector.is_sensitive_file("/etc/ssl/server.pem"))
+
+    def test_sensitive_extension_env(self):
+        self.assertTrue(detector.is_sensitive_file("C:\\project\\.env"))
+
+    def test_sensitive_extension_sql(self):
+        self.assertTrue(detector.is_sensitive_file("D:\\backup\\dump.sql"))
+
+    def test_normal_extension_txt(self):
+        # .txt is not in the sensitive extensions list
+        self.assertFalse(detector.is_sensitive_file("C:\\Users\\Public\\note.txt"))
+
+    def test_normal_extension_png(self):
+        self.assertFalse(detector.is_sensitive_file("C:\\Photos\\img.png"))
+
+    def test_empty_path(self):
+        self.assertFalse(detector.is_sensitive_file(""))
+
+    def test_none_path(self):
+        self.assertFalse(detector.is_sensitive_file(None))
+
+
+class TestIsSuspiciousDestination(unittest.TestCase):
+
+    def test_usb_drive_e(self):
+        self.assertTrue(detector.is_suspicious_destination("E:\\secret\\file.docx"))
+
+    def test_usb_drive_f(self):
+        self.assertTrue(detector.is_suspicious_destination("F:\\backup.zip"))
+
+    def test_unc_network_path(self):
+        self.assertTrue(detector.is_suspicious_destination("\\\\fileserver\\share\\doc.pdf"))
+
+    def test_onedrive_path(self):
+        self.assertTrue(
+            detector.is_suspicious_destination("C:\\Users\\Sven\\OneDrive\\secret.docx")
+        )
+
+    def test_dropbox_path(self):
+        self.assertTrue(
+            detector.is_suspicious_destination("C:\\Users\\Sven\\Dropbox\\report.xlsx")
+        )
+
+    def test_normal_local_path(self):
+        self.assertFalse(
+            detector.is_suspicious_destination("C:\\Users\\Sven\\Documents\\notes.docx")
+        )
+
+    def test_empty_destination(self):
+        self.assertFalse(detector.is_suspicious_destination(""))
+
+
+class TestClassifyEvent(unittest.TestCase):
+
+    def test_sensitive_file_to_usb_is_critical(self):
+        level = detector.classify_event("MOVED", "C:\\Secret\\payroll.xlsx", "E:\\copy.xlsx")
+        self.assertEqual(level, "CRITICAL")
+
+    def test_normal_file_to_usb_is_critical(self):
+        # FIX: use C:\Projects instead of C:\Temp (Temp is in SUSPICIOUS_PATH_KEYWORDS)
+        level = detector.classify_event("MOVED", "C:\\Projects\\notes.txt", "E:\\notes.txt")
+        self.assertEqual(level, "CRITICAL")
+
+    def test_sensitive_file_moved_locally_is_critical(self):
+        # Moving sensitive files is CRITICAL even within local directories
+        level = detector.classify_event("MOVED", "C:\\Docs\\contract.docx", "C:\\Archive\\")
+        self.assertEqual(level, "CRITICAL")
+
+    def test_sensitive_file_deleted_is_critical(self):
+        level = detector.classify_event("DELETED", "C:\\Docs\\key.pem")
+        self.assertEqual(level, "CRITICAL")
+
+    def test_sensitive_file_created_is_warning(self):
+        level = detector.classify_event("CREATED", "C:\\Docs\\report.pdf")
+        self.assertEqual(level, "WARNING")
+
+    def test_sensitive_file_modified_is_warning(self):
+        level = detector.classify_event("MODIFIED", "C:\\Docs\\budget.xlsx")
+        self.assertEqual(level, "WARNING")
+
+    def test_normal_file_normal_path_is_info(self):
+        # FIX: C:\Temp contains "Temp" which is in SUSPICIOUS_PATH_KEYWORDS.
+        # Use C:\Projects instead — a neutral path with no sensitive/suspicious markers.
+        level = detector.classify_event("CREATED", "C:\\Projects\\notes.txt")
+        self.assertEqual(level, "INFO")
+
+    def test_normal_file_modified_is_info(self):
+        level = detector.classify_event("MODIFIED", "C:\\Public\\readme.txt")
+        self.assertEqual(level, "INFO")
+
+
+class TestDescribeEvent(unittest.TestCase):
+
+    def test_created_description(self):
+        desc = detector.describe_event("CREATED", "C:\\Docs\\report.pdf")
+        self.assertIn("created", desc.lower())
+        self.assertIn("report.pdf", desc)
+
+    def test_moved_description(self):
+        desc = detector.describe_event("MOVED", "C:\\Docs\\file.docx", "E:\\file.docx")
+        self.assertIn("moved", desc.lower())
+
+    def test_deleted_description(self):
+        desc = detector.describe_event("DELETED", "C:\\secret.key")
+        self.assertIn("deleted", desc.lower())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+</file>
+
+<file path="tests/test_integration.py">
+"""
+tests/test_integration.py - Live integration test for debounce and self-logging prevention
+"""
+
+import os
+import sys
+import time
+import tempfile
+import shutil
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from monitor import FileMonitor
+import logger
+
+
+def test_monitor_no_flood():
+    # Record starting log count
+    start_logs = len(logger.load_logs())
+
+    # Create a temporary monitored directory
+    temp_dir = tempfile.mkdtemp(prefix="sec_mon_test_")
+
+    monitor = FileMonitor(directories=[temp_dir])
+    monitor.start()
+    time.sleep(0.5)
+
+    try:
+        # 1. Create a normal file and write to it multiple times in rapid succession
+        normal_file = os.path.join(temp_dir, "notes.txt")
+        with open(normal_file, "w") as f:
+            f.write("Hello World\n")
+
+        # Simulate rapid write flushes like Windows does during file copy
+        for i in range(10):
+            with open(normal_file, "a") as f:
+                f.write(f"Line {i}\n")
+            time.sleep(0.05)
+
+        time.sleep(1.0)
+
+        # 2. Create a sensitive file
+        sensitive_file = os.path.join(temp_dir, "payroll.xlsx")
+        with open(sensitive_file, "wb") as f:
+            f.write(b"PK\x03\x04DummyExcelBytes")
+
+        for i in range(10):
+            with open(sensitive_file, "ab") as f:
+                f.write(b"extra_chunk")
+            time.sleep(0.05)
+
+        time.sleep(1.0)
+
+    finally:
+        monitor.stop()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    # Check results
+    new_logs = logger.load_logs()[start_logs:]
+    print(f"\n--- INTEGRATION TEST RESULTS ---")
+    print(f"Total events recorded: {len(new_logs)}")
+    for l in new_logs:
+        print(f"[{l['alert_level']}] {l['event_type']} -> {os.path.basename(l['source'])}")
+
+    normal_events = [l for l in new_logs if "notes.txt" in l["source"]]
+    sensitive_events = [l for l in new_logs if "payroll.xlsx" in l["source"]]
+
+    print(f"Normal file events: {len(normal_events)} (expected 1, was 0 without debounce)")
+    print(f"Sensitive file events: {len(sensitive_events)} (expected 1, was 0 without debounce)")
+
+    assert len(normal_events) <= 2, f"Too many normal file events: {len(normal_events)}"
+    assert len(sensitive_events) <= 2, f"Too many sensitive file events: {len(sensitive_events)}"
+
+    # Check alert levels
+    if normal_events:
+        assert normal_events[0]["alert_level"] == "INFO", f"Expected INFO for notes.txt, got {normal_events[0]['alert_level']}"
+    if sensitive_events:
+        assert sensitive_events[0]["alert_level"] == "WARNING", f"Expected WARNING for payroll.xlsx, got {sensitive_events[0]['alert_level']}"
+
+    print("ALL INTEGRATION ASSERTIONS PASSED! Clean, non-flooded monitoring verified.")
+
+
+if __name__ == "__main__":
+    test_monitor_no_flood()
+
+</file>
+
+<file path=".gitignore">
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Application runtime logs and reports
+logs/*.log
+reports/*.txt
+
+# OS metadata
+desktop.ini
+thumbs.db
+.DS_Store
+
+# Virtual environment / IDE
+venv/
+.env
+.vscode/
+.idea/
+
+</file>
+
+</files>

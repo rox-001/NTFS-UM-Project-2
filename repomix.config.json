@@ -1,0 +1,38 @@
+{
+  "$schema": "https://repomix.com/schemas/repomix.config.json",
+  "output": {
+    "filePath": "repomix-output.xml",
+    "style": "xml",
+    "removeComments": false,
+    "removeEmptyLines": false,
+    "showLineNumbers": true,
+    "topFiles": [
+      "README.md",
+      "main.py",
+      "config.py",
+      "monitor.py",
+      "detector.py",
+      "hasher.py",
+      "logger.py",
+      "alerter.py",
+      "reporter.py",
+      "dashboard/app.py",
+      "requirements.txt"
+    ]
+  },
+  "include": [
+    "**/*"
+  ],
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      "logs/**",
+      "reports/**",
+      "__pycache__/**",
+      "*.pyc",
+      "desktop.ini",
+      "thumbs.db"
+    ]
+  }
+}
