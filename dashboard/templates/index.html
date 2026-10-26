@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>SecureMonitor — File Transfer Dashboard</title>
+  <title>FileSentinel DLP — File Transfer Dashboard</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css"/>
@@ -15,8 +15,8 @@
   <div class="top-bar-inner">
     <div class="logo-area">
       <span class="logo-icon">🛡</span>
-      <span class="logo-text">SecureMonitor</span>
-      <span class="logo-sub">File Transfer DLP</span>
+      <span class="logo-text">FileSentinel DLP</span>
+      <span class="logo-sub">Security Operations</span>
     </div>
     <div class="status-area">
       <span class="status-dot" id="statusDot"></span>
@@ -27,7 +27,7 @@
 </header>
 
 <!-- ═══════════════════════════════ MAIN LAYOUT ═══════════════════════════ -->
-<div class="layout">
+<div class="layout" id="mainLayout">
 
   <!-- ─── LEFT SIDEBAR: Alerts ─── -->
   <aside class="sidebar">
@@ -97,7 +97,10 @@
     <!-- Log Table -->
     <section class="table-section">
       <div class="table-header-row">
-        <span class="table-title">Event Log</span>
+        <div>
+          <span class="table-title">Event Log</span>
+          <span class="table-tip">💡 Click any row to view security incident report in chat format</span>
+        </div>
         <span class="table-meta" id="tableMeta">Loading…</span>
       </div>
       <div class="table-wrapper">
@@ -126,13 +129,39 @@
     </section>
 
   </main>
+
+  <!-- ─── RIGHT VERTICAL REPORT DRAWER: Chat Block Form ─── -->
+  <aside class="report-drawer" id="reportDrawer">
+    <div class="drawer-header">
+      <div class="drawer-title-box">
+        <span class="drawer-icon">💬</span>
+        <div>
+          <div class="drawer-title">Security Incident Report</div>
+          <div class="drawer-sub" id="drawerSub">Click any log row on the left</div>
+        </div>
+      </div>
+      <button class="btn-close-drawer" onclick="closeDrawer()" title="Close Report">✕</button>
+    </div>
+
+    <!-- Scrollable Chat Stream -->
+    <div class="chat-stream" id="chatStream">
+      <div class="chat-placeholder">
+        <div class="placeholder-icon">🔍</div>
+        <div class="placeholder-title">No Event Selected</div>
+        <div class="placeholder-desc">Click on any file transfer log row to see the full vertical security report breakdown in interactive chat blocks.</div>
+      </div>
+    </div>
+  </aside>
+
 </div>
 
 <!-- ═════════════════════════════ JAVASCRIPT ══════════════════════════════ -->
 <script>
-  let currentPage   = 1;
-  let refreshTimer  = null;
-  let isConnected   = false;
+  let currentPage     = 1;
+  let refreshTimer    = null;
+  let isConnected     = false;
+  let currentLogs     = [];
+  let selectedEventId = null;
 
   // ── Fetch everything ────────────────────────────────────────────────────
   async function fetchAll() {
@@ -166,10 +195,11 @@
     try {
       const res  = await fetch(url);
       const data = await res.json();
-      renderLogs(data.logs);
+      currentLogs = data.logs || [];
+      renderLogs(currentLogs);
       renderPagination(data.page, data.total_pages, data.total);
       document.getElementById("tableMeta").textContent =
-        `Showing ${data.logs.length} of ${data.total} events`;
+        `Showing ${currentLogs.length} of ${data.total} events`;
     } catch (e) {
       document.getElementById("tableMeta").textContent = "Could not load logs.";
     }
@@ -181,19 +211,191 @@
       tbody.innerHTML = `<tr><td colspan="9" class="empty-row">No matching events.</td></tr>`;
       return;
     }
-    tbody.innerHTML = logs.map(e => `
-      <tr class="row-${(e.alert_level||"INFO").toLowerCase()}">
-        <td class="mono ts">${(e.timestamp||"").slice(0,19).replace("T"," ")}</td>
-        <td><span class="badge-level ${(e.alert_level||"INFO").toLowerCase()}">${e.alert_level||"—"}</span></td>
-        <td><span class="event-type">${e.event_type||"—"}</span></td>
-        <td class="mono path" title="${e.source||""}">${truncate(e.source||"", 45)}</td>
-        <td class="mono path" title="${e.destination||""}">${truncate(e.destination||"—", 35)}</td>
-        <td>${e.user||"—"}</td>
-        <td class="mono hash" title="${e.hash_pre||""}">${shortHash(e.hash_pre)}</td>
-        <td class="mono hash" title="${e.hash_post||""}">${shortHash(e.hash_post)}</td>
-        <td><span class="integrity-badge ${(e.integrity_status||"").toLowerCase()}">${e.integrity_status||"—"}</span></td>
-      </tr>
-    `).join("");
+    tbody.innerHTML = logs.map((e, idx) => {
+      const isSelected = selectedEventId === (e.timestamp + e.source);
+      const selectedClass = isSelected ? "selected-row" : "";
+      return `
+        <tr class="row-${(e.alert_level||"INFO").toLowerCase()} ${selectedClass}"
+            onclick="selectLogEvent(${idx}, this)"
+            title="Click to inspect this security event in chat format">
+          <td class="mono ts">${(e.timestamp||"").slice(0,19).replace("T"," ")}</td>
+          <td><span class="badge-level ${(e.alert_level||"INFO").toLowerCase()}">${e.alert_level||"—"}</span></td>
+          <td><span class="event-type">${e.event_type||"—"}</span></td>
+          <td class="mono path" title="${e.source||""}">${truncate(e.source||"", 35)}</td>
+          <td class="mono path" title="${e.destination||""}">${truncate(e.destination||"—", 25)}</td>
+          <td>${e.user||"—"}</td>
+          <td class="mono hash" title="${e.hash_pre||""}">${shortHash(e.hash_pre)}</td>
+          <td class="mono hash" title="${e.hash_post||""}">${shortHash(e.hash_post)}</td>
+          <td><span class="integrity-badge ${(e.integrity_status||"").toLowerCase()}">${e.integrity_status||"—"}</span></td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+  // ── Vertical Chat Report Selection ────────────────────────────────────────
+  function selectLogEvent(index, rowEl) {
+    const event = currentLogs[index];
+    if (!event) return;
+
+    selectedEventId = (event.timestamp + event.source);
+
+    // Update row highlights
+    document.querySelectorAll("#logTable tbody tr").forEach(tr => tr.classList.remove("selected-row"));
+    if (rowEl) rowEl.classList.add("selected-row");
+
+    // Open drawer
+    const layout = document.getElementById("mainLayout");
+    layout.classList.add("drawer-open");
+
+    // Update subtitle
+    const fileName = getBasename(event.source);
+    document.getElementById("drawerSub").textContent = `${event.event_type} • ${fileName}`;
+
+    // Render Chat Blocks
+    renderChatReport(event);
+  }
+
+  function closeDrawer() {
+    document.getElementById("mainLayout").classList.remove("drawer-open");
+    selectedEventId = null;
+    document.querySelectorAll("#logTable tbody tr").forEach(tr => tr.classList.remove("selected-row"));
+  }
+
+  function renderChatReport(e) {
+    const stream = document.getElementById("chatStream");
+    const level = (e.alert_level || "INFO").toUpperCase();
+    const fileName = getBasename(e.source);
+    const tsFormatted = (e.timestamp || "").replace("T", " ").slice(0, 19);
+
+    // Dynamic advice and policy text
+    let policyText = "";
+    let recText = "";
+    if (level === "CRITICAL") {
+      policyText = "High-Risk Security Policy Triggered: Sensitive file moved or transferred to an unauthorized destination (e.g. external USB drive, cloud folder, or network UNC share).";
+      recText = "🚨 Immediate Action Required: Verify user identity and confirm if transfer was authorized. Isolate destination storage or block exfiltration path.";
+    } else if (level === "WARNING") {
+      policyText = "Data Loss Prevention (DLP) Warning: Creation or modification of a restricted sensitive file type in a monitored directory.";
+      recText = "⚠️ Monitoring Advisory: Verify user context and ensure sensitive file adheres to corporate retention policies.";
+    } else {
+      policyText = "Standard Operational Event: Normal file activity within monitored local parameters.";
+      recText = "✅ Routine Logging: No further blue team action needed. Activity cataloged in audit ledger.";
+    }
+
+    const html = `
+      <!-- Block 1: Incident Trigger (System Alert) -->
+      <div class="chat-block bot-block">
+        <div class="chat-avatar system-av ${level.toLowerCase()}">🤖</div>
+        <div class="chat-body">
+          <div class="chat-meta">
+            <span class="chat-sender">FileSentinel Agent</span>
+            <span class="chat-time">${tsFormatted}</span>
+          </div>
+          <div class="chat-bubble ${level.toLowerCase()}">
+            <div class="bubble-headline">
+              <span class="badge-level ${level.toLowerCase()}">${level}</span>
+              <strong>${e.event_type} event detected</strong>
+            </div>
+            <p class="bubble-p">Filesystem monitor intercepted a file <strong>${e.event_type}</strong> operation for <code>${fileName}</code>.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Block 2: File & Transfer Telemetry -->
+      <div class="chat-block bot-block">
+        <div class="chat-avatar file-av">📁</div>
+        <div class="chat-body">
+          <div class="chat-meta">
+            <span class="chat-sender">Filesystem Telemetry</span>
+            <span class="chat-tag">Transfer Details</span>
+          </div>
+          <div class="chat-bubble info-bubble">
+            <div class="kv-grid">
+              <div class="kv-item">
+                <span class="kv-label">Source Path:</span>
+                <div class="kv-val mono break-all" id="srcPathVal">${e.source || "—"}</div>
+              </div>
+              ${e.destination ? `
+              <div class="kv-item">
+                <span class="kv-label">Destination Path:</span>
+                <div class="kv-val mono break-all text-amber">${e.destination}</div>
+              </div>` : ""}
+              <div class="kv-item flex-row">
+                <div>
+                  <span class="kv-label">User / Account:</span>
+                  <div class="kv-val font-semibold">${e.user || "N/A"}</div>
+                </div>
+                <div>
+                  <span class="kv-label">Triggering Process:</span>
+                  <div class="kv-val mono">${e.process || "N/A"}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Block 3: Cryptographic Integrity Hashing -->
+      <div class="chat-block bot-block">
+        <div class="chat-avatar hash-av">🔐</div>
+        <div class="chat-body">
+          <div class="chat-meta">
+            <span class="chat-sender">Integrity Engine</span>
+            <span class="chat-tag">${(e.hash_algorithm || "SHA256").toUpperCase()}</span>
+          </div>
+          <div class="chat-bubble">
+            <div class="bubble-headline">
+              <span class="integrity-badge ${(e.integrity_status||"").toLowerCase()}">
+                ${e.integrity_status === "INTACT" ? "✓ INTACT" : (e.integrity_status === "TAMPERED" ? "🚨 TAMPERED" : "UNAVAILABLE")}
+              </span>
+              <span class="hash-status-text">
+                ${e.integrity_status === "INTACT" ? "Cryptographic checksum matched perfectly." : "Hash disparity detected or file removed."}
+              </span>
+            </div>
+            <div class="hash-box">
+              <div class="hash-line">
+                <span class="hash-label">Pre-Hash:</span>
+                <code class="mono-code">${e.hash_pre || "N/A"}</code>
+              </div>
+              <div class="hash-line">
+                <span class="hash-label">Post-Hash:</span>
+                <code class="mono-code">${e.hash_post || "N/A"}</code>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Block 4: Policy Verdict & Recommendation -->
+      <div class="chat-block bot-block">
+        <div class="chat-avatar verdict-av ${level.toLowerCase()}">🛡️</div>
+        <div class="chat-body">
+          <div class="chat-meta">
+            <span class="chat-sender">SOC Policy Advisor</span>
+            <span class="chat-tag">Blue Team Brief</span>
+          </div>
+          <div class="chat-bubble policy-bubble ${level.toLowerCase()}">
+            <div class="policy-section">
+              <div class="sec-title">Security Policy Evaluation</div>
+              <div class="sec-body">${policyText}</div>
+            </div>
+            <div class="policy-section mt-8">
+              <div class="sec-title">Recommended Action</div>
+              <div class="sec-body font-medium">${recText}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Block 5: Interactive Quick Actions -->
+      <div class="action-footer">
+        <button class="btn-action" onclick="copyLogJson(${encodeURIComponent(JSON.stringify(e))})">📋 Copy JSON</button>
+        <button class="btn-action" onclick="copyText('${escapeQuotes(e.source || "")}')">📁 Copy Source</button>
+        <button class="btn-action secondary" onclick="closeDrawer()">✕ Close</button>
+      </div>
+    `;
+
+    stream.innerHTML = html;
+    stream.scrollTop = 0;
   }
 
   function renderPagination(page, totalPages, total) {
@@ -231,7 +433,7 @@
     } catch (e) { /* sidebar alert failure is non-critical */ }
   }
 
-  // ── Helpers ──────────────────────────────────────────────────────────────
+  // ── Utilities ────────────────────────────────────────────────────────────
   function truncate(str, n) {
     if (!str) return "—";
     return str.length > n ? "…" + str.slice(-(n-1)) : str;
@@ -240,6 +442,31 @@
   function shortHash(h) {
     if (!h || h === "N/A") return "N/A";
     return h.length > 12 ? h.slice(0, 8) + "…" + h.slice(-4) : h;
+  }
+
+  function getBasename(path) {
+    if (!path) return "Unknown File";
+    const parts = path.split(/[\/\\]/);
+    return parts[parts.length - 1] || path;
+  }
+
+  function escapeQuotes(str) {
+    return str.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  }
+
+  function copyLogJson(jsonStr) {
+    try {
+      const parsed = JSON.parse(decodeURIComponent(jsonStr));
+      navigator.clipboard.writeText(JSON.stringify(parsed, null, 2));
+      alert("✓ Log JSON copied to clipboard!");
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  function copyText(txt) {
+    navigator.clipboard.writeText(txt);
+    alert("✓ Copied to clipboard:\n" + txt);
   }
 
   function setConnected(ok) {
