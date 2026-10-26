@@ -4,6 +4,7 @@ Adjust these values to match your environment before running.
 """
 
 import os
+import sys
 
 # =============================================================================
 # MONITORING TARGETS
@@ -82,9 +83,25 @@ ALERT_LEVELS = {
 }
 
 # =============================================================================
-# LOGGING & OUTPUT PATHS
+# LOGGING & OUTPUT PATHS & RESOURCE RESOLUTION (PyInstaller Frozen Support)
 # =============================================================================
-BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    # PyInstaller unpacks bundled assets (templates, static, icons) into _MEIPASS
+    RESOURCE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    # Output logs and reports next to executable (or AppData if installed in Program Files)
+    _exe_dir = os.path.dirname(sys.executable)
+    try:
+        _test_file = os.path.join(_exe_dir, ".perm_test")
+        with open(_test_file, "w") as _f:
+            _f.write("1")
+        os.remove(_test_file)
+        BASE_DIR = _exe_dir
+    except (PermissionError, OSError):
+        BASE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "FileSentinel")
+else:
+    RESOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+    BASE_DIR = RESOURCE_DIR
+
 LOG_DIR         = os.path.join(BASE_DIR, "logs")
 REPORT_DIR      = os.path.join(BASE_DIR, "reports")
 

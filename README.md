@@ -29,6 +29,9 @@ A Python-based Blue Team security tool designed to monitor filesystem activity i
   - Local Flask web UI (`http://127.0.0.1:5000`) with auto-refreshing telemetry, searchable/filterable logs, and live alert feeds.
   - **Interactive Incident Chat Drawer:** Clicking any log event row opens a vertical report in chat block form (System alert, Telemetry breakdown, SHA-256 hash inspection, and SOC blue-team advice).
   - Zero external network dependencies (100% localhost).
+- **Standalone `.exe` & Windows `.msi` Installer:**
+  - Compiled portable executable `FileSentinel.exe` (run directly with zero Python installation required).
+  - Official Windows Installer `FileSentinel-Setup.msi` with desktop/start menu shortcuts and clean uninstallation.
 - **Noise Suppression & Write-Burst Debouncing:**
   - Eliminates duplicate operating system write-buffer flushes during large file transfers.
   - Prevents recursive log feedback loops.
@@ -75,7 +78,12 @@ A Python-based Blue Team security tool designed to monitor filesystem activity i
 ├── reporter.py               # Automated audit report generator
 ├── main.py                   # Central CLI and desktop app launcher
 ├── app_desktop.py            # Native Windows Desktop App with System Tray & Toasts
+├── build_all.ps1             # 1-click automated build pipeline (.exe & .msi)
 ├── assets/                   # Application icons (icon.png, icon.ico)
+├── installer/
+│   ├── FileSentinel.wxs      # WiX Toolset Windows Installer definition
+│   └── license.rtf           # EULA license displayed in MSI setup wizard
+├── dist/                     # Compiled binaries (FileSentinel.exe, FileSentinel-Setup.msi)
 ├── dashboard/
 │   ├── app.py                # Local Flask server providing REST API endpoints
 │   ├── templates/index.html  # SPLUNK-inspired dashboard UI with vertical chat drawer
@@ -90,7 +98,31 @@ A Python-based Blue Team security tool designed to monitor filesystem activity i
 
 ---
 
-## 🚀 Installation & Requirements
+## 📦 Standalone Executable & Windows Installer (.msi)
+
+### Running the Standalone Executable
+You do **not** need Python installed to run the compiled application:
+* Location: `dist\FileSentinel.exe`
+* Double-click `FileSentinel.exe` to launch the native desktop application immediately.
+* It embeds the dashboard, assets, and watchdog engine into a single portable binary.
+
+### Installing via Windows Installer (.msi)
+* Location: `dist\FileSentinel-Setup.msi`
+* Double-click `FileSentinel-Setup.msi` to run the standard Windows installation wizard.
+* Installs `FileSentinel` to `C:\Program Files\FileSentinel`.
+* Automatically creates Desktop and Start Menu shortcuts.
+* Can be uninstalled cleanly at any time through Windows **Settings > Apps > Installed apps** or **Control Panel**.
+
+### Building `.exe` and `.msi` from Source
+To rebuild both binaries at any time, run the automated PowerShell script:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_all.ps1
+```
+This script handles dependency verification, PyInstaller frozen bundling, portable WiX Toolset setup, and `.msi` compilation.
+
+---
+
+## 🚀 Python Source Installation & Setup
 
 ### Prerequisites
 - Python 3.9+ (Python 3.10+ recommended)
@@ -99,7 +131,7 @@ A Python-based Blue Team security tool designed to monitor filesystem activity i
 ### Setup
 ```bash
 # Clone the repository
-git clone https://github.com/rox-001/NTFS-UM-Project-2.git
+git clone https://github.com/swastik-v1/NTFS-UM-Project-2.git
 cd NTFS-UM-Project-2
 
 # Install dependencies
@@ -112,8 +144,10 @@ pip install -r requirements.txt
 
 ## 💻 Usage
 
-### 1. Launch the Native Windows Desktop App (Recommended)
+### 1. Launch the Native Windows Desktop App (Default)
 ```bash
+python main.py
+# or
 python main.py --desktop
 # or
 python app_desktop.py
@@ -150,21 +184,19 @@ python main.py --test-hash "path/to/file.docx"
 
 ## 🛑 How to Stop / Exit the Program
 
-### When Running the Desktop App (`--desktop`):
-Because security monitors are designed to protect files continuously, clicking the window's close (`X`) button **minimizes the app to the system tray** instead of killing it.
-
-To fully quit:
-1. Locate the **FileSentinel shield icon** in the Windows Taskbar Notification Tray (bottom-right near the clock; click `^` if hidden).
-2. Right-click the shield icon and select **Exit FileSentinel**.
-3. *(Or press `Ctrl + C` in the PowerShell/terminal window where you launched it).*
+### When Running the Desktop App (`--desktop` or `FileSentinel.exe`):
+To exit the application, use any of the following convenient options:
+1. **Close the Window (`X`):** Simply click the close button on the desktop window. FileSentinel shuts down all background threads, stops monitoring, and exits cleanly.
+2. **Press `Ctrl + C`:** If launched from a PowerShell or Command Prompt terminal, pressing `Ctrl + C` immediately terminates all monitoring and Flask threads.
+3. **System Tray Menu:** Right-click the FileSentinel shield icon in the system tray and select **Exit FileSentinel**.
 
 ### When Running in Terminal Mode (`--monitor`):
 * Press **`Ctrl + C`** in your PowerShell or Command Prompt window. The watchdog observer will flush any remaining logs and shut down gracefully.
 
 ### Emergency Force-Stop:
-If you need to force-terminate all running Python monitoring processes from PowerShell:
+If you need to force-terminate any lingering processes from PowerShell:
 ```powershell
-Stop-Process -Name python -Force
+Stop-Process -Name FileSentinel, python -Force -ErrorAction SilentlyContinue
 ```
 
 ---

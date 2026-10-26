@@ -13,9 +13,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from flask import Flask, render_template, jsonify, request
 import logger
 import alerter
-from config import DASHBOARD_HOST, DASHBOARD_PORT, DASHBOARD_DEBUG, LOGS_PER_PAGE
+from config import DASHBOARD_HOST, DASHBOARD_PORT, DASHBOARD_DEBUG, LOGS_PER_PAGE, RESOURCE_DIR
 
-app = Flask(__name__)
+template_dir = os.path.join(RESOURCE_DIR, "dashboard", "templates")
+static_dir   = os.path.join(RESOURCE_DIR, "dashboard", "static")
+
+app = Flask(__name__, template_folder=template_dir, static_folder=static_dir)
 
 
 @app.route("/")

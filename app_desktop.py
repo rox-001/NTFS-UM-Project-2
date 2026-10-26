@@ -2,14 +2,16 @@
 app_desktop.py - Native Windows Desktop Application for FileSentinel DLP
 Combines:
   - pywebview: Native Chromium/Edge desktop window for the SPLUNK dashboard
-  - pystray: System tray icon with right-click menu & background persistence
+  - pystray: System tray icon with right-click menu
   - Native toast notifications for WARNING and CRITICAL policy violations
   - Background watchdog filesystem monitoring
+  - Instant and clean shutdown on window close [X] or Ctrl+C
 """
 
 import os
 import sys
 import time
+import signal
 import threading
 from PIL import Image
 import webview
@@ -18,19 +20,76 @@ import webview
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
-from config import DASHBOARD_HOST, DASHBOARD_PORT, BASE_DIR
+from config import DASHBOARD_HOST, DASHBOARD_PORT, BASE_DIR, RESOURCE_DIR
 from monitor import FileMonitor
 import alerter
 import reporter
 from dashboard.app import app as flask_app
 
-ICON_PATH = os.path.join(BASE_DIR, "assets", "icon.png")
+ICON_PATH = os.path.join(RESOURCE_DIR, "assets", "icon.png")
 
 # Global state handles
 _monitor = None
 _tray_icon = None
 _main_window = None
 _is_monitoring = True
+_is_shutting_down = False
+
+
+def _quit_app(icon=None, item=None):
+    """Shuts down all threads, monitor, tray icon, and exits immediately."""
+    global _monitor, _tray_icon, _main_window, _is_shutting_down
+    if _is_shutting_down:
+        return
+    _is_shutting_down = True
+
+    print("\n  [+] FileSentinel shutting down...")
+
+    if _monitor:
+        try:
+            _monitor.stop()
+        except Exception:
+            pass
+
+    if _tray_icon:
+        try:
+            _tray_icon.stop()
+        except Exception:
+            pass
+
+    if _main_window:
+        try:
+            _main_window.destroy()
+        except Exception:
+            pass
+
+    # Hard exit guarantees no background threads (Flask, Watchdog) linger in memory
+    os._exit(0)
+
+
+def _handle_exit_signal(sig=None, frame=None):
+    """Signal handler for Ctrl+C (SIGINT) and termination (SIGTERM)."""
+    _quit_app()
+
+
+# Register signal handlers
+try:
+    signal.signal(signal.SIGINT, _handle_exit_signal)
+    signal.signal(signal.SIGTERM, _handle_exit_signal)
+except Exception:
+    pass
+
+# Windows console control handler (handles Ctrl+C even if Python thread is blocked in C loop)
+try:
+    import win32api
+
+    def _console_ctrl_handler(ctrl_type):
+        _quit_app()
+        return True
+
+    win32api.SetConsoleCtrlHandler(_console_ctrl_handler, True)
+except Exception:
+    pass
 
 
 def _run_flask_server():
@@ -87,30 +146,6 @@ def _show_window(icon=None, item=None):
             pass
 
 
-def _quit_app(icon=None, item=None):
-    """Shuts down all threads, monitor, tray icon, and exits."""
-    global _monitor, _tray_icon, _main_window
-    if _monitor:
-        try:
-            _monitor.stop()
-        except Exception:
-            pass
-
-    if _tray_icon:
-        try:
-            _tray_icon.stop()
-        except Exception:
-            pass
-
-    if _main_window:
-        try:
-            _main_window.destroy()
-        except Exception:
-            pass
-
-    os._exit(0)
-
-
 def _setup_system_tray():
     """Initializes and runs the system tray icon with context menu."""
     global _tray_icon
@@ -136,21 +171,15 @@ def _setup_system_tray():
 
 
 def _on_window_closing():
-    """When the user closes the window, hide it to the system tray instead of killing the app."""
-    global _main_window, _tray_icon
-    if _main_window:
-        _main_window.hide()
-        if _tray_icon:
-            _tray_icon.notify("FileSentinel is continuing to protect files in the background.", "Running in Tray")
-    # Return False to prevent pywebview from destroying the window
-    return False
+    """When the user closes the window with [X], cleanly exit the entire application."""
+    _quit_app()
 
 
 def launch_desktop_app():
     """Main entry point for the desktop application."""
     global _monitor, _main_window
 
-    # 1. Register native toast notification callback
+    # 1. Register native toast notification callback (only for security alerts)
     alerter.register_desktop_notifier(_show_toast_notification)
 
     # 2. Start Flask Web Server thread
@@ -177,17 +206,19 @@ def launch_desktop_app():
         background_color="#0d1117",
     )
 
-    # Attach window close handler to minimize to system tray
+    # When the user closes the window with [X], shut down the application cleanly
     _main_window.events.closing += _on_window_closing
 
     print("\n  [+] FileSentinel Desktop App launched.")
-    print("  [+] Native window active. System tray icon enabled.\n")
+    print("  [+] Native window active. Close the window or press Ctrl+C to exit.\n")
 
     # Start pywebview main GUI loop (blocking call on main thread)
-    webview.start(gui="edgechromium")
-
-    # Cleanup if loop exits
-    _quit_app()
+    try:
+        webview.start(gui="edgechromium")
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        _quit_app()
 
 
 if __name__ == "__main__":

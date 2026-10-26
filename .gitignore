@@ -7,6 +7,13 @@ __pycache__/
 logs/*.log
 reports/*.txt
 
+# Packaging & compiler artifacts
+build/
+dist/
+tools/
+*.wixobj
+*.wixpdb
+
 # OS metadata
 desktop.ini
 thumbs.db

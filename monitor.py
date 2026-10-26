@@ -283,7 +283,7 @@ class FileMonitor:
         """Gracefully stop the observer."""
         if self._running:
             self.observer.stop()
-            self.observer.join()
+            self.observer.join(timeout=1.0)
             self._running = False
             print("\n  Monitor stopped. Goodbye.")
 

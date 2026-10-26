@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="FileSentinel DLP"
+           Language="1033"
+           Version="1.0.0"
+           Manufacturer="FileSentinel Security"
+           UpgradeCode="B9F74C82-1D5B-4C95-8F32-843B80E2AC7E">
+
+    <Package InstallerVersion="301"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Platform="x64"
+             Description="FileSentinel DLP - Secure File Transfer Monitoring System"
+             Comments="Real-time file integrity and data loss prevention monitoring." />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of FileSentinel is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Application Icon (Id ends in .ico for ICE50 compliance) -->
+    <Icon Id="AppIcon.ico" SourceFile="..\assets\icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/swastik-v1/NTFS-UM-Project-2" />
+
+    <!-- Directory Layout -->
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="FileSentinel">
+          <Component Id="MainExecutable" Guid="3A9B7C12-58D4-4F91-A89E-7E3D8F5C1B20" Win64="yes">
+            <File Id="FileSentinelEXE"
+                  Name="FileSentinel.exe"
+                  Source="..\dist\FileSentinel.exe"
+                  KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="FileSentinel">
+          <Component Id="StartMenuShortcutComponent" Guid="8E1C2D34-7B5A-4C9F-9D8E-1F2A3B4C5D6E">
+            <Shortcut Id="StartMenuShortcut"
+                      Name="FileSentinel DLP"
+                      Description="Launch FileSentinel DLP Desktop App"
+                      Target="[#FileSentinelEXE]"
+                      WorkingDirectory="INSTALLFOLDER"
+                      Icon="AppIcon.ico" />
+            <RemoveFolder Id="CleanUpStartMenuFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
+            <RegistryValue Root="HKCU"
+                           Key="Software\FileSentinel"
+                           Name="StartMenuInstalled"
+                           Type="integer"
+                           Value="1"
+                           KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+
+      <Directory Id="DesktopFolder" Name="Desktop">
+        <Component Id="DesktopShortcutComponent" Guid="5F4E3D2C-1B0A-4987-9876-543210FEDCBA">
+          <Shortcut Id="DesktopShortcut"
+                    Name="FileSentinel DLP"
+                    Description="Launch FileSentinel DLP Desktop App"
+                    Target="[#FileSentinelEXE]"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Icon="AppIcon.ico" />
+          <RegistryValue Root="HKCU"
+                         Key="Software\FileSentinel"
+                         Name="DesktopShortcutInstalled"
+                         Type="integer"
+                         Value="1"
+                         KeyPath="yes" />
+        </Component>
+      </Directory>
+    </Directory>
+
+    <!-- Features to install -->
+    <Feature Id="ProductFeature" Title="FileSentinel DLP" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="StartMenuShortcutComponent" />
+      <ComponentRef Id="DesktopShortcutComponent" />
+    </Feature>
+
+    <!-- UI Setup Wizard -->
+    <UIRef Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="license.rtf" />
+  </Product>
+</Wix>

@@ -1,6 +1,7 @@
 """
 main.py - Secure File Transfer Monitoring System — Entry Point
 Usage:
+  python main.py                        # Default: Launch native Windows Desktop App
   python main.py --desktop              # Launch full native Windows Desktop App (Window + Tray + Alerts)
   python main.py --monitor              # Monitor + colorama console (no dashboard)
   python main.py --monitor --dashboard  # Monitor + console + web dashboard in browser
@@ -31,6 +32,9 @@ def cmd_desktop():
     try:
         from app_desktop import launch_desktop_app
         launch_desktop_app()
+    except (KeyboardInterrupt, SystemExit):
+        print("\n  [+] FileSentinel shutdown requested. Exiting...")
+        os._exit(0)
     except ImportError as e:
         print(f"  [ERROR] Desktop GUI dependency missing: {e}")
         print("  Install desktop dependencies with: pip install pywebview pystray Pillow")
@@ -48,17 +52,25 @@ def cmd_monitor(with_dashboard: bool):
     try:
         monitor.start()
         while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        monitor.stop()
+            time.sleep(0.5)
+    except (KeyboardInterrupt, SystemExit):
+        try:
+            monitor.stop()
+        except Exception:
+            pass
         print("\n  Logs saved. Run 'python main.py --report' for a full audit report.")
+        os._exit(0)
 
 
 def cmd_dashboard_only():
     """Launch dashboard without starting the file monitor."""
     print_banner()
     print("  [Dashboard-only mode] File monitoring is NOT active.\n")
-    _launch_dashboard_blocking()
+    try:
+        _launch_dashboard_blocking()
+    except (KeyboardInterrupt, SystemExit):
+        print("\n  Dashboard stopped.")
+        os._exit(0)
 
 
 def cmd_report():
@@ -109,12 +121,19 @@ def _launch_dashboard_blocking():
 
 # ── CLI Argument Parser ───────────────────────────────────────────────────────
 def main():
+    # If launched with no arguments (e.g. double-clicked executable / shortcut),
+    # launch the native desktop application by default.
+    if len(sys.argv) == 1:
+        cmd_desktop()
+        return
+
     parser = argparse.ArgumentParser(
         prog="FileSentinel",
         description="Secure File Transfer Monitoring & DLP System",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  python main.py                            # Launch native Windows Desktop App (default)
   python main.py --desktop                  # Launch native Windows Desktop App
   python main.py --monitor                  # Console monitoring only
   python main.py --monitor --dashboard      # Monitor + web dashboard in browser
