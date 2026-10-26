@@ -3,6 +3,9 @@
 A Python-based Blue Team security tool designed to monitor filesystem activity in real time, detect unauthorized movement of sensitive or restricted files, verify file integrity via cryptographic hashing (SHA-256), generate policy alerts, and stream security telemetry to a local SPLUNK-style dashboard and **native Windows desktop application**.
 
 ---
+*In other words, an easy to use and efficient (fun) way to track files if you deal with a lot of them on daily basis.*
+
+---
 
 ## 🎯 Objectives & Capabilities
 
@@ -172,10 +175,11 @@ Run the automated test suite (43 unit & integration tests):
 ```bash
 python -m pytest tests -v
 ```
+*(If you've got time...)*
 
 ---
 
-## 🛡️ Blue Team Security Techniques Implemented
+## 🛡️ Blue Team Security Techniques Implemented (A bit extra stuff)
 
 - **Data Loss Prevention (DLP):** Tracks unauthorized movement of corporate and confidential file types to external endpoints.
 - **Tamper Detection:** Computes cryptographic pre/post hashes to verify that transferred files have not been modified or corrupted in transit.
