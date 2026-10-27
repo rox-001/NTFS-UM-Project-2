@@ -44,5 +44,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version='C:/Users/Sven/Desktop/NTFS UM Project 2/installer/version_info.txt',
     icon=['assets/icon.ico'],
 )
