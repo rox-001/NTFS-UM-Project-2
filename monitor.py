@@ -2,12 +2,13 @@
 monitor.py - Filesystem Event Monitor (Watchdog-based)
 Detects file create/modify/move/delete events across configured directories.
 Orchestrates the full pipeline: detect → hash → log → alert.
-Includes noise-filtering and write-burst debouncing to prevent event flooding.
+Includes noise-filtering, write-burst debouncing, directory recursion, and exfiltration correlation.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 import time
 import getpass
 import threading
@@ -25,8 +26,11 @@ from config import (
     MONITORED_DIRECTORIES,
     ENABLE_PROCESS_TRACKING,
     BASE_DIR,
+    LOG_DIR,
+    REPORT_DIR,
     IGNORED_EXTENSIONS,
     IGNORED_FILENAMES,
+    get_auto_discovered_targets,
 )
 import hasher
 import detector
@@ -34,56 +38,80 @@ import logger
 import alerter
 
 
-# Pre-calculate normalized base project path to ignore internal project files
-_PROJECT_BASE_NORM = os.path.normcase(os.path.normpath(os.path.abspath(BASE_DIR)))
+# Pre-calculate normalized directory paths
+_LOG_DIR_NORM = os.path.normcase(os.path.normpath(os.path.abspath(LOG_DIR)))
+_REPORT_DIR_NORM = os.path.normcase(os.path.normpath(os.path.abspath(REPORT_DIR)))
+_BASE_DIR_NORM = os.path.normcase(os.path.normpath(os.path.abspath(BASE_DIR)))
+
 _IGNORED_EXTS_SET = frozenset(ext.lower() for ext in IGNORED_EXTENSIONS)
 _IGNORED_NAMES_SET = frozenset(name.lower() for name in IGNORED_FILENAMES)
 
-# ── Debounce & Burst Filtering ───────────────────────────────────────────────
-# When copying/saving a file, the OS flushes buffers in chunks, firing dozens
-# of MODIFIED events. We track recent creations and modifications to eliminate noise.
-_DEBOUNCE_WINDOW = 2.0        # Seconds to suppress identical events for same file
-_RECENT_CREATION_WINDOW = 3.0 # Seconds to suppress MODIFIED events after CREATED
+# Debounce & Burst Filtering
+_DEBOUNCE_WINDOW = 0.8         # Seconds to absorb OS chunked write-buffer flushes
+_RECENT_CREATION_WINDOW = 1.0  # Seconds to absorb immediate post-create writes
 
 _recent_events: dict[str, float] = {}       # key: "EVENT_TYPE:norm_path" -> timestamp
 _recent_creations: dict[str, float] = {}    # key: "norm_path" -> timestamp
+_recent_file_sizes: dict[str, int] = {}     # key: "norm_path" -> last known size
+_recent_deletions: dict[str, tuple[float, str, str | None]] = {}  # basename -> (time, src_path, hash)
+
 _debounce_lock = threading.Lock()
 
 
 def _should_ignore_path(path: str) -> bool:
     """
     Return True if the file should be ignored:
-      - Inside the project's own folder (audit.log, alerts.log, reports, pycache)
-      - Temporary / lock files (~$doc.docx, .tmp, .crdownload, .part)
-      - OS system files (desktop.ini, thumbs.db)
-      - Version control / package directories (.git, __pycache__, node_modules)
+      - Internal application folders (logs/, reports/, build/, dist/, .git/)
+      - Zero-length system/lock files (desktop.ini, thumbs.db)
+      - Temporary non-sensitive download fragments
+    Does NOT drop files with sensitive double extensions (secret.pem.tmp).
+    Does NOT ignore sibling folders (Downloads2) or .github folders.
     """
     if not path:
         return True
 
     norm = os.path.normcase(os.path.normpath(os.path.abspath(path)))
 
-    # 1. CRITICAL: Ignore own project directory to prevent log recursion loops
-    if norm.startswith(_PROJECT_BASE_NORM):
+    # 1. Ignore application runtime folders with trailing separator
+    if norm == _LOG_DIR_NORM or norm.startswith(_LOG_DIR_NORM + os.sep):
+        return True
+    if norm == _REPORT_DIR_NORM or norm.startswith(_REPORT_DIR_NORM + os.sep):
         return True
 
-    # 2. Ignore common version control & cache directories
-    if any(segment in norm for segment in ("\\.git", "/.git", "__pycache__", "node_modules", ".vscode")):
+    # Check internal build/dist folders only if inside application base
+    if norm == _BASE_DIR_NORM or norm.startswith(_BASE_DIR_NORM + os.sep):
+        rel = os.path.relpath(norm, _BASE_DIR_NORM).replace("/", "\\")
+        top_segment = rel.split("\\")[0].lower()
+        if top_segment in {"build", "dist", "tools", "__pycache__", ".pytest_cache"}:
+            return True
+
+    # 2. Version control and package directories (exact path segment matching)
+    parts = [p.lower() for p in norm.replace("/", "\\").split("\\") if p]
+    if any(p in {".git", "__pycache__", "node_modules", ".vscode"} for p in parts):
         return True
 
     basename = os.path.basename(norm).lower()
 
-    # 3. Ignore system filenames
+    # 3. System metadata files
     if basename in _IGNORED_NAMES_SET:
         return True
 
-    # 4. Ignore temporary Office lock files and hidden temp markers
+    # 4. Office lock files (~$)
     if basename.startswith("~$") or basename.startswith(".~"):
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > 1024:
+                return False  # Not a standard lock file; investigate
+        except OSError:
+            pass
         return True
 
-    # 5. Ignore temporary / partial download extensions
+    # 5. Temporary download extensions
     _, ext = os.path.splitext(norm)
     if ext.lower() in _IGNORED_EXTS_SET:
+        # Double extension check: if stem has a sensitive extension, DO NOT drop!
+        stem, _ = os.path.splitext(norm)
+        if detector.is_sensitive_file(stem):
+            return False
         return True
 
     return False
@@ -91,22 +119,18 @@ def _should_ignore_path(path: str) -> bool:
 
 def _is_burst_duplicate(event_type: str, path: str) -> bool:
     """
-    Filter out duplicate/burst events:
-      - If file was CREATED within the last 3s, suppress subsequent MODIFIED events.
-      - Suppress identical event_type on same path within 2s.
+    Filter out duplicate OS buffer-flush events while allowing legitimate edits.
     """
     norm_path = os.path.normcase(os.path.normpath(os.path.abspath(path)))
     now = time.monotonic()
 
     with _debounce_lock:
-        # If this is a MODIFIED event right after a CREATED event for the same file, suppress it.
-        # (This is just Windows writing the file content after creation).
+        # If this is a MODIFIED event within 1.0s of CREATED, suppress it (initial buffer write)
         if event_type == "MODIFIED":
             last_created = _recent_creations.get(norm_path)
             if last_created is not None and (now - last_created) < _RECENT_CREATION_WINDOW:
                 return True
 
-        # Check general debounce for the exact event_type + path
         event_key = f"{event_type}:{norm_path}"
         last_seen = _recent_events.get(event_key)
         if last_seen is not None and (now - last_seen) < _DEBOUNCE_WINDOW:
@@ -117,9 +141,9 @@ def _is_burst_duplicate(event_type: str, path: str) -> bool:
         if event_type == "CREATED":
             _recent_creations[norm_path] = now
 
-        # Periodic cleanup when table grows large
-        if len(_recent_events) > 600:
-            cutoff = now - 15.0
+        # Periodic cache cleanup
+        if len(_recent_events) > 800:
+            cutoff = now - 10.0
             stale_keys = [k for k, t in _recent_events.items() if t < cutoff]
             for k in stale_keys:
                 del _recent_events[k]
@@ -141,40 +165,40 @@ def _get_current_user() -> str:
 
 def _get_process_name() -> str:
     """
-    Attempt to retrieve the name of the process that triggered the event.
-    Falls back to 'N/A' if psutil is unavailable or lookup fails.
+    Identify the active user-facing process interacting with files.
+    On Windows, inspects the foreground window process (e.g. explorer.exe, powershell.exe).
+    Falls back to 'System / Background' rather than attributing to FileSentinel.
     """
-    if not ENABLE_PROCESS_TRACKING or not PSUTIL_AVAILABLE:
+    if not ENABLE_PROCESS_TRACKING:
         return "N/A"
-    try:
-        return psutil.Process(os.getpid()).name()
-    except Exception:
-        return "N/A"
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            if hwnd:
+                pid = ctypes.c_ulong()
+                ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value and pid.value != os.getpid() and PSUTIL_AVAILABLE:
+                    return psutil.Process(pid.value).name()
+        except Exception:
+            pass
+
+    return "System / Background"
 
 
 class SecureTransferEventHandler(FileSystemEventHandler):
     """
-    Custom watchdog event handler that processes all filesystem events
-    through the full security pipeline.
+    Custom watchdog event handler that processes filesystem events
+    through the security pipeline with exfiltration correlation.
     """
 
     def _process_event(self, event_type: str, src_path: str, dest_path: str = ""):
-        """
-        Core pipeline for each filesystem event:
-          1. Ignore filter check (system noise & project internal logs)
-          2. Debounce & burst suppression
-          3. Classify event severity
-          4. Compute integrity hashes
-          5. Log the event
-          6. Trigger alert if needed
-        """
-        # Step 1: Filter out system noise and internal log files
         if _should_ignore_path(src_path):
             return
         if dest_path and _should_ignore_path(dest_path):
             return
 
-        # Step 2: Burst & duplicate suppression
         target_path = dest_path if (event_type == "MOVED" and dest_path) else src_path
         if _is_burst_duplicate(event_type, target_path):
             return
@@ -182,7 +206,7 @@ class SecureTransferEventHandler(FileSystemEventHandler):
         user    = _get_current_user()
         process = _get_process_name()
 
-        # Step 3: Classify severity (INFO / WARNING / CRITICAL)
+        # Step 3: Classify severity
         level = detector.classify_event(event_type, src_path, dest_path)
 
         # Step 4: Integrity hashing
@@ -190,14 +214,35 @@ class SecureTransferEventHandler(FileSystemEventHandler):
 
         if event_type == "MOVED" and dest_path and os.path.exists(dest_path):
             post_hash = hasher.compute_hash(dest_path)
-        elif event_type not in ("DELETED", "MOVED") and os.path.exists(src_path):
+        elif event_type not in ("DELETED", "MOVED", "DELETED_DIR") and os.path.exists(src_path):
             post_hash = hasher.compute_hash(src_path)
         else:
             post_hash = None
 
         _, integrity_status = hasher.verify_integrity(pre_hash, post_hash)
 
-        # Step 5: Log event to audit.log and console
+        # Step 5: Exfiltration correlation (F-01)
+        basename = os.path.basename(src_path)
+        now = time.monotonic()
+
+        # Track sensitive deletions
+        if event_type == "DELETED" and detector.is_sensitive_file(src_path):
+            with _debounce_lock:
+                _recent_deletions[basename.lower()] = (now, src_path, pre_hash)
+
+        # Correlate creation on removable / cloud destination
+        correlation_note = ""
+        if event_type in ("CREATED", "MOVED"):
+            dest_check = dest_path if dest_path else src_path
+            if detector.is_suspicious_destination(dest_check):
+                with _debounce_lock:
+                    match = _recent_deletions.get(basename.lower())
+                    if match and (now - match[0]) < 10.0:
+                        del_src = match[1]
+                        level = "CRITICAL"
+                        correlation_note = f" [Cross-Volume Exfiltration: moved/copied from '{del_src}']"
+
+        # Step 6: Log event
         logger.log_event(
             event_type       = event_type,
             source           = src_path,
@@ -210,9 +255,9 @@ class SecureTransferEventHandler(FileSystemEventHandler):
             alert_level      = level,
         )
 
-        # Step 6: Trigger alert if policy violation (WARNING or CRITICAL)
+        # Step 7: Trigger alert
         if level in ("WARNING", "CRITICAL"):
-            description = detector.describe_event(event_type, src_path, dest_path)
+            description = detector.describe_event(event_type, src_path, dest_path) + correlation_note
             alerter.trigger_alert(
                 level      = level,
                 message    = description,
@@ -224,10 +269,19 @@ class SecureTransferEventHandler(FileSystemEventHandler):
                 },
             )
 
-    # ── Watchdog callbacks ───────────────────────────────────────────────────
+    # ── Watchdog Callbacks (with Directory Expansion F-08) ───────────────────
 
     def on_created(self, event):
-        if not event.is_directory:
+        if event.is_directory:
+            self._process_event("CREATED_DIR", event.src_path)
+            if os.path.isdir(event.src_path):
+                try:
+                    for root, _, files in os.walk(event.src_path):
+                        for f in files:
+                            self._process_event("CREATED", os.path.join(root, f))
+                except OSError:
+                    pass
+        else:
             self._process_event("CREATED", event.src_path)
 
     def on_modified(self, event):
@@ -235,39 +289,61 @@ class SecureTransferEventHandler(FileSystemEventHandler):
             self._process_event("MODIFIED", event.src_path)
 
     def on_deleted(self, event):
-        if not event.is_directory:
+        if event.is_directory:
+            self._process_event("DELETED_DIR", event.src_path)
+        else:
             self._process_event("DELETED", event.src_path)
 
     def on_moved(self, event):
-        if not event.is_directory:
+        if event.is_directory:
+            self._process_event("MOVED_DIR", event.src_path, event.dest_path)
+            if os.path.isdir(event.dest_path):
+                try:
+                    for root, _, files in os.walk(event.dest_path):
+                        for f in files:
+                            dest_f = os.path.join(root, f)
+                            rel = os.path.relpath(dest_f, event.dest_path)
+                            src_f = os.path.join(event.src_path, rel)
+                            self._process_event("MOVED", src_f, dest_f)
+                except OSError:
+                    pass
+        else:
             self._process_event("MOVED", event.src_path, event.dest_path)
 
 
 class FileMonitor:
     """
-    Manages one or more watchdog Observer instances for all
-    configured directories.
+    Manages watchdog Observer instances with auto-discovered directories
+    and background USB/removable media polling.
     """
 
     def __init__(self, directories: list[str] | None = None):
         self.observer = Observer()
         self._running = False
+        self._stop_event = threading.Event()
         self.event_handler = SecureTransferEventHandler()
-        self.directories = directories if directories is not None else MONITORED_DIRECTORIES
+        self.directories = directories if directories is not None else get_auto_discovered_targets()
+        self._scheduled_paths: set[str] = set()
 
     def start(self):
-        """Schedule watchers for all configured directories and start the observer."""
+        """Schedule watchers for all discovered directories and start observer."""
         scheduled = 0
         for directory in self.directories:
             directory = os.path.expandvars(directory)
             if os.path.isdir(directory):
-                self.observer.schedule(
-                    self.event_handler,
-                    path      = directory,
-                    recursive = True,
-                )
-                print(f"  [+] Watching: {directory}")
-                scheduled += 1
+                norm = os.path.normcase(os.path.normpath(directory))
+                if norm not in self._scheduled_paths:
+                    try:
+                        self.observer.schedule(
+                            self.event_handler,
+                            path      = directory,
+                            recursive = True,
+                        )
+                        self._scheduled_paths.add(norm)
+                        print(f"  [+] Watching: {directory}")
+                        scheduled += 1
+                    except Exception as e:
+                        print(f"  [-] Could not watch {directory}: {e}")
             else:
                 print(f"  [-] Skipped (not found): {directory}")
 
@@ -277,11 +353,33 @@ class FileMonitor:
 
         self.observer.start()
         self._running = True
-        print(f"\n  Monitoring {scheduled} director(ies). Press Ctrl+C to stop.\n")
+        print(f"\n  Monitoring {scheduled} director(ies) & cloud/removable drives. Press Ctrl+C to stop.\n")
+
+        # Start dynamic USB/removable drive attachment watcher
+        poll_thread = threading.Thread(target=self._poll_new_drives, daemon=True)
+        poll_thread.start()
+
+    def _poll_new_drives(self):
+        """Polls periodically for newly plugged-in USB or network drives."""
+        while not self._stop_event.is_set():
+            time.sleep(5.0)
+            if not self._running:
+                break
+            discovered = get_auto_discovered_targets()
+            for d in discovered:
+                norm = os.path.normcase(os.path.normpath(d))
+                if norm not in self._scheduled_paths and os.path.isdir(d):
+                    try:
+                        self.observer.schedule(self.event_handler, path=d, recursive=True)
+                        self._scheduled_paths.add(norm)
+                        print(f"  [+] Auto-detected & watching new target: {d}")
+                    except Exception:
+                        pass
 
     def stop(self):
-        """Gracefully stop the observer."""
+        """Gracefully stop observer and polling threads."""
         if self._running:
+            self._stop_event.set()
             self.observer.stop()
             self.observer.join(timeout=1.0)
             self._running = False

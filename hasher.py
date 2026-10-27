@@ -32,7 +32,7 @@ def compute_hash(filepath: str, algorithm: str = HASH_ALGORITHM) -> str | None:
             while chunk := f.read(HASH_CHUNK_SIZE):
                 h.update(chunk)
         return h.hexdigest()
-    except (FileNotFoundError, PermissionError, OSError):
+    except (FileNotFoundError, PermissionError, OSError, ValueError):
         return None
 
 
