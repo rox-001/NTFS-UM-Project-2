@@ -84,12 +84,28 @@
 
     <!-- Filter Bar -->
     <section class="filter-bar">
-      <input type="text"  id="searchInput"  class="filter-input" placeholder="🔍  Search source, destination, event type…" />
-      <select id="levelFilter" class="filter-select">
+      <input type="text"  id="searchInput"  class="filter-input" placeholder="🔍  Search source, destination, event type, user…" />
+      <select id="levelFilter" class="filter-select" title="Filter by alert level">
         <option value="">All Levels</option>
         <option value="INFO">INFO</option>
         <option value="WARNING">WARNING</option>
         <option value="CRITICAL">CRITICAL</option>
+      </select>
+      <select id="fileTypeFilter" class="filter-select" title="Filter by file type">
+        <option value="">All File Types</option>
+        <option value="documents">📄 Documents (.docx, .pdf, .xlsx...)</option>
+        <option value="secrets">🔑 Secrets & Keys (.pem, .env...)</option>
+        <option value="databases">🗄️ Databases (.sql, .db...)</option>
+        <option value="scripts">📜 Scripts & Code (.py, .ps1...)</option>
+        <option value="archives">📦 Archives (.zip, .7z...)</option>
+      </select>
+      <select id="sortSelect" class="filter-select" title="Sort log events" onchange="onSortSelectChange()">
+        <option value="timestamp_desc">📅 Date: Newest First</option>
+        <option value="timestamp_asc">📅 Date: Oldest First</option>
+        <option value="level_desc">🚨 Severity: High → Low</option>
+        <option value="level_asc">ℹ️ Severity: Low → High</option>
+        <option value="source_asc">📁 Directory / Path (A-Z)</option>
+        <option value="ext_asc">🏷️ File Extension (A-Z)</option>
       </select>
       <button class="btn-refresh" id="btnRefresh" onclick="fetchAll()">↺ Refresh</button>
     </section>
@@ -107,15 +123,15 @@
         <table id="logTable">
           <thead>
             <tr>
-              <th>Timestamp</th>
-              <th>Level</th>
-              <th>Event</th>
-              <th>Source</th>
-              <th>Destination</th>
+              <th onclick="toggleSort('timestamp')" class="sortable-th">Timestamp <span class="sort-icon" id="th-timestamp">▼</span></th>
+              <th onclick="toggleSort('level')" class="sortable-th">Level <span class="sort-icon" id="th-level"></span></th>
+              <th onclick="toggleSort('event_type')" class="sortable-th">Event <span class="sort-icon" id="th-event_type"></span></th>
+              <th onclick="toggleSort('source')" class="sortable-th">Source <span class="sort-icon" id="th-source"></span></th>
+              <th onclick="toggleSort('destination')" class="sortable-th">Destination <span class="sort-icon" id="th-destination"></span></th>
               <th>User</th>
               <th>Hash Pre</th>
               <th>Hash Post</th>
-              <th>Integrity</th>
+              <th onclick="toggleSort('integrity')" class="sortable-th">Integrity <span class="sort-icon" id="th-integrity"></span></th>
             </tr>
           </thead>
           <tbody id="logBody">
@@ -161,7 +177,10 @@
   let refreshTimer    = null;
   let isConnected     = false;
   let currentLogs     = [];
+  let currentAlerts   = [];
   let selectedEventId = null;
+  let currentSortBy   = "timestamp";
+  let currentOrder    = "desc";
 
   // ── Fetch everything ────────────────────────────────────────────────────
   async function fetchAll() {
@@ -184,13 +203,49 @@
     }
   }
 
+  // ── Sorting Handlers ─────────────────────────────────────────────────────
+  function toggleSort(col) {
+    if (currentSortBy === col) {
+      currentOrder = currentOrder === "asc" ? "desc" : "asc";
+    } else {
+      currentSortBy = col;
+      currentOrder = (col === "level" || col === "timestamp") ? "desc" : "asc";
+    }
+    const matchVal = `${currentSortBy}_${currentOrder}`;
+    const sortSelect = document.getElementById("sortSelect");
+    if (sortSelect && sortSelect.querySelector(`option[value="${matchVal}"]`)) {
+      sortSelect.value = matchVal;
+    }
+    updateSortHeaderIcons();
+    fetchLogs(1);
+  }
+
+  function onSortSelectChange() {
+    const val = document.getElementById("sortSelect").value;
+    const parts = val.split("_");
+    currentSortBy = parts[0];
+    currentOrder = parts[1] || "desc";
+    updateSortHeaderIcons();
+    fetchLogs(1);
+  }
+
+  function updateSortHeaderIcons() {
+    document.querySelectorAll(".sort-icon").forEach(el => el.textContent = "");
+    const activeIcon = document.getElementById(`th-${currentSortBy}`);
+    if (activeIcon) {
+      activeIcon.textContent = currentOrder === "asc" ? " ▲" : " ▼";
+    }
+  }
+
   // ── Logs ─────────────────────────────────────────────────────────────────
   async function fetchLogs(page = currentPage) {
-    const level   = document.getElementById("levelFilter").value;
-    const keyword = document.getElementById("searchInput").value.trim();
-    let url = `/api/logs?page=${page}`;
-    if (level)   url += `&level=${encodeURIComponent(level)}`;
-    if (keyword) url += `&keyword=${encodeURIComponent(keyword)}`;
+    const level    = document.getElementById("levelFilter").value;
+    const fileType = document.getElementById("fileTypeFilter").value;
+    const keyword  = document.getElementById("searchInput").value.trim();
+    let url = `/api/logs?page=${page}&sort_by=${encodeURIComponent(currentSortBy)}&order=${encodeURIComponent(currentOrder)}`;
+    if (level)    url += `&level=${encodeURIComponent(level)}`;
+    if (fileType) url += `&file_type=${encodeURIComponent(fileType)}`;
+    if (keyword)  url += `&keyword=${encodeURIComponent(keyword)}`;
 
     try {
       const res  = await fetch(url);
@@ -261,6 +316,22 @@
     document.querySelectorAll("#logTable tbody tr").forEach(tr => tr.classList.remove("selected-row"));
   }
 
+  function renderFormattedDiff(snippet) {
+    if (!snippet) return "";
+    const lines = snippet.split("\n");
+    return lines.map(line => {
+      const escaped = escapeHtml(line);
+      if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("@@")) {
+        return `<span class="diff-line-meta">${escaped}</span>`;
+      } else if (line.startsWith("+")) {
+        return `<span class="diff-line-add">${escaped}</span>`;
+      } else if (line.startsWith("-")) {
+        return `<span class="diff-line-del">${escaped}</span>`;
+      }
+      return `<span class="diff-line-ctx">${escaped}</span>`;
+    }).join("\n");
+  }
+
   function renderChatReport(e) {
     const stream = document.getElementById("chatStream");
     const level = (e.alert_level || "INFO").toUpperCase();
@@ -295,7 +366,7 @@
               <span class="badge-level ${level.toLowerCase()}">${level}</span>
               <strong>${e.event_type} event detected</strong>
             </div>
-            <p class="bubble-p">Filesystem monitor intercepted a file <strong>${e.event_type}</strong> operation for <code>${fileName}</code>.</p>
+            <p class="bubble-p">Filesystem monitor intercepted a file <strong>${e.event_type}</strong> operation for <code>${escapeHtml(fileName)}</code>.</p>
           </div>
         </div>
       </div>
@@ -312,21 +383,21 @@
             <div class="kv-grid">
               <div class="kv-item">
                 <span class="kv-label">Source Path:</span>
-                <div class="kv-val mono break-all" id="srcPathVal">${e.source || "—"}</div>
+                <div class="kv-val mono break-all" id="srcPathVal">${escapeHtml(e.source || "—")}</div>
               </div>
               ${e.destination ? `
               <div class="kv-item">
                 <span class="kv-label">Destination Path:</span>
-                <div class="kv-val mono break-all text-amber">${e.destination}</div>
+                <div class="kv-val mono break-all text-amber">${escapeHtml(e.destination)}</div>
               </div>` : ""}
               <div class="kv-item flex-row">
                 <div>
                   <span class="kv-label">User / Account:</span>
-                  <div class="kv-val font-semibold">${e.user || "N/A"}</div>
+                  <div class="kv-val font-semibold">${escapeHtml(e.user || "N/A")}</div>
                 </div>
                 <div>
                   <span class="kv-label">Triggering Process:</span>
-                  <div class="kv-val mono">${e.process || "N/A"}</div>
+                  <div class="kv-val mono">${escapeHtml(e.process || "N/A")}</div>
                 </div>
               </div>
             </div>
@@ -334,7 +405,43 @@
         </div>
       </div>
 
-      <!-- Block 3: Cryptographic Integrity Hashing -->
+      <!-- Block 3: Exact Content Changes & Diff Telemetry -->
+      ${e.diff ? `
+      <div class="chat-block bot-block">
+        <div class="chat-avatar diff-av">📝</div>
+        <div class="chat-body">
+          <div class="chat-meta">
+            <span class="chat-sender">Diff Analysis Engine</span>
+            <span class="chat-tag">${e.diff.type === 'text' ? 'Unified Text Diff' : (e.diff.type === 'binary' ? 'Binary Delta' : 'Lifecycle Event')}</span>
+          </div>
+          <div class="chat-bubble diff-bubble">
+            <div class="diff-summary-row">
+              <span class="diff-summary-text">${escapeHtml(e.diff.summary || "Change recorded")}</span>
+              ${e.diff.size_delta !== undefined ? `<span class="diff-badge-delta ${e.diff.size_delta > 0 ? 'pos' : (e.diff.size_delta < 0 ? 'neg' : 'zero')}">${e.diff.size_delta > 0 ? '+' : ''}${e.diff.size_delta} bytes</span>` : ''}
+            </div>
+            ${e.diff.snippet ? `
+            <div class="diff-code-wrapper">
+              <pre class="diff-code"><code>${renderFormattedDiff(e.diff.snippet)}</code></pre>
+            </div>` : ''}
+          </div>
+        </div>
+      </div>
+      ` : `
+      <div class="chat-block bot-block">
+        <div class="chat-avatar diff-av">📝</div>
+        <div class="chat-body">
+          <div class="chat-meta">
+            <span class="chat-sender">Diff Analysis Engine</span>
+            <span class="chat-tag">Change Telemetry</span>
+          </div>
+          <div class="chat-bubble info-bubble">
+            <p class="bubble-p text-muted">No line-by-line diff recorded for this historical log entry.</p>
+          </div>
+        </div>
+      </div>
+      `}
+
+      <!-- Block 4: Cryptographic Integrity Hashing -->
       <div class="chat-block bot-block">
         <div class="chat-avatar hash-av">🔐</div>
         <div class="chat-body">
@@ -348,7 +455,7 @@
                 ${e.integrity_status === "INTACT" ? "✓ INTACT" : (e.integrity_status === "TAMPERED" ? "🚨 TAMPERED" : "UNAVAILABLE")}
               </span>
               <span class="hash-status-text">
-                ${e.integrity_status === "INTACT" ? "Cryptographic checksum matched perfectly." : "Hash disparity detected or file removed."}
+                ${e.integrity_status === "INTACT" ? "Cryptographic checksum matched baseline." : (e.integrity_status === "TAMPERED" ? "Hash disparity detected (content changed)." : "Hash snapshot unavailable.")}
               </span>
             </div>
             <div class="hash-box">
@@ -365,7 +472,7 @@
         </div>
       </div>
 
-      <!-- Block 4: Policy Verdict & Recommendation -->
+      <!-- Block 5: Policy Verdict & Recommendation -->
       <div class="chat-block bot-block">
         <div class="chat-avatar verdict-av ${level.toLowerCase()}">🛡️</div>
         <div class="chat-body">
@@ -386,7 +493,7 @@
         </div>
       </div>
 
-      <!-- Block 5: Interactive Quick Actions -->
+      <!-- Block 6: Interactive Quick Actions -->
       <div class="action-footer">
         <button class="btn-action" onclick="copyLogJson(${encodeURIComponent(JSON.stringify(e))})">📋 Copy JSON</button>
         <button class="btn-action" onclick="copyText('${escapeQuotes(e.source || "")}')">📁 Copy Source</button>
@@ -410,27 +517,90 @@
     el.innerHTML = html;
   }
 
-  // ── Alerts ───────────────────────────────────────────────────────────────
+  // ── Alerts & Live Alert Inspection ───────────────────────────────────────
   async function fetchAlerts() {
     try {
       const res    = await fetch("/api/alerts?limit=30");
       const alerts = await res.json();
+      currentAlerts = alerts || [];
       const feed   = document.getElementById("alertFeed");
-      document.getElementById("alertCount").textContent = alerts.length;
+      document.getElementById("alertCount").textContent = currentAlerts.length;
 
-      if (alerts.length === 0) {
+      if (currentAlerts.length === 0) {
         feed.innerHTML = `<div class="alert-empty">No alerts yet.</div>`;
         return;
       }
-      feed.innerHTML = alerts.map(a => `
-        <div class="alert-item ${(a.level||"INFO").toLowerCase()}">
-          <div class="alert-ts">${(a.timestamp||"").slice(0,19).replace("T"," ")}</div>
-          <div class="alert-level">${a.level||""}</div>
-          <div class="alert-msg">${a.message||""}</div>
-          ${a.event_data && a.event_data.source ? `<div class="alert-src">${truncate(a.event_data.source,40)}</div>` : ""}
+      feed.innerHTML = currentAlerts.map((a, idx) => `
+        <div class="alert-item ${(a.level||"INFO").toLowerCase()}" onclick="inspectAlert(${idx})" title="Click to view live alert report">
+          <div class="alert-item-top">
+            <span class="alert-ts">${(a.timestamp||"").slice(0,19).replace("T"," ")}</span>
+            <span class="badge-level ${(a.level||"INFO").toLowerCase()}">${a.level||""}</span>
+          </div>
+          <div class="alert-msg">${escapeHtml(a.message||"")}</div>
+          ${a.event_data && a.event_data.source ? `<div class="alert-src mono">${truncate(a.event_data.source,36)}</div>` : ""}
+          <div class="alert-action-row">
+            <a href="javascript:void(0)" class="alert-link" onclick="event.stopPropagation(); inspectAlert(${idx})">
+              🔍 View Live Report →
+            </a>
+          </div>
         </div>
       `).join("");
     } catch (e) { /* sidebar alert failure is non-critical */ }
+  }
+
+  function inspectAlert(alertIndex) {
+    const alertObj = currentAlerts[alertIndex];
+    if (!alertObj) return;
+
+    let matchingIndex = -1;
+    const alertSrc = (alertObj.event_data && alertObj.event_data.source) || "";
+    const alertTs = (alertObj.timestamp || "").slice(0, 19);
+
+    for (let i = 0; i < currentLogs.length; i++) {
+      const log = currentLogs[i];
+      if (log.source === alertSrc && (log.timestamp || "").slice(0, 19) === alertTs) {
+        matchingIndex = i;
+        break;
+      }
+    }
+
+    if (matchingIndex === -1 && alertSrc) {
+      for (let i = 0; i < currentLogs.length; i++) {
+        if (currentLogs[i].source === alertSrc) {
+          matchingIndex = i;
+          break;
+        }
+      }
+    }
+
+    if (matchingIndex !== -1) {
+      const tableRows = document.querySelectorAll("#logTable tbody tr");
+      const targetRow = tableRows[matchingIndex];
+      selectLogEvent(matchingIndex, targetRow);
+      if (targetRow) {
+        targetRow.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    } else {
+      const synthEvent = {
+        timestamp: alertObj.timestamp,
+        alert_level: alertObj.level,
+        event_type: (alertObj.event_data && alertObj.event_data.event_type) || "ALERT",
+        source: alertSrc || "Unknown Source",
+        destination: (alertObj.event_data && alertObj.event_data.destination) || "",
+        user: (alertObj.event_data && alertObj.event_data.user) || "N/A",
+        process: (alertObj.event_data && alertObj.event_data.process) || "N/A",
+        hash_pre: (alertObj.event_data && alertObj.event_data.hash_pre) || "N/A",
+        hash_post: (alertObj.event_data && alertObj.event_data.hash_post) || "N/A",
+        integrity_status: (alertObj.event_data && alertObj.event_data.integrity_status) || "TAMPERED",
+        hash_algorithm: "SHA256",
+        diff: alertObj.event_data && alertObj.event_data.diff,
+      };
+      selectedEventId = synthEvent.timestamp + synthEvent.source;
+      document.getElementById("mainLayout").classList.add("drawer-open");
+      const fileName = getBasename(synthEvent.source);
+      document.getElementById("drawerSub").textContent = `LIVE ALERT • ${fileName}`;
+      renderChatReport(synthEvent);
+    }
   }
 
   // ── Utilities ────────────────────────────────────────────────────────────
@@ -452,6 +622,16 @@
 
   function escapeQuotes(str) {
     return str.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  }
+
+  function escapeHtml(str) {
+    if (str === null || str === undefined) return "";
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
   }
 
   function copyLogJson(jsonStr) {
@@ -482,6 +662,7 @@
     searchDebounce = setTimeout(() => fetchLogs(1), 400);
   });
   document.getElementById("levelFilter").addEventListener("change", () => fetchLogs(1));
+  document.getElementById("fileTypeFilter").addEventListener("change", () => fetchLogs(1));
 
   // ── Auto-refresh every 5 seconds ──────────────────────────────────────────
   function startRefresh() {

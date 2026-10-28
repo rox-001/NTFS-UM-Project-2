@@ -102,17 +102,46 @@ def log_event(
     _console_print(alert_level, msg)
 
 
-def load_logs(limit: int = None, level_filter: str = None, keyword: str = None) -> list[dict]:
+# File type extension categories for advanced filtering
+_FILE_TYPE_MAP = {
+    "documents": {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf", ".txt", ".csv", ".rtf"},
+    "secrets":   {".pem", ".key", ".env", ".pfx", ".p12", ".crt", ".cer", ".kdbx", ".id_rsa"},
+    "databases": {".sql", ".db", ".sqlite", ".sqlite3", ".mdb", ".accdb"},
+    "scripts":   {".py", ".ps1", ".bat", ".cmd", ".sh", ".vbs", ".js", ".ts"},
+    "archives":  {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2"},
+}
+
+_ALERT_LEVEL_WEIGHT = {
+    "CRITICAL": 3,
+    "WARNING":  2,
+    "INFO":     1,
+    "NORMAL":   0,
+}
+
+
+def load_logs(
+    limit: int = None,
+    level_filter: str = None,
+    keyword: str = None,
+    sort_by: str = None,
+    order: str = "desc",
+    file_type: str = None,
+    directory: str = None,
+) -> list[dict]:
     """
-    Read and parse audit.log entries with optional filtering.
+    Read and parse audit.log entries with optional filtering and sorting.
 
     Args:
-        limit:        Maximum number of recent entries to return. None = all.
+        limit:        Maximum number of entries to return. None = all.
         level_filter: Filter by alert level string ('INFO', 'WARNING', 'CRITICAL').
-        keyword:      Filter entries where keyword appears in source or destination.
+        keyword:      Filter entries where keyword appears in source, destination, or user.
+        sort_by:      Sort key: 'timestamp', 'level', 'source', 'destination', 'event_type', 'ext', 'integrity'.
+        order:        Sort order: 'asc' or 'desc'.
+        file_type:    Category ('documents', 'secrets', 'databases', 'scripts', 'archives') or specific extension.
+        directory:    Filter entries where directory path substring appears in source or destination.
 
     Returns:
-        List of log entry dicts, most recent last.
+        List of log entry dicts.
     """
     if not os.path.exists(AUDIT_LOG_PATH):
         return []
@@ -125,21 +154,72 @@ def load_logs(limit: int = None, level_filter: str = None, keyword: str = None) 
                 continue
             try:
                 entry = json.loads(line)
-                # Apply filters
+                # Apply level filter
                 if level_filter and entry.get("alert_level") != level_filter:
                     continue
+
+                # Apply keyword filter
                 if keyword:
                     kw = keyword.lower()
-                    if kw not in entry.get("source", "").lower() \
-                       and kw not in entry.get("destination", "").lower() \
-                       and kw not in entry.get("event_type", "").lower():
+                    src_kw = entry.get("source", "").lower()
+                    dest_kw = entry.get("destination", "").lower()
+                    evt_kw = entry.get("event_type", "").lower()
+                    user_kw = entry.get("user", "").lower()
+                    if kw not in src_kw and kw not in dest_kw and kw not in evt_kw and kw not in user_kw:
                         continue
+
+                # Apply file type / extension filter
+                if file_type:
+                    ft_lower = file_type.lower()
+                    src_path = entry.get("source", "")
+                    dest_path = entry.get("destination", "")
+                    target = dest_path if (entry.get("event_type") == "MOVED" and dest_path) else src_path
+                    _, ext = os.path.splitext(target.lower())
+                    if ft_lower in _FILE_TYPE_MAP:
+                        if ext not in _FILE_TYPE_MAP[ft_lower]:
+                            continue
+                    else:
+                        norm_ft = ft_lower if ft_lower.startswith(".") else f".{ft_lower}"
+                        if ext != norm_ft:
+                            continue
+
+                # Apply directory filter
+                if directory:
+                    dir_lower = directory.lower()
+                    src_lower = entry.get("source", "").lower()
+                    dest_lower = entry.get("destination", "").lower()
+                    if dir_lower not in src_lower and dir_lower not in dest_lower:
+                        continue
+
                 entries.append(entry)
             except json.JSONDecodeError:
                 continue
 
+    # Apply sorting if requested
+    if sort_by:
+        s = sort_by.lower()
+        if s in ("timestamp", "date"):
+            key_fn = lambda e: e.get("timestamp", "")
+        elif s in ("level", "alert_level", "severity"):
+            key_fn = lambda e: _ALERT_LEVEL_WEIGHT.get(e.get("alert_level", "").upper(), 0)
+        elif s in ("source", "directory", "dir", "path"):
+            key_fn = lambda e: e.get("source", "").lower()
+        elif s in ("destination", "dest"):
+            key_fn = lambda e: e.get("destination", "").lower()
+        elif s in ("event", "event_type"):
+            key_fn = lambda e: e.get("event_type", "").lower()
+        elif s in ("ext", "extension", "file_type"):
+            key_fn = lambda e: os.path.splitext(e.get("source", ""))[1].lower()
+        elif s in ("integrity", "integrity_status"):
+            key_fn = lambda e: e.get("integrity_status", "").lower()
+        else:
+            key_fn = lambda e: e.get("timestamp", "")
+
+        is_desc = (order.lower() == "desc")
+        entries.sort(key=key_fn, reverse=is_desc)
+
     if limit:
-        entries = entries[-limit:]
+        entries = entries[:limit] if sort_by else entries[-limit:]
     return entries
 
 

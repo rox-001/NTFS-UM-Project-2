@@ -30,30 +30,45 @@ def index():
 @app.route("/api/logs")
 def api_logs():
     """
-    Return paginated, filterable log entries as JSON.
+    Return paginated, filterable, and sortable log entries as JSON.
     Query params:
-      - level:   Filter by alert level (INFO / WARNING / CRITICAL)
-      - keyword: Search in source/destination/event_type
-      - page:    Page number (1-indexed)
+      - level:     Filter by alert level (INFO / WARNING / CRITICAL)
+      - keyword:   Search in source/destination/event_type/user
+      - sort_by:   Field to sort by (timestamp, source, ext, level, integrity)
+      - order:     Sort direction (asc / desc)
+      - file_type: Filter by file category (documents, secrets, databases, scripts, archives)
+      - directory: Filter by directory path substring
+      - page:      Page number (1-indexed)
     """
-    level   = request.args.get("level", "").upper() or None
-    keyword = request.args.get("keyword", "") or None
-    page    = max(1, int(request.args.get("page", 1)))
+    level     = request.args.get("level", "").upper() or None
+    keyword   = request.args.get("keyword", "") or None
+    sort_by   = request.args.get("sort_by", "timestamp")
+    order     = request.args.get("order", "desc").lower()
+    file_type = request.args.get("file_type", "") or None
+    directory = request.args.get("directory", "") or None
+    page      = max(1, int(request.args.get("page", 1)))
 
-    entries  = logger.load_logs(level_filter=level, keyword=keyword)
-    total    = len(entries)
-    # Most recent first for display
-    entries  = list(reversed(entries))
-    start    = (page - 1) * LOGS_PER_PAGE
-    end      = start + LOGS_PER_PAGE
+    entries = logger.load_logs(
+        level_filter=level,
+        keyword=keyword,
+        sort_by=sort_by,
+        order=order,
+        file_type=file_type,
+        directory=directory,
+    )
+    total = len(entries)
+    start = (page - 1) * LOGS_PER_PAGE
+    end   = start + LOGS_PER_PAGE
     page_entries = entries[start:end]
 
     return jsonify({
-        "logs":       page_entries,
-        "total":      total,
-        "page":       page,
-        "per_page":   LOGS_PER_PAGE,
+        "logs":        page_entries,
+        "total":       total,
+        "page":        page,
+        "per_page":    LOGS_PER_PAGE,
         "total_pages": max(1, (total + LOGS_PER_PAGE - 1) // LOGS_PER_PAGE),
+        "sort_by":     sort_by,
+        "order":       order,
     })
 
 
@@ -66,7 +81,7 @@ def api_stats():
 @app.route("/api/alerts")
 def api_alerts():
     """Return the most recent alerts."""
-    limit  = int(request.args.get("limit", 20))
+    limit  = int(request.args.get("limit", 30))
     alerts = alerter.load_alerts(limit=limit)
     return jsonify(list(reversed(alerts)))  # Most recent first
 

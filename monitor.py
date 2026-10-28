@@ -36,6 +36,7 @@ import hasher
 import detector
 import logger
 import alerter
+import diff_tracker
 
 
 # Pre-calculate normalized directory paths
@@ -54,6 +55,8 @@ _recent_events: dict[str, float] = {}       # key: "EVENT_TYPE:norm_path" -> tim
 _recent_creations: dict[str, float] = {}    # key: "norm_path" -> timestamp
 _recent_file_sizes: dict[str, int] = {}     # key: "norm_path" -> last known size
 _recent_deletions: dict[str, tuple[float, str, str | None]] = {}  # basename -> (time, src_path, hash)
+_pending_deletions: dict[str, tuple[float, str, str | None]] = {} # basename -> (time, src_path, pre_hash)
+_pending_delete_timers: dict[str, threading.Timer] = {}           # basename -> Timer
 
 _debounce_lock = threading.Lock()
 
@@ -190,10 +193,39 @@ def _get_process_name() -> str:
 class SecureTransferEventHandler(FileSystemEventHandler):
     """
     Custom watchdog event handler that processes filesystem events
-    through the security pipeline with exfiltration correlation.
+    through the security pipeline with exfiltration correlation,
+    line-by-line diff tracking, and cross-directory move resolution.
     """
 
-    def _process_event(self, event_type: str, src_path: str, dest_path: str = ""):
+    def _buffer_or_process_deletion(self, src_path: str):
+        """
+        Buffer deletion briefly (0.35s) so that if a corresponding creation
+        arrives in another monitored root, it is resolved as a single MOVED event
+        with both source and destination populated.
+        """
+        norm = os.path.normcase(os.path.normpath(os.path.abspath(src_path)))
+        basename = os.path.basename(norm).lower()
+        pre_hash = hasher.get_baseline_hash(src_path)
+
+        with _debounce_lock:
+            old_timer = _pending_delete_timers.pop(basename, None)
+            if old_timer:
+                old_timer.cancel()
+
+            timer = threading.Timer(0.35, self._flush_deletion, args=[src_path, pre_hash])
+            _pending_delete_timers[basename] = timer
+            _pending_deletions[basename] = (time.monotonic(), src_path, pre_hash)
+            timer.start()
+
+    def _flush_deletion(self, src_path: str, pre_hash: str | None):
+        """Callback when deletion timer expires without a matching creation (true delete)."""
+        basename = os.path.basename(os.path.normcase(src_path)).lower()
+        with _debounce_lock:
+            _pending_deletions.pop(basename, None)
+            _pending_delete_timers.pop(basename, None)
+        self._process_event("DELETED", src_path, pre_hash_override=pre_hash)
+
+    def _process_event(self, event_type: str, src_path: str, dest_path: str = "", pre_hash_override: str | None = None):
         if _should_ignore_path(src_path):
             return
         if dest_path and _should_ignore_path(dest_path):
@@ -209,19 +241,57 @@ class SecureTransferEventHandler(FileSystemEventHandler):
         # Step 3: Classify severity
         level = detector.classify_event(event_type, src_path, dest_path)
 
-        # Step 4: Integrity hashing
-        pre_hash = hasher.snapshot_file(src_path) if os.path.exists(src_path) else None
-
-        if event_type == "MOVED" and dest_path and os.path.exists(dest_path):
-            post_hash = hasher.compute_hash(dest_path)
-        elif event_type not in ("DELETED", "MOVED", "DELETED_DIR") and os.path.exists(src_path):
-            post_hash = hasher.compute_hash(src_path)
+        # Step 4: Integrity hashing with baseline registry
+        if pre_hash_override is not None:
+            pre_hash = pre_hash_override
         else:
+            pre_hash = hasher.get_baseline_hash(src_path)
+
+        if event_type in ("CREATED", "CREATED_DIR"):
+            post_hash = hasher.compute_hash(src_path) if os.path.exists(src_path) else None
+            if not pre_hash and post_hash:
+                pre_hash = post_hash
+            if post_hash:
+                hasher.set_baseline_hash(src_path, post_hash)
+                diff_tracker.record_initial_state(src_path)
+            integrity_status = "INTACT" if post_hash else "UNAVAILABLE"
+
+        elif event_type == "MODIFIED":
+            post_hash = hasher.compute_hash(src_path) if os.path.exists(src_path) else None
+            if pre_hash and post_hash:
+                _, integrity_status = hasher.verify_integrity(pre_hash, post_hash)
+            elif post_hash:
+                integrity_status = "INTACT"
+            else:
+                integrity_status = "UNAVAILABLE"
+            if post_hash:
+                hasher.set_baseline_hash(src_path, post_hash)
+
+        elif event_type in ("MOVED", "MOVED_DIR"):
+            post_hash = hasher.compute_hash(dest_path) if (dest_path and os.path.exists(dest_path)) else None
+            hasher.remove_baseline_hash(src_path)
+            if dest_path and post_hash:
+                hasher.set_baseline_hash(dest_path, post_hash)
+            if pre_hash and post_hash:
+                _, integrity_status = hasher.verify_integrity(pre_hash, post_hash)
+            elif post_hash:
+                integrity_status = "INTACT"
+            else:
+                integrity_status = "UNAVAILABLE"
+
+        elif event_type in ("DELETED", "DELETED_DIR"):
             post_hash = None
+            hasher.remove_baseline_hash(src_path)
+            integrity_status = "INTACT" if pre_hash else "UNAVAILABLE"
 
-        _, integrity_status = hasher.verify_integrity(pre_hash, post_hash)
+        else:
+            post_hash = hasher.compute_hash(src_path) if os.path.exists(src_path) else None
+            _, integrity_status = hasher.verify_integrity(pre_hash, post_hash)
 
-        # Step 5: Exfiltration correlation (F-01)
+        # Step 5: Diff & Content change calculation
+        diff_data = diff_tracker.compute_file_diff(event_type, src_path, dest_path)
+
+        # Step 6: Exfiltration correlation (F-01)
         basename = os.path.basename(src_path)
         now = time.monotonic()
 
@@ -242,7 +312,7 @@ class SecureTransferEventHandler(FileSystemEventHandler):
                         level = "CRITICAL"
                         correlation_note = f" [Cross-Volume Exfiltration: moved/copied from '{del_src}']"
 
-        # Step 6: Log event
+        # Step 7: Log event (with exact diff)
         logger.log_event(
             event_type       = event_type,
             source           = src_path,
@@ -253,23 +323,29 @@ class SecureTransferEventHandler(FileSystemEventHandler):
             hash_post        = post_hash,
             integrity_status = integrity_status,
             alert_level      = level,
+            extra            = {"diff": diff_data},
         )
 
-        # Step 7: Trigger alert
+        # Step 8: Trigger alert
         if level in ("WARNING", "CRITICAL"):
             description = detector.describe_event(event_type, src_path, dest_path) + correlation_note
             alerter.trigger_alert(
                 level      = level,
                 message    = description,
                 event_data = {
-                    "source":      src_path,
-                    "destination": dest_path,
-                    "user":        user,
-                    "process":     process,
+                    "event_type":       event_type,
+                    "source":           src_path,
+                    "destination":      dest_path,
+                    "user":             user,
+                    "process":          process,
+                    "hash_pre":         pre_hash or "N/A",
+                    "hash_post":        post_hash or "N/A",
+                    "integrity_status": integrity_status,
+                    "diff":             diff_data,
                 },
             )
 
-    # ── Watchdog Callbacks (with Directory Expansion F-08) ───────────────────
+    # ── Watchdog Callbacks (with Directory Expansion F-08 & Move Correlation) ─
 
     def on_created(self, event):
         if event.is_directory:
@@ -282,7 +358,20 @@ class SecureTransferEventHandler(FileSystemEventHandler):
                 except OSError:
                     pass
         else:
-            self._process_event("CREATED", event.src_path)
+            basename = os.path.basename(os.path.normcase(event.src_path)).lower()
+            with _debounce_lock:
+                pending = _pending_deletions.pop(basename, None)
+                timer = _pending_delete_timers.pop(basename, None)
+                if timer:
+                    timer.cancel()
+
+            if pending and pending[1] != event.src_path:
+                # Correlated cross-directory move!
+                orig_src = pending[1]
+                orig_pre_hash = pending[2]
+                self._process_event("MOVED", orig_src, event.src_path, pre_hash_override=orig_pre_hash)
+            else:
+                self._process_event("CREATED", event.src_path)
 
     def on_modified(self, event):
         if not event.is_directory:
@@ -292,9 +381,16 @@ class SecureTransferEventHandler(FileSystemEventHandler):
         if event.is_directory:
             self._process_event("DELETED_DIR", event.src_path)
         else:
-            self._process_event("DELETED", event.src_path)
+            self._buffer_or_process_deletion(event.src_path)
 
     def on_moved(self, event):
+        basename = os.path.basename(os.path.normcase(event.src_path)).lower()
+        with _debounce_lock:
+            timer = _pending_delete_timers.pop(basename, None)
+            if timer:
+                timer.cancel()
+            _pending_deletions.pop(basename, None)
+
         if event.is_directory:
             self._process_event("MOVED_DIR", event.src_path, event.dest_path)
             if os.path.isdir(event.dest_path):
@@ -313,8 +409,8 @@ class SecureTransferEventHandler(FileSystemEventHandler):
 
 class FileMonitor:
     """
-    Manages watchdog Observer instances with auto-discovered directories
-    and background USB/removable media polling.
+    Manages watchdog Observer instances with auto-discovered directories,
+    baseline seeding, and background USB/removable media polling.
     """
 
     def __init__(self, directories: list[str] | None = None):
@@ -324,6 +420,27 @@ class FileMonitor:
         self.event_handler = SecureTransferEventHandler()
         self.directories = directories if directories is not None else get_auto_discovered_targets()
         self._scheduled_paths: set[str] = set()
+
+    def _seed_baseline(self):
+        """Index existing files in monitored folders to populate baseline hashes and diff caches."""
+        try:
+            for d in self.directories:
+                expanded = os.path.expandvars(d)
+                if not os.path.isdir(expanded):
+                    continue
+                for root, _, files in os.walk(expanded):
+                    if _should_ignore_path(root):
+                        continue
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        if not _should_ignore_path(fp):
+                            try:
+                                hasher.set_baseline_hash(fp)
+                                diff_tracker.record_initial_state(fp)
+                            except Exception:
+                                pass
+        except Exception:
+            pass
 
     def start(self):
         """Schedule watchers for all discovered directories and start observer."""
@@ -359,6 +476,10 @@ class FileMonitor:
         poll_thread = threading.Thread(target=self._poll_new_drives, daemon=True)
         poll_thread.start()
 
+        # Seed baseline hashes and diff caches in background
+        seed_thread = threading.Thread(target=self._seed_baseline, daemon=True)
+        seed_thread.start()
+
     def _poll_new_drives(self):
         """Polls periodically for newly plugged-in USB or network drives."""
         while not self._stop_event.is_set():
@@ -377,9 +498,14 @@ class FileMonitor:
                         pass
 
     def stop(self):
-        """Gracefully stop observer and polling threads."""
+        """Gracefully stop observer, timers, and polling threads."""
         if self._running:
             self._stop_event.set()
+            with _debounce_lock:
+                for timer in _pending_delete_timers.values():
+                    timer.cancel()
+                _pending_delete_timers.clear()
+                _pending_deletions.clear()
             self.observer.stop()
             self.observer.join(timeout=1.0)
             self._running = False
