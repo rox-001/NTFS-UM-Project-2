@@ -206,3 +206,144 @@ class TestCrossDirectoryMoveCorrelation(unittest.TestCase):
         self.assertEqual(move_log[0]["destination"], dest_file)
         self.assertTrue(len(move_log[0]["destination"]) > 0)
 
+
+class TestV2Enhancements(unittest.TestCase):
+    """Unit tests covering the Do Now V2 architecture enhancements."""
+
+    def test_dlp_scanner_secrets_and_pii(self):
+        """Test true DLP regex pattern matching and Luhn credit card validation."""
+        import dlp_scanner
+
+        # 1. AWS Access Key
+        aws_sample = "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n"
+        with tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".txt") as f:
+            f.write(aws_sample)
+            tmp_path = f.name
+        res = dlp_scanner.scan_file_content(tmp_path)
+        os.unlink(tmp_path)
+        self.assertTrue(res["is_violation"])
+        match_types = [m["type"] for m in res["matches"]]
+        self.assertIn("AWS Access Key", match_types)
+        self.assertGreater(res["risk_bonus"], 0)
+
+        # 2. RSA / Private Key
+        rsa_sample = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0...\n-----END RSA PRIVATE KEY-----"
+        with tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".txt") as f:
+            f.write(rsa_sample)
+            tmp_path = f.name
+        res = dlp_scanner.scan_file_content(tmp_path)
+        os.unlink(tmp_path)
+        self.assertTrue(res["is_violation"])
+        match_types = [m["type"] for m in res["matches"]]
+        self.assertIn("Private Key", match_types)
+
+        # 3. Luhn Valid vs Invalid Credit Card
+        self.assertTrue(dlp_scanner._luhn_checksum_valid("4111111111111111"))
+        self.assertFalse(dlp_scanner._luhn_checksum_valid("4111111111111112"))
+
+    def test_database_persistence_layer(self):
+        """Test SQLite persistence for baselines, monitored dirs, allowlist, and quarantine."""
+        import db
+
+        test_path = "C:\\Files\\sample_test.docx"
+        test_hash = "abcdef0123456789"
+
+        # Baseline hash CRUD
+        db.set_baseline(test_path, test_hash, size=1024)
+        fetched = db.get_baseline(test_path)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched["hash"], test_hash)
+        self.assertEqual(fetched["size"], 1024)
+
+        db.remove_baseline(test_path)
+        self.assertIsNone(db.get_baseline(test_path))
+
+        # Monitored directories CRUD
+        test_dir = tempfile.mkdtemp(prefix="test_mon_")
+        try:
+            db.add_monitored_directory(test_dir)
+            dirs = db.get_monitored_directories()
+            self.assertIn(test_dir, dirs)
+            db.remove_monitored_directory(test_dir)
+            self.assertNotIn(test_dir, db.get_monitored_directories())
+        finally:
+            import shutil
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+        # Allowlist CRUD
+        db.add_to_allowlist(test_path, entry_type="path", reason="Testing")
+        self.assertTrue(db.is_allowlisted(test_path, test_hash))
+        db.add_to_allowlist("C:\\Files\\other.txt", entry_type="path")
+        self.assertTrue(db.is_allowlisted("C:\\Files\\other.txt"))
+
+    def test_process_tracker_safety(self):
+        """Test process termination safety guards preventing kill of critical system PIDs."""
+        import process_tracker
+
+        # Refusal to kill PID 0, 4 (System)
+        res_zero = process_tracker.terminate_process(0)
+        self.assertFalse(res_zero["success"])
+        self.assertIn("system process", res_zero["error"].lower())
+
+        res_four = process_tracker.terminate_process(4)
+        self.assertFalse(res_four["success"])
+        self.assertIn("system process", res_four["error"].lower())
+
+        # Current process telemetry lookup
+        curr_pid = os.getpid()
+        telem = process_tracker.get_process_telemetry(curr_pid)
+        self.assertIsNotNone(telem)
+        self.assertEqual(telem["pid"], curr_pid)
+        self.assertIn("python", telem["name"].lower())
+
+    def test_risk_scoring_matrix(self):
+        """Test 0-100 mathematical risk scoring and severity mapping."""
+        import detector
+
+        # Normal file locally: low risk, INFO
+        score, level = detector.calculate_risk_score("CREATED", "C:\\Users\\User\\notes.txt", "")
+        self.assertLess(score, 40)
+        self.assertEqual(level, "INFO")
+
+        # Sensitive file moved to USB: high risk, CRITICAL
+        score_crit, level_crit = detector.calculate_risk_score(
+            "MOVED",
+            "C:\\Users\\User\\keys.pem",
+            "E:\\keys.pem",
+            process_name="powershell.exe",
+            dlp_bonus=15
+        )
+        self.assertGreaterEqual(score_crit, 70)
+        self.assertEqual(level_crit, "CRITICAL")
+
+    def test_smart_search_token_parsing(self):
+        """Test tokenized smart search in audit logs."""
+        import logger
+        orig_log = logger.AUDIT_LOG_PATH
+        test_dir = tempfile.mkdtemp(prefix="test_search_")
+        test_file = os.path.join(test_dir, "audit.log")
+        logger.AUDIT_LOG_PATH = test_file
+
+        try:
+            logger.log_event("CREATED", "C:\\HR\\payroll.xlsx", "", "alice", "excel.exe", "h1", "h1", "INTACT", "WARNING", risk_score=55)
+            logger.log_event("DOWNLOADED", "C:\\Downloads\\installer.exe", "", "bob", "chrome.exe", "h2", "h2", "INTACT", "INFO", risk_score=20)
+            logger.log_event("MOVED", "C:\\Keys\\id_rsa", "E:\\id_rsa", "charlie", "cmd.exe", "h3", "h3", "INTACT", "CRITICAL", risk_score=85)
+
+            # 1. Search by risk token
+            high_risk = logger.load_logs(keyword="risk:>50")
+            self.assertEqual(len(high_risk), 2)
+
+            # 2. Search by event token
+            downloads = logger.load_logs(keyword="event:DOWNLOADED")
+            self.assertEqual(len(downloads), 1)
+            self.assertEqual(downloads[0]["user"], "bob")
+
+            # 3. Search by user token
+            alice_logs = logger.load_logs(keyword="user:alice")
+            self.assertEqual(len(alice_logs), 1)
+        finally:
+            logger.AUDIT_LOG_PATH = orig_log
+            import shutil
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+

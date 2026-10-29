@@ -6,6 +6,8 @@ __pycache__/
 # Application runtime logs and reports
 logs/*.log
 reports/*.txt
+data/*.db
+data/quarantine/*
 
 # Packaging & compiler artifacts
 build/

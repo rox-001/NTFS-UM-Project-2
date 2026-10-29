@@ -37,6 +37,9 @@ import detector
 import logger
 import alerter
 import diff_tracker
+import db
+import process_tracker
+import dlp_scanner
 
 
 # Pre-calculate normalized directory paths
@@ -231,15 +234,29 @@ class SecureTransferEventHandler(FileSystemEventHandler):
         if dest_path and _should_ignore_path(dest_path):
             return
 
+        # Check SOC allowlist by path
+        if db.is_allowlisted(src_path):
+            return
+        if dest_path and db.is_allowlisted(dest_path):
+            return
+
         target_path = dest_path if (event_type == "MOVED" and dest_path) else src_path
         if _is_burst_duplicate(event_type, target_path):
             return
 
-        user    = _get_current_user()
-        process = _get_process_name()
+        user = _get_current_user()
 
-        # Step 3: Classify severity
-        level = detector.classify_event(event_type, src_path, dest_path)
+        # Step 2: Accurate Handle-to-Process Attribution & Lineage (Restart Manager)
+        telemetry = process_tracker.get_process_telemetry(target_path)
+        process = telemetry["name"]
+
+        # Step 3: Check Alternate Data Stream for Internet DOWNLOADED event
+        download_info = {}
+        if event_type == "CREATED" and os.path.isfile(src_path):
+            is_dl, host_url, ref_url = detector.detect_download_metadata(src_path)
+            if is_dl:
+                event_type = "DOWNLOADED"
+                download_info = {"host_url": host_url, "referrer_url": ref_url}
 
         # Step 4: Integrity hashing with baseline registry
         if pre_hash_override is not None:
@@ -247,7 +264,7 @@ class SecureTransferEventHandler(FileSystemEventHandler):
         else:
             pre_hash = hasher.get_baseline_hash(src_path)
 
-        if event_type in ("CREATED", "CREATED_DIR"):
+        if event_type in ("CREATED", "CREATED_DIR", "DOWNLOADED"):
             post_hash = hasher.compute_hash(src_path) if os.path.exists(src_path) else None
             if not pre_hash and post_hash:
                 pre_hash = post_hash
@@ -288,10 +305,26 @@ class SecureTransferEventHandler(FileSystemEventHandler):
             post_hash = hasher.compute_hash(src_path) if os.path.exists(src_path) else None
             _, integrity_status = hasher.verify_integrity(pre_hash, post_hash)
 
-        # Step 5: Diff & Content change calculation
+        # Check SOC allowlist by hash
+        if post_hash and db.is_allowlisted(src_path, digest=post_hash):
+            return
+
+        # Step 5: True DLP Content Regex Inspection
+        dlp_result = {"is_violation": False, "matches": [], "risk_bonus": 0, "summary": ""}
+        if event_type in ("CREATED", "MODIFIED", "DOWNLOADED") and os.path.isfile(target_path):
+            dlp_result = dlp_scanner.scan_file_content(target_path)
+
+        # Step 6: Multi-Variable Risk Scoring (0-100) & Severity Level
+        risk_score, level = detector.calculate_risk_score(
+            event_type, src_path, dest_path,
+            process_name=process,
+            dlp_bonus=dlp_result["risk_bonus"]
+        )
+
+        # Step 7: Diff & Content change calculation
         diff_data = diff_tracker.compute_file_diff(event_type, src_path, dest_path)
 
-        # Step 6: Exfiltration correlation (F-01)
+        # Step 8: Exfiltration correlation (F-01)
         basename = os.path.basename(src_path)
         now = time.monotonic()
 
@@ -302,7 +335,7 @@ class SecureTransferEventHandler(FileSystemEventHandler):
 
         # Correlate creation on removable / cloud destination
         correlation_note = ""
-        if event_type in ("CREATED", "MOVED"):
+        if event_type in ("CREATED", "MOVED", "DOWNLOADED"):
             dest_check = dest_path if dest_path else src_path
             if detector.is_suspicious_destination(dest_check):
                 with _debounce_lock:
@@ -310,9 +343,19 @@ class SecureTransferEventHandler(FileSystemEventHandler):
                     if match and (now - match[0]) < 10.0:
                         del_src = match[1]
                         level = "CRITICAL"
+                        risk_score = max(risk_score, 90)
                         correlation_note = f" [Cross-Volume Exfiltration: moved/copied from '{del_src}']"
 
-        # Step 7: Log event (with exact diff)
+        # Step 9: Log event (with telemetry, risk score, and DLP inspection)
+        extra_payload = {
+            "diff": diff_data,
+            "risk_score": risk_score,
+            "dlp_matches": dlp_result["matches"],
+            "dlp_summary": dlp_result["summary"],
+            "process_telemetry": telemetry,
+            "download_info": download_info,
+        }
+
         logger.log_event(
             event_type       = event_type,
             source           = src_path,
@@ -323,25 +366,37 @@ class SecureTransferEventHandler(FileSystemEventHandler):
             hash_post        = post_hash,
             integrity_status = integrity_status,
             alert_level      = level,
-            extra            = {"diff": diff_data},
+            risk_score       = risk_score,
+            extra            = extra_payload,
         )
 
-        # Step 8: Trigger alert
-        if level in ("WARNING", "CRITICAL"):
+        # Step 10: Trigger alert
+        if level in ("WARNING", "CRITICAL") or risk_score >= 40:
             description = detector.describe_event(event_type, src_path, dest_path) + correlation_note
+            if dlp_result["summary"]:
+                description += f" [DLP Content Alert: {dlp_result['summary']}]"
+            if download_info.get("host_url"):
+                description += f" [Web Source: {download_info['host_url']}]"
+
             alerter.trigger_alert(
                 level      = level,
                 message    = description,
+                risk_score = risk_score,
                 event_data = {
                     "event_type":       event_type,
                     "source":           src_path,
                     "destination":      dest_path,
                     "user":             user,
                     "process":          process,
+                    "risk_score":       risk_score,
                     "hash_pre":         pre_hash or "N/A",
                     "hash_post":        post_hash or "N/A",
                     "integrity_status": integrity_status,
                     "diff":             diff_data,
+                    "dlp_matches":      dlp_result["matches"],
+                    "dlp_summary":      dlp_result["summary"],
+                    "process_telemetry": telemetry,
+                    "download_info":    download_info,
                 },
             )
 
@@ -407,24 +462,44 @@ class SecureTransferEventHandler(FileSystemEventHandler):
             self._process_event("MOVED", event.src_path, event.dest_path)
 
 
+_active_monitor: FileMonitor | None = None
+
+
+def get_active_monitor() -> FileMonitor | None:
+    """Return the currently running FileMonitor singleton."""
+    global _active_monitor
+    return _active_monitor
+
+
 class FileMonitor:
     """
-    Manages watchdog Observer instances with auto-discovered directories,
-    baseline seeding, and background USB/removable media polling.
+    Manages watchdog Observer instances with persistent SQLite directory tracking,
+    dynamic on-the-fly folder addition/removal, baseline seeding, and USB polling.
     """
 
     def __init__(self, directories: list[str] | None = None):
+        global _active_monitor
+        _active_monitor = self
+
         self.observer = Observer()
         self._running = False
         self._stop_event = threading.Event()
         self.event_handler = SecureTransferEventHandler()
-        self.directories = directories if directories is not None else get_auto_discovered_targets()
-        self._scheduled_paths: set[str] = set()
 
-    def _seed_baseline(self):
+        # Combine user-defined database directories with system auto-discovery
+        db_dirs = db.get_monitored_directories()
+        discovered = get_auto_discovered_targets()
+        initial_set = set(directories) if directories is not None else (set(db_dirs) | set(discovered))
+        self.directories = sorted(list(initial_set))
+
+        self._scheduled_paths: set[str] = set()
+        self._watches: dict[str, object] = {}
+
+    def _seed_baseline(self, target_dirs: list[str] = None):
         """Index existing files in monitored folders to populate baseline hashes and diff caches."""
+        dirs_to_seed = target_dirs if target_dirs else self.directories
         try:
-            for d in self.directories:
+            for d in dirs_to_seed:
                 expanded = os.path.expandvars(d)
                 if not os.path.isdir(expanded):
                     continue
@@ -442,6 +517,78 @@ class FileMonitor:
         except Exception:
             pass
 
+    def add_directory(self, directory: str) -> bool:
+        """
+        Dynamically schedule a new directory watch on the fly
+        and persist it to the SQLite database.
+        """
+        if not directory or not os.path.isdir(directory):
+            return False
+
+        norm = os.path.normcase(os.path.normpath(os.path.abspath(directory)))
+        db.add_monitored_directory(norm)
+
+        if norm not in self.directories:
+            self.directories.append(norm)
+
+        if self._running and norm not in self._scheduled_paths:
+            try:
+                watch = self.observer.schedule(
+                    self.event_handler,
+                    path=norm,
+                    recursive=True,
+                )
+                self._scheduled_paths.add(norm)
+                self._watches[norm] = watch
+                print(f"  [+] Dynamically watching new directory: {norm}")
+
+                # Index newly added folder in background
+                threading.Thread(target=self._seed_baseline, args=[[norm]], daemon=True).start()
+                return True
+            except Exception as e:
+                print(f"  [-] Failed to watch {norm}: {e}")
+                return False
+        return True
+
+    def remove_directory(self, directory: str) -> bool:
+        """
+        Dynamically unschedule a monitored directory and remove it from SQLite.
+        """
+        if not directory:
+            return False
+
+        norm = os.path.normcase(os.path.normpath(os.path.abspath(directory)))
+        db.remove_monitored_directory(norm)
+
+        if norm in self.directories:
+            self.directories.remove(norm)
+
+        if self._running and norm in self._watches:
+            try:
+                watch = self._watches.pop(norm)
+                self.observer.unschedule(watch)
+                self._scheduled_paths.discard(norm)
+                print(f"  [-] Unscheduled directory: {norm}")
+                return True
+            except Exception as e:
+                print(f"  [-] Error unscheduling {norm}: {e}")
+                return False
+        return True
+
+    def get_monitored_directories(self) -> list[dict]:
+        """Return the list of active monitored directories and their source classification."""
+        custom_db = set(db.get_monitored_directories())
+        results = []
+        for d in self.directories:
+            norm = os.path.normcase(os.path.normpath(os.path.abspath(d)))
+            is_active = norm in self._scheduled_paths if self._running else os.path.isdir(d)
+            results.append({
+                "path": d,
+                "is_active": is_active,
+                "is_custom": norm in custom_db,
+            })
+        return results
+
     def start(self):
         """Schedule watchers for all discovered directories and start observer."""
         scheduled = 0
@@ -451,12 +598,13 @@ class FileMonitor:
                 norm = os.path.normcase(os.path.normpath(directory))
                 if norm not in self._scheduled_paths:
                     try:
-                        self.observer.schedule(
+                        watch = self.observer.schedule(
                             self.event_handler,
                             path      = directory,
                             recursive = True,
                         )
                         self._scheduled_paths.add(norm)
+                        self._watches[norm] = watch
                         print(f"  [+] Watching: {directory}")
                         scheduled += 1
                     except Exception as e:
@@ -491,14 +639,18 @@ class FileMonitor:
                 norm = os.path.normcase(os.path.normpath(d))
                 if norm not in self._scheduled_paths and os.path.isdir(d):
                     try:
-                        self.observer.schedule(self.event_handler, path=d, recursive=True)
+                        watch = self.observer.schedule(self.event_handler, path=d, recursive=True)
                         self._scheduled_paths.add(norm)
+                        self._watches[norm] = watch
+                        if norm not in self.directories:
+                            self.directories.append(norm)
                         print(f"  [+] Auto-detected & watching new target: {d}")
                     except Exception:
                         pass
 
     def stop(self):
         """Gracefully stop observer, timers, and polling threads."""
+        global _active_monitor
         if self._running:
             self._stop_event.set()
             with _debounce_lock:
@@ -509,6 +661,9 @@ class FileMonitor:
             self.observer.stop()
             self.observer.join(timeout=1.0)
             self._running = False
+            self._watches.clear()
+            self._scheduled_paths.clear()
+            _active_monitor = None
             print("\n  Monitor stopped. Goodbye.")
 
     def is_running(self) -> bool:

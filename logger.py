@@ -60,12 +60,13 @@ def log_event(
     integrity_status: str,
     alert_level: str,
     extra: dict = None,
+    risk_score: int = 0,
 ):
     """
     Write a structured JSON log entry to audit.log and print to console.
 
     Args:
-        event_type:        Type of FS event (CREATED, MODIFIED, MOVED, DELETED).
+        event_type:        Type of FS event (CREATED, MODIFIED, MOVED, DELETED, DOWNLOADED).
         source:            Source file path.
         destination:       Destination path (empty string if not applicable).
         user:              OS username performing the action.
@@ -74,7 +75,8 @@ def log_event(
         hash_post:         Hash after event (or None).
         integrity_status:  'INTACT', 'TAMPERED', or 'UNAVAILABLE'.
         alert_level:       'INFO', 'WARNING', or 'CRITICAL'.
-        extra:             Optional dict of additional fields.
+        extra:             Optional dict of additional fields (diff, dlp_matches, process_telemetry).
+        risk_score:        Numerical risk assessment score (0-100).
     """
     entry = {
         "timestamp":        datetime.now().isoformat(),
@@ -83,6 +85,7 @@ def log_event(
         "destination":      destination,
         "user":             user,
         "process":          process,
+        "risk_score":       risk_score,
         "hash_algorithm":   HASH_ALGORITHM,
         "hash_pre":         hash_pre or "N/A",
         "hash_post":        hash_post or "N/A",
@@ -98,7 +101,7 @@ def log_event(
 
     # Print to console with colors (using ASCII -> arrow)
     dest_str = f" -> {destination}" if destination else ""
-    msg = f"{event_type:10} | {os.path.basename(source)}{dest_str} | {integrity_status}"
+    msg = f"{event_type:10} | {os.path.basename(source)}{dest_str} | [Risk {risk_score:02d}] {integrity_status}"
     _console_print(alert_level, msg)
 
 
@@ -127,24 +130,27 @@ def load_logs(
     order: str = "desc",
     file_type: str = None,
     directory: str = None,
+    start_time: str = None,
+    end_time: str = None,
 ) -> list[dict]:
     """
-    Read and parse audit.log entries with optional filtering and sorting.
-
-    Args:
-        limit:        Maximum number of entries to return. None = all.
-        level_filter: Filter by alert level string ('INFO', 'WARNING', 'CRITICAL').
-        keyword:      Filter entries where keyword appears in source, destination, or user.
-        sort_by:      Sort key: 'timestamp', 'level', 'source', 'destination', 'event_type', 'ext', 'integrity'.
-        order:        Sort order: 'asc' or 'desc'.
-        file_type:    Category ('documents', 'secrets', 'databases', 'scripts', 'archives') or specific extension.
-        directory:    Filter entries where directory path substring appears in source or destination.
-
-    Returns:
-        List of log entry dicts.
+    Read and parse audit.log entries with multi-criteria filtering,
+    time-window slicing, smart token query parsing, and custom sorting.
     """
     if not os.path.exists(AUDIT_LOG_PATH):
         return []
+
+    # Parse search tokens if present in keyword (e.g. user:admin ext:pem level:crit)
+    token_filters = {}
+    free_text_terms = []
+    if keyword:
+        parts = keyword.strip().split()
+        for p in parts:
+            if ":" in p:
+                k, v = p.split(":", 1)
+                token_filters[k.lower()] = v.lower()
+            else:
+                free_text_terms.append(p.lower())
 
     entries = []
     with open(AUDIT_LOG_PATH, "r", encoding="utf-8") as f:
@@ -154,21 +160,19 @@ def load_logs(
                 continue
             try:
                 entry = json.loads(line)
-                # Apply level filter
+                ts = entry.get("timestamp", "")
+
+                # 1. Date/Time Window Filter
+                if start_time and ts < start_time:
+                    continue
+                if end_time and ts > end_time:
+                    continue
+
+                # 2. Alert Level Filter
                 if level_filter and entry.get("alert_level") != level_filter:
                     continue
 
-                # Apply keyword filter
-                if keyword:
-                    kw = keyword.lower()
-                    src_kw = entry.get("source", "").lower()
-                    dest_kw = entry.get("destination", "").lower()
-                    evt_kw = entry.get("event_type", "").lower()
-                    user_kw = entry.get("user", "").lower()
-                    if kw not in src_kw and kw not in dest_kw and kw not in evt_kw and kw not in user_kw:
-                        continue
-
-                # Apply file type / extension filter
+                # 3. File Type / Category Filter
                 if file_type:
                     ft_lower = file_type.lower()
                     src_path = entry.get("source", "")
@@ -183,12 +187,69 @@ def load_logs(
                         if ext != norm_ft:
                             continue
 
-                # Apply directory filter
+                # 4. Directory Filter
                 if directory:
                     dir_lower = directory.lower()
                     src_lower = entry.get("source", "").lower()
                     dest_lower = entry.get("destination", "").lower()
                     if dir_lower not in src_lower and dir_lower not in dest_lower:
+                        continue
+
+                # 5. Smart Token & Keyword Filters
+                if token_filters:
+                    # user: token
+                    if "user" in token_filters:
+                        if token_filters["user"] not in entry.get("user", "").lower():
+                            continue
+                    # ext: token
+                    if "ext" in token_filters:
+                        t_ext = token_filters["ext"]
+                        target_ext = os.path.splitext(entry.get("source", "").lower())[1].lstrip(".")
+                        if t_ext.lstrip(".") != target_ext:
+                            continue
+                    # level: token
+                    if "level" in token_filters:
+                        if token_filters["level"] not in entry.get("alert_level", "").lower():
+                            continue
+                    # event: token
+                    if "event" in token_filters:
+                        if token_filters["event"] not in entry.get("event_type", "").lower():
+                            continue
+                    # dir: token
+                    if "dir" in token_filters:
+                        d_val = token_filters["dir"]
+                        if d_val not in entry.get("source", "").lower() and d_val not in entry.get("destination", "").lower():
+                            continue
+                    # risk:>N or risk:N
+                    if "risk" in token_filters:
+                        r_val = token_filters["risk"]
+                        e_risk = entry.get("risk_score", 0)
+                        if r_val.startswith(">="):
+                            if e_risk < int(r_val[2:]):
+                                continue
+                        elif r_val.startswith(">"):
+                            if e_risk <= int(r_val[1:]):
+                                continue
+                        elif r_val.startswith("<="):
+                            if e_risk > int(r_val[2:]):
+                                continue
+                        elif r_val.startswith("<"):
+                            if e_risk >= int(r_val[1:]):
+                                continue
+                        elif int(r_val) != e_risk:
+                            continue
+
+                if free_text_terms:
+                    combined_text = " ".join([
+                        entry.get("source", ""),
+                        entry.get("destination", ""),
+                        entry.get("event_type", ""),
+                        entry.get("user", ""),
+                        entry.get("process", ""),
+                        str(entry.get("cmdline", "")),
+                        str(entry.get("dlp_summary", ""))
+                    ]).lower()
+                    if not all(term in combined_text for term in free_text_terms):
                         continue
 
                 entries.append(entry)
@@ -202,6 +263,8 @@ def load_logs(
             key_fn = lambda e: e.get("timestamp", "")
         elif s in ("level", "alert_level", "severity"):
             key_fn = lambda e: _ALERT_LEVEL_WEIGHT.get(e.get("alert_level", "").upper(), 0)
+        elif s in ("risk", "risk_score"):
+            key_fn = lambda e: e.get("risk_score", 0)
         elif s in ("source", "directory", "dir", "path"):
             key_fn = lambda e: e.get("source", "").lower()
         elif s in ("destination", "dest"):

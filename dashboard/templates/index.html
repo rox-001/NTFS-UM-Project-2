@@ -18,6 +18,10 @@
       <span class="logo-text">FileSentinel DLP</span>
       <span class="logo-sub">Security Operations</span>
     </div>
+    <div class="top-nav-actions">
+      <button class="btn-nav-action" onclick="openDirectoriesModal()" title="Manage Monitored Directories">📁 Monitored Folders</button>
+      <button class="btn-nav-action" onclick="openVaultModal()" title="View Quarantined Files">🛡️ Vault</button>
+    </div>
     <div class="status-area">
       <span class="status-dot" id="statusDot"></span>
       <span class="status-label" id="statusLabel">Connecting…</span>
@@ -82,9 +86,29 @@
       </div>
     </section>
 
+    <!-- Time Window Presets Bar -->
+    <section class="time-bar">
+      <div class="time-presets">
+        <span class="time-label">⏱️ Timeframe:</span>
+        <button class="time-pill active" id="pill-all" onclick="setTimePreset('all')">All Time</button>
+        <button class="time-pill" id="pill-1h" onclick="setTimePreset('1h')">Last 1 Hour</button>
+        <button class="time-pill" id="pill-24h" onclick="setTimePreset('24h')">Last 24 Hours</button>
+        <button class="time-pill" id="pill-7d" onclick="setTimePreset('7d')">Last 7 Days</button>
+        <button class="time-pill" id="pill-custom" onclick="toggleCustomTime()">Custom Range ▾</button>
+      </div>
+      <div class="custom-time-row" id="customTimeRow" style="display: none;">
+        <span>From:</span>
+        <input type="datetime-local" id="startTimeInput" class="time-input" />
+        <span>To:</span>
+        <input type="datetime-local" id="endTimeInput" class="time-input" />
+        <button class="btn-apply-time" onclick="applyCustomTime()">Apply</button>
+        <button class="btn-clear-time" onclick="clearCustomTime()">Clear</button>
+      </div>
+    </section>
+
     <!-- Filter Bar -->
     <section class="filter-bar">
-      <input type="text"  id="searchInput"  class="filter-input" placeholder="🔍  Search source, destination, event type, user…" />
+      <input type="text"  id="searchInput"  class="filter-input" placeholder="🔍  Search or use tokens: user:admin ext:pem risk:>70 dir:Downloads event:DOWNLOADED..." />
       <select id="levelFilter" class="filter-select" title="Filter by alert level">
         <option value="">All Levels</option>
         <option value="INFO">INFO</option>
@@ -102,7 +126,8 @@
       <select id="sortSelect" class="filter-select" title="Sort log events" onchange="onSortSelectChange()">
         <option value="timestamp_desc">📅 Date: Newest First</option>
         <option value="timestamp_asc">📅 Date: Oldest First</option>
-        <option value="level_desc">🚨 Severity: High → Low</option>
+        <option value="risk_desc">🚨 Risk Score: High → Low</option>
+        <option value="level_desc">⚠️ Severity: High → Low</option>
         <option value="level_asc">ℹ️ Severity: Low → High</option>
         <option value="source_asc">📁 Directory / Path (A-Z)</option>
         <option value="ext_asc">🏷️ File Extension (A-Z)</option>
@@ -115,7 +140,7 @@
       <div class="table-header-row">
         <div>
           <span class="table-title">Event Log</span>
-          <span class="table-tip">💡 Click any row to view security incident report in chat format</span>
+          <span class="table-tip">💡 Click any row to inspect deep telemetry & remediation actions in chat format</span>
         </div>
         <span class="table-meta" id="tableMeta">Loading…</span>
       </div>
@@ -124,18 +149,17 @@
           <thead>
             <tr>
               <th onclick="toggleSort('timestamp')" class="sortable-th">Timestamp <span class="sort-icon" id="th-timestamp">▼</span></th>
+              <th onclick="toggleSort('risk')" class="sortable-th">Risk <span class="sort-icon" id="th-risk"></span></th>
               <th onclick="toggleSort('level')" class="sortable-th">Level <span class="sort-icon" id="th-level"></span></th>
               <th onclick="toggleSort('event_type')" class="sortable-th">Event <span class="sort-icon" id="th-event_type"></span></th>
               <th onclick="toggleSort('source')" class="sortable-th">Source <span class="sort-icon" id="th-source"></span></th>
               <th onclick="toggleSort('destination')" class="sortable-th">Destination <span class="sort-icon" id="th-destination"></span></th>
-              <th>User</th>
-              <th>Hash Pre</th>
-              <th>Hash Post</th>
-              <th onclick="toggleSort('integrity')" class="sortable-th">Integrity <span class="sort-icon" id="th-integrity"></span></th>
+              <th>Process / Lineage</th>
+              <th>Integrity</th>
             </tr>
           </thead>
           <tbody id="logBody">
-            <tr><td colspan="9" class="empty-row">No events yet. Start monitoring to see data.</td></tr>
+            <tr><td colspan="8" class="empty-row">No events yet. Start monitoring to see data.</td></tr>
           </tbody>
         </table>
       </div>
@@ -237,6 +261,64 @@
     }
   }
 
+  // ── Time Presets & Range State ──────────────────────────────────────────
+  let activeTimePreset = "all";
+  let activeStartTime  = null;
+  let activeEndTime    = null;
+
+  function setTimePreset(preset) {
+    activeTimePreset = preset;
+    document.querySelectorAll(".time-pill").forEach(p => p.classList.remove("active"));
+    const pill = document.getElementById("pill-" + preset);
+    if (pill) pill.classList.add("active");
+
+    const customRow = document.getElementById("customTimeRow");
+    if (preset !== "custom") {
+      customRow.style.display = "none";
+    }
+
+    const now = new Date();
+    if (preset === "all") {
+      activeStartTime = null;
+      activeEndTime = null;
+    } else if (preset === "1h") {
+      activeStartTime = new Date(now.getTime() - 3600 * 1000).toISOString();
+      activeEndTime = null;
+    } else if (preset === "24h") {
+      activeStartTime = new Date(now.getTime() - 24 * 3600 * 1000).toISOString();
+      activeEndTime = null;
+    } else if (preset === "7d") {
+      activeStartTime = new Date(now.getTime() - 7 * 24 * 3600 * 1000).toISOString();
+      activeEndTime = null;
+    }
+    fetchLogs(1);
+  }
+
+  function toggleCustomTime() {
+    const customRow = document.getElementById("customTimeRow");
+    if (customRow.style.display === "none" || !customRow.style.display) {
+      customRow.style.display = "flex";
+      document.querySelectorAll(".time-pill").forEach(p => p.classList.remove("active"));
+      document.getElementById("pill-custom").classList.add("active");
+    } else {
+      customRow.style.display = "none";
+    }
+  }
+
+  function applyCustomTime() {
+    const startVal = document.getElementById("startTimeInput").value;
+    const endVal = document.getElementById("endTimeInput").value;
+    activeStartTime = startVal ? new Date(startVal).toISOString() : null;
+    activeEndTime = endVal ? new Date(endVal).toISOString() : null;
+    fetchLogs(1);
+  }
+
+  function clearCustomTime() {
+    document.getElementById("startTimeInput").value = "";
+    document.getElementById("endTimeInput").value = "";
+    setTimePreset("all");
+  }
+
   // ── Logs ─────────────────────────────────────────────────────────────────
   async function fetchLogs(page = currentPage) {
     const level    = document.getElementById("levelFilter").value;
@@ -246,6 +328,8 @@
     if (level)    url += `&level=${encodeURIComponent(level)}`;
     if (fileType) url += `&file_type=${encodeURIComponent(fileType)}`;
     if (keyword)  url += `&keyword=${encodeURIComponent(keyword)}`;
+    if (activeStartTime) url += `&start_time=${encodeURIComponent(activeStartTime)}`;
+    if (activeEndTime)   url += `&end_time=${encodeURIComponent(activeEndTime)}`;
 
     try {
       const res  = await fetch(url);
@@ -263,24 +347,26 @@
   function renderLogs(logs) {
     const tbody = document.getElementById("logBody");
     if (!logs || logs.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="9" class="empty-row">No matching events.</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="8" class="empty-row">No matching events.</td></tr>`;
       return;
     }
     tbody.innerHTML = logs.map((e, idx) => {
       const isSelected = selectedEventId === (e.timestamp + e.source);
       const selectedClass = isSelected ? "selected-row" : "";
+      const risk = (e.risk_score !== undefined && e.risk_score !== null) ? e.risk_score : (e.alert_level === 'CRITICAL' ? 85 : (e.alert_level === 'WARNING' ? 45 : 10));
+      const riskClass = risk >= 70 ? 'r-high' : (risk >= 40 ? 'r-med' : 'r-low');
+      const lineageText = e.process_lineage || e.process || "—";
       return `
         <tr class="row-${(e.alert_level||"INFO").toLowerCase()} ${selectedClass}"
             onclick="selectLogEvent(${idx}, this)"
             title="Click to inspect this security event in chat format">
           <td class="mono ts">${(e.timestamp||"").slice(0,19).replace("T"," ")}</td>
+          <td><span class="badge-risk ${riskClass}">${risk}</span></td>
           <td><span class="badge-level ${(e.alert_level||"INFO").toLowerCase()}">${e.alert_level||"—"}</span></td>
           <td><span class="event-type">${e.event_type||"—"}</span></td>
-          <td class="mono path" title="${e.source||""}">${truncate(e.source||"", 35)}</td>
-          <td class="mono path" title="${e.destination||""}">${truncate(e.destination||"—", 25)}</td>
-          <td>${e.user||"—"}</td>
-          <td class="mono hash" title="${e.hash_pre||""}">${shortHash(e.hash_pre)}</td>
-          <td class="mono hash" title="${e.hash_post||""}">${shortHash(e.hash_post)}</td>
+          <td class="mono path" title="${escapeHtml(e.source||"")}">${truncate(e.source||"", 30)}</td>
+          <td class="mono path" title="${escapeHtml(e.destination||"")}">${truncate(e.destination||"—", 22)}</td>
+          <td class="mono lineage" title="${escapeHtml(e.process_cmdline || lineageText)}">${truncate(lineageText, 24)}</td>
           <td><span class="integrity-badge ${(e.integrity_status||"").toLowerCase()}">${e.integrity_status||"—"}</span></td>
         </tr>
       `;
@@ -338,6 +424,9 @@
     const fileName = getBasename(e.source);
     const tsFormatted = (e.timestamp || "").replace("T", " ").slice(0, 19);
 
+    const risk = (e.risk_score !== undefined && e.risk_score !== null) ? e.risk_score : (level === 'CRITICAL' ? 85 : (level === 'WARNING' ? 45 : 10));
+    const riskClass = risk >= 70 ? 'r-high' : (risk >= 40 ? 'r-med' : 'r-low');
+
     // Dynamic advice and policy text
     let policyText = "";
     let recText = "";
@@ -364,9 +453,18 @@
           <div class="chat-bubble ${level.toLowerCase()}">
             <div class="bubble-headline">
               <span class="badge-level ${level.toLowerCase()}">${level}</span>
-              <strong>${e.event_type} event detected</strong>
+              <strong>${escapeHtml(e.event_type)} event detected</strong>
             </div>
-            <p class="bubble-p">Filesystem monitor intercepted a file <strong>${e.event_type}</strong> operation for <code>${escapeHtml(fileName)}</code>.</p>
+            <p class="bubble-p">Filesystem monitor intercepted a file <strong>${escapeHtml(e.event_type)}</strong> operation for <code>${escapeHtml(fileName)}</code>.</p>
+            <div class="risk-meter-container">
+              <div class="risk-meter-header">
+                <span class="risk-meter-label">Calculated Risk Score</span>
+                <span class="risk-score-num ${riskClass}">${risk}/100</span>
+              </div>
+              <div class="risk-bar-track">
+                <div class="risk-bar-fill ${riskClass}" style="width: ${risk}%"></div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -396,14 +494,82 @@
                   <div class="kv-val font-semibold">${escapeHtml(e.user || "N/A")}</div>
                 </div>
                 <div>
-                  <span class="kv-label">Triggering Process:</span>
-                  <div class="kv-val mono">${escapeHtml(e.process || "N/A")}</div>
+                  <span class="kv-label">Process / PID:</span>
+                  <div class="kv-val mono">${escapeHtml(e.process || "N/A")} ${e.process_pid ? `(PID: ${e.process_pid})` : ""}</div>
                 </div>
+              </div>
+              ${e.process_lineage ? `
+              <div class="kv-item">
+                <span class="kv-label">Process Lineage:</span>
+                <div class="kv-val mono lineage break-all">${escapeHtml(e.process_lineage)}</div>
+              </div>` : ""}
+              ${e.process_cmdline ? `
+              <div class="kv-item">
+                <span class="kv-label">Command Line:</span>
+                <div class="cmdline-box">${escapeHtml(e.process_cmdline)}</div>
+              </div>` : ""}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      ${e.download_metadata || e.event_type === 'DOWNLOADED' ? `
+      <!-- Block 2.5: Web Download Origin (NTFS Zone.Identifier) -->
+      <div class="chat-block bot-block">
+        <div class="chat-avatar file-av">🌐</div>
+        <div class="chat-body">
+          <div class="chat-meta">
+            <span class="chat-sender">NTFS Zone.Identifier Engine</span>
+            <span class="chat-tag">Origin URL Telemetry</span>
+          </div>
+          <div class="chat-bubble download-bubble">
+            <div class="kv-grid">
+              <div class="kv-item">
+                <span class="kv-label">Origin Host URL:</span>
+                <div class="download-url-box">${escapeHtml((e.download_metadata && e.download_metadata.host_url) || "Unknown Host URL")}</div>
+              </div>
+              ${(e.download_metadata && e.download_metadata.referrer_url) ? `
+              <div class="kv-item">
+                <span class="kv-label">Referrer URL:</span>
+                <div class="download-url-box">${escapeHtml(e.download_metadata.referrer_url)}</div>
+              </div>` : ""}
+              <div class="kv-item">
+                <span class="kv-label">Zone Security Identifier:</span>
+                <div class="kv-val mono text-amber">Zone 3 (Internet Security Zone)</div>
               </div>
             </div>
           </div>
         </div>
       </div>
+      ` : ""}
+
+      ${(e.dlp_findings && Object.keys(e.dlp_findings).length > 0) ? `
+      <!-- Block 2.6: DLP Regex Content Inspection Findings -->
+      <div class="chat-block bot-block">
+        <div class="chat-avatar system-av critical">🔍</div>
+        <div class="chat-body">
+          <div class="chat-meta">
+            <span class="chat-sender">DLP Content Inspection Engine</span>
+            <span class="chat-tag">Confidential Data Detected</span>
+          </div>
+          <div class="chat-bubble dlp-bubble">
+            <div class="bubble-headline">
+              <span class="badge-level critical">DLP ALERT</span>
+              <strong>Pattern matches detected in content</strong>
+            </div>
+            ${Object.entries(e.dlp_findings).map(([ruleName, data]) => `
+              <div class="dlp-item">
+                <div class="dlp-type-header">
+                  <span>⚠️ ${escapeHtml(ruleName.toUpperCase().replace(/_/g, ' '))}</span>
+                  <span class="dlp-count-pill">${data.count || (Array.isArray(data) ? data.length : 1)} match(es)</span>
+                </div>
+                <div class="dlp-sample-box">${escapeHtml(Array.isArray(data.samples) ? data.samples.join(", ") : (Array.isArray(data) ? data.join(", ") : JSON.stringify(data)))}</div>
+              </div>
+            `).join("")}
+          </div>
+        </div>
+      </div>
+      ` : ""}
 
       <!-- Block 3: Exact Content Changes & Diff Telemetry -->
       ${e.diff ? `
@@ -493,9 +659,25 @@
         </div>
       </div>
 
-      <!-- Block 6: Interactive Quick Actions -->
+      <!-- Block 6: Remediation & Quick Actions -->
+      <div class="remediation-box">
+        <div class="remediation-title">SOC One-Click Remediation</div>
+        <div class="remediation-btn-row">
+          <button class="btn-remedy btn-quarantine" onclick="actionQuarantine('${escapeQuotes(e.source || "")}')">
+            🛡️ Quarantine File
+          </button>
+          ${e.process_pid && e.process_pid > 4 ? `
+          <button class="btn-remedy btn-terminate" onclick="actionTerminate(${e.process_pid}, '${escapeQuotes(e.process || "")}')">
+            🛑 Terminate Process
+          </button>` : ""}
+          <button class="btn-remedy btn-allowlist" onclick="actionAllowlist('${escapeQuotes(e.source || "")}', 'path')">
+            ✅ Add to Allowlist
+          </button>
+        </div>
+      </div>
+
       <div class="action-footer">
-        <button class="btn-action" onclick="copyLogJson(${encodeURIComponent(JSON.stringify(e))})">📋 Copy JSON</button>
+        <button class="btn-action" onclick="copyLogJson('${encodeURIComponent(JSON.stringify(e))}')">📋 Copy JSON</button>
         <button class="btn-action" onclick="copyText('${escapeQuotes(e.source || "")}')">📁 Copy Source</button>
         <button class="btn-action secondary" onclick="closeDrawer()">✕ Close</button>
       </div>
@@ -670,7 +852,231 @@
     refreshTimer = setInterval(fetchAll, 5000);
   }
 
+  // ── SOC Remediation Handlers ─────────────────────────────────────────────
+  async function actionQuarantine(filePath) {
+    if (!filePath || filePath === "—") return;
+    if (!confirm(`Are you sure you want to isolate & quarantine this file?\n\n${filePath}`)) return;
+    try {
+      const res = await fetch("/api/action/quarantine", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file_path: filePath })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        alert(`✓ File successfully moved to Quarantine Vault:\nVault: ${data.quarantine_vault_path}`);
+        fetchAll();
+      } else {
+        alert(`⚠️ Quarantine failed: ${data.error || "Unknown error"}`);
+      }
+    } catch (e) {
+      alert(`⚠️ Quarantine request failed: ${e.message}`);
+    }
+  }
+
+  async function actionTerminate(pid, procName) {
+    if (!pid || pid <= 4) {
+      alert("No valid process PID available for termination.");
+      return;
+    }
+    if (!confirm(`⚠️ CRITICAL SOC ACTION:\nTerminate process "${procName}" (PID: ${pid})?`)) return;
+    try {
+      const res = await fetch("/api/action/terminate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pid: pid })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        alert(`✓ Process ${pid} (${procName}) terminated successfully.`);
+      } else {
+        alert(`⚠️ Termination failed: ${data.error || "Could not terminate process."}`);
+      }
+    } catch (e) {
+      alert(`⚠️ Terminate request failed: ${e.message}`);
+    }
+  }
+
+  async function actionAllowlist(entry, entryType = "path") {
+    if (!entry) return;
+    if (!confirm(`Add ${entryType} to Allowlist to suppress future alerts?\n\n${entry}`)) return;
+    try {
+      const res = await fetch("/api/action/allowlist", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entry: entry, entry_type: entryType, reason: "Added from Incident Drawer" })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        alert(`✓ Entry added to Allowlist.`);
+      } else {
+        alert(`⚠️ Could not add to allowlist: ${data.error || "Unknown error"}`);
+      }
+    } catch (e) {
+      alert(`⚠️ Allowlist request failed: ${e.message}`);
+    }
+  }
+
+  // ── Monitored Directories Modal Handlers ──────────────────────────────────
+  async function openDirectoriesModal() {
+    document.getElementById("dirsModal").style.display = "flex";
+    loadDirectories();
+  }
+
+  function closeDirectoriesModal() {
+    document.getElementById("dirsModal").style.display = "none";
+    document.getElementById("dirsFeedback").style.display = "none";
+  }
+
+  async function loadDirectories() {
+    const listEl = document.getElementById("dirsList");
+    try {
+      const res = await fetch("/api/directories");
+      const data = await res.json();
+      const dirs = data.directories || [];
+      if (dirs.length === 0) {
+        listEl.innerHTML = `<div class="text-muted" style="padding: 10px; font-size: 12px;">No custom directories monitored yet.</div>`;
+        return;
+      }
+      listEl.innerHTML = dirs.map(d => `
+        <div class="modal-item">
+          <span class="modal-item-path" title="${escapeHtml(d)}">${escapeHtml(d)}</span>
+          <button class="btn-item-del" onclick="removeDirectory('${escapeQuotes(d)}')" title="Stop monitoring this folder">🗑️ Remove</button>
+        </div>
+      `).join("");
+    } catch (e) {
+      listEl.innerHTML = `<div class="text-crit" style="padding: 10px; font-size: 12px;">Failed to load directories.</div>`;
+    }
+  }
+
+  async function addDirectory() {
+    const input = document.getElementById("newDirInput");
+    const dir = input.value.trim();
+    const fb = document.getElementById("dirsFeedback");
+    if (!dir) return;
+    try {
+      const res = await fetch("/api/directories/add", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ directory: dir })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        fb.textContent = `✓ Added: ${dir}`;
+        fb.className = "modal-feedback success";
+        input.value = "";
+        loadDirectories();
+      } else {
+        fb.textContent = `⚠️ Error: ${data.error || "Failed to add directory"}`;
+        fb.className = "modal-feedback error";
+      }
+    } catch (e) {
+      fb.textContent = `⚠️ Network error: ${e.message}`;
+      fb.className = "modal-feedback error";
+    }
+  }
+
+  async function removeDirectory(dir) {
+    if (!confirm(`Stop monitoring folder?\n${dir}`)) return;
+    try {
+      const res = await fetch("/api/directories/remove", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ directory: dir })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        loadDirectories();
+      } else {
+        alert(`⚠️ Error: ${data.error || "Failed to remove directory"}`);
+      }
+    } catch (e) {
+      alert(`⚠️ Network error: ${e.message}`);
+    }
+  }
+
+  // ── Quarantine Vault Modal Handlers ───────────────────────────────────────
+  async function openVaultModal() {
+    document.getElementById("vaultModal").style.display = "flex";
+    loadVault();
+  }
+
+  function closeVaultModal() {
+    document.getElementById("vaultModal").style.display = "none";
+  }
+
+  async function loadVault() {
+    const listEl = document.getElementById("vaultList");
+    try {
+      const res = await fetch("/api/quarantine");
+      const data = await res.json();
+      const files = data.vault || data.quarantined_files || [];
+      if (files.length === 0) {
+        listEl.innerHTML = `<div class="text-muted" style="padding: 12px; font-size: 12px; text-align: center;">Quarantine Vault is currently empty.</div>`;
+        return;
+      }
+      listEl.innerHTML = files.map(f => `
+        <div class="modal-item" style="flex-direction: column; align-items: flex-start; gap: 4px;">
+          <div style="display: flex; justify-content: space-between; width: 100%;">
+            <strong style="color: #ff7b72; font-size: 12px;">${escapeHtml(getBasename(f.original_path))}</strong>
+            <span style="font-size: 10.5px; color: var(--text-muted);">${(f.quarantined_at||"").replace("T"," ").slice(0,19)}</span>
+          </div>
+          <div class="mono" style="font-size: 11px; color: var(--text-secondary); word-break: break-all;">Original: ${escapeHtml(f.original_path)}</div>
+          <div class="mono" style="font-size: 10.5px; color: var(--text-muted);">Vault: ${escapeHtml(f.quarantine_path)}</div>
+        </div>
+      `).join("");
+    } catch (e) {
+      listEl.innerHTML = `<div class="text-crit" style="padding: 10px; font-size: 12px;">Failed to load vault records.</div>`;
+    }
+  }
+
   startRefresh();
 </script>
+
+<!-- ═════════════════════════════ MODALS ══════════════════════════════════ -->
+<!-- Monitored Directories Modal -->
+<div class="modal-backdrop" id="dirsModal" style="display: none;" onclick="if(event.target===this) closeDirectoriesModal()">
+  <div class="modal-box">
+    <div class="modal-header">
+      <div class="modal-title">📁 Monitored Directories</div>
+      <button class="modal-close" onclick="closeDirectoriesModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-section-title">Active Monitored Directories</div>
+      <div class="modal-list" id="dirsList">
+        <div class="text-muted">Loading monitored directories…</div>
+      </div>
+      <div class="modal-section-title" style="margin-top: 10px;">Add New Directory</div>
+      <div class="modal-add-form">
+        <input type="text" id="newDirInput" class="modal-input" placeholder="e.g. C:\Users\YourUser\Documents" />
+        <button class="btn-modal-add" onclick="addDirectory()">➕ Add Folder</button>
+      </div>
+      <div class="modal-feedback" id="dirsFeedback"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-action secondary" onclick="closeDirectoriesModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Quarantine Vault Modal -->
+<div class="modal-backdrop" id="vaultModal" style="display: none;" onclick="if(event.target===this) closeVaultModal()">
+  <div class="modal-box">
+    <div class="modal-header">
+      <div class="modal-title">🛡️ Quarantined Files Vault</div>
+      <button class="modal-close" onclick="closeVaultModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-section-title">Quarantined File Records</div>
+      <div class="modal-list" id="vaultList">
+        <div class="text-muted">Loading vault…</div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-action secondary" onclick="closeVaultModal()">Close</button>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>

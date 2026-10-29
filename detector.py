@@ -235,8 +235,126 @@ def describe_event(event_type: str, src_path: str, dest_path: str = "") -> str:
         "MODIFIED":    f"File modified: '{basename}'",
         "DELETED":     f"File deleted: '{basename}'",
         "MOVED":       f"File moved: '{basename}' \u2192 '{dest_path}'",
+        "DOWNLOADED":  f"File downloaded from internet: '{basename}'",
         "CREATED_DIR": f"Directory created: '{basename}'",
         "DELETED_DIR": f"Directory deleted: '{basename}'",
         "MOVED_DIR":   f"Directory moved: '{basename}' \u2192 '{dest_path}'",
     }
     return descriptions.get(event_type, f"Event {event_type} on '{basename}'")
+
+
+def detect_download_metadata(filepath: str) -> tuple[bool, str, str]:
+    """
+    Check if a file was downloaded from the Internet via NTFS Zone.Identifier Alternate Data Stream.
+    Returns:
+        (is_download, host_url, referrer_url)
+    """
+    if sys.platform != "win32" or not filepath:
+        return False, "", ""
+
+    ads_path = filepath + ":Zone.Identifier"
+    try:
+        if os.path.exists(ads_path):
+            host_url = ""
+            referrer_url = ""
+            is_internet = False
+            with open(ads_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("ZoneId="):
+                        val = line.split("=", 1)[1].strip()
+                        # ZoneId 3 = Internet, ZoneId 4 = Restricted
+                        if val in ("3", "4"):
+                            is_internet = True
+                    elif line.startswith("HostUrl="):
+                        host_url = line.split("=", 1)[1].strip()
+                    elif line.startswith("ReferrerUrl="):
+                        referrer_url = line.split("=", 1)[1].strip()
+            if is_internet:
+                return True, host_url, referrer_url
+    except Exception:
+        pass
+    return False, "", ""
+
+
+def calculate_risk_score(
+    event_type: str,
+    src_path: str,
+    dest_path: str = "",
+    process_name: str = "",
+    dlp_bonus: int = 0,
+) -> tuple[int, str]:
+    """
+    Calculate a normalized 0-100 risk score and mapped severity level:
+      Score = FileSensitivity (0-35) + DestinationRisk (0-30) + ProcessRisk (0-20) + DLPBonus (0-15) + OffHours (0-10)
+    """
+    score = 0
+    src_sens = is_sensitive_file(src_path)
+    dest_sens = is_sensitive_file(dest_path) if dest_path else False
+    is_sens = src_sens or dest_sens
+
+    # 1. File Sensitivity (0 to 35)
+    if is_sens:
+        basename = os.path.basename(src_path).lower()
+        _, ext = os.path.splitext(basename)
+        if ext in {".pem", ".key", ".env", ".pfx", ".p12", ".kdbx"} or basename in {".env"}:
+            score += 35
+        else:
+            score += 25
+    else:
+        score += 5
+
+    # 2. Destination / Location Risk (0 to 30)
+    if dest_path:
+        if is_suspicious_destination(dest_path) or is_cloud_or_removable_location(dest_path):
+            score += 30
+        elif event_type in ("MOVED", "MOVED_DIR"):
+            score += 10
+    else:
+        if is_cloud_or_removable_location(src_path):
+            score += 20
+
+    # 3. Process Risk (0 to 20)
+    proc_lower = (process_name or "").lower()
+    suspicious_procs = {"powershell.exe", "pwsh.exe", "cmd.exe", "curl.exe", "wget.exe", "python.exe", "wscript.exe", "cscript.exe", "certutil.exe", "bitsadmin.exe"}
+    if proc_lower in suspicious_procs:
+        score += 20
+    elif proc_lower in {"explorer.exe", "devenv.exe", "code.exe"}:
+        score += 0
+    elif proc_lower and proc_lower != "system / background":
+        score += 10
+    else:
+        score += 5
+
+    # 4. DLP Content Regex Hits (0 to 15)
+    score += min(15, max(0, dlp_bonus))
+
+    # 5. Off-Hours Anomaly (0 to 10) - (23:00 to 06:00 local time)
+    import datetime
+    current_hour = datetime.datetime.now().hour
+    if current_hour >= 23 or current_hour < 6:
+        score += 10
+
+    # Cap score at 100
+    score = min(100, max(0, score))
+
+    if score >= 70:
+        level = "CRITICAL"
+    elif score >= 40:
+        level = "WARNING"
+    else:
+        level = "INFO"
+
+    # Align with classic classify_event for safety
+    classic_level = classify_event(event_type, src_path, dest_path)
+    if classic_level == "CRITICAL":
+        level = "CRITICAL"
+        score = max(score, 75)
+    elif classic_level == "WARNING" and level == "INFO":
+        level = "WARNING"
+        score = max(score, 45)
+    elif classic_level == "INFO" and not is_sens and not dest_path and not dlp_bonus:
+        level = "INFO"
+        score = min(score, 35)
+
+    return score, level

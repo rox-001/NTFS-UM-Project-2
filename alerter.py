@@ -34,7 +34,7 @@ def register_desktop_notifier(callback):
     _desktop_notifier = callback
 
 
-def trigger_alert(level: str, message: str, event_data: dict = None):
+def trigger_alert(level: str, message: str, event_data: dict = None, risk_score: int = 0):
     """
     Generate an alert at the specified severity level.
 
@@ -47,11 +47,13 @@ def trigger_alert(level: str, message: str, event_data: dict = None):
         level:      'INFO', 'WARNING', or 'CRITICAL'
         message:    Human-readable alert summary
         event_data: Optional dict of event context (source, destination, etc.)
+        risk_score: Numerical risk score (0-100)
     """
     ts = datetime.now().isoformat()
     alert_entry = {
         "timestamp":  ts,
         "level":      level,
+        "risk_score": risk_score,
         "message":    message,
         "event_data": event_data or {},
     }
@@ -65,9 +67,9 @@ def trigger_alert(level: str, message: str, event_data: dict = None):
     ts_short = datetime.now().strftime("%H:%M:%S")
 
     if level == "CRITICAL":
-        _print_critical_banner(message, event_data, ts_short)
+        _print_critical_banner(message, event_data, ts_short, risk_score)
     else:
-        out = f"{color}{ts_short} {icon} [{level}] {message}{Style.RESET_ALL}"
+        out = f"{color}{ts_short} {icon} [{level} | Risk {risk_score:02d}] {message}{Style.RESET_ALL}"
         try:
             print(out)
         except UnicodeEncodeError:
@@ -81,7 +83,7 @@ def trigger_alert(level: str, message: str, event_data: dict = None):
             pass
 
 
-def _print_critical_banner(message: str, event_data: dict, ts: str):
+def _print_critical_banner(message: str, event_data: dict, ts: str, risk_score: int = 0):
     """Print a loud CRITICAL alert banner to the console."""
     src  = event_data.get("source", "N/A")      if event_data else "N/A"
     dest = event_data.get("destination", "N/A") if event_data else "N/A"
@@ -91,7 +93,7 @@ def _print_critical_banner(message: str, event_data: dict, ts: str):
     banner = f"""
 {Fore.RED}{Back.BLACK}
 +{line}+
-|  [!]  CRITICAL SECURITY ALERT  {ts:>29}  |
+|  [!]  CRITICAL SECURITY ALERT (RISK {risk_score:02d}/100)  {ts:>17}  |
 +{line}+
 |  {message[:60]:<60}  |
 |  User   : {user[:52]:<52}  |
