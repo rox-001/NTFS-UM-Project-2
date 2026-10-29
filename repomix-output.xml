@@ -710,270 +710,6 @@ This section contains the contents of the repository's files.
 84:     test_monitor_no_flood()
 </file>
 
-<file path="db.py">
-  1: """
-  2: db.py - Persistent SQLite Database Engine for FileSentinel
-  3: Manages persistent baseline file hashes, custom monitored directories,
-  4: SOC allowlists, and quarantine vault metadata across system reboots.
-  5: """
-  6: 
-  7: import os
-  8: import sqlite3
-  9: import threading
- 10: import time
- 11: import shutil
- 12: from config import BASE_DIR
- 13: 
- 14: DATA_DIR = os.path.join(BASE_DIR, "data")
- 15: VAULT_DIR = os.path.join(BASE_DIR, "vault")
- 16: QUARANTINE_DIR = os.path.join(VAULT_DIR, "quarantine")
- 17: DB_PATH = os.path.join(DATA_DIR, "filesentinel.db")
- 18: 
- 19: os.makedirs(DATA_DIR, exist_ok=True)
- 20: os.makedirs(QUARANTINE_DIR, exist_ok=True)
- 21: 
- 22: _db_lock = threading.Lock()
- 23: 
- 24: 
- 25: def _get_connection() -> sqlite3.Connection:
- 26:     conn = sqlite3.connect(DB_PATH, timeout=10.0)
- 27:     conn.row_factory = sqlite3.Row
- 28:     return conn
- 29: 
- 30: 
- 31: def init_db():
- 32:     """Create tables and indexes if they do not exist."""
- 33:     with _db_lock, _get_connection() as conn:
- 34:         conn.execute("""
- 35:             CREATE TABLE IF NOT EXISTS baseline_hashes (
- 36:                 norm_path TEXT PRIMARY KEY,
- 37:                 hash TEXT NOT NULL,
- 38:                 size INTEGER NOT NULL,
- 39:                 mtime REAL NOT NULL,
- 40:                 updated_at REAL NOT NULL
- 41:             )
- 42:         """)
- 43:         conn.execute("""
- 44:             CREATE TABLE IF NOT EXISTS monitored_directories (
- 45:                 path TEXT PRIMARY KEY,
- 46:                 added_at REAL NOT NULL,
- 47:                 is_active INTEGER NOT NULL DEFAULT 1
- 48:             )
- 49:         """)
- 50:         conn.execute("""
- 51:             CREATE TABLE IF NOT EXISTS allowlist (
- 52:                 entry TEXT PRIMARY KEY,
- 53:                 entry_type TEXT NOT NULL,
- 54:                 reason TEXT,
- 55:                 added_at REAL NOT NULL
- 56:             )
- 57:         """)
- 58:         conn.execute("""
- 59:             CREATE TABLE IF NOT EXISTS quarantine_vault (
- 60:                 id INTEGER PRIMARY KEY AUTOINCREMENT,
- 61:                 original_path TEXT NOT NULL,
- 62:                 quarantined_path TEXT NOT NULL,
- 63:                 quarantined_at REAL NOT NULL,
- 64:                 file_size INTEGER NOT NULL,
- 65:                 original_hash TEXT,
- 66:                 reason TEXT
- 67:             )
- 68:         """)
- 69:         conn.commit()
- 70: 
- 71: 
- 72: # Initialize database schema immediately on module import
- 73: init_db()
- 74: 
- 75: 
- 76: # ── Baseline Hash Functions ──────────────────────────────────────────────────
- 77: 
- 78: def set_baseline(filepath: str, digest: str, size: int = 0, mtime: float = 0.0):
- 79:     if not filepath or not digest:
- 80:         return
- 81:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
- 82:     now = time.time()
- 83:     with _db_lock, _get_connection() as conn:
- 84:         conn.execute("""
- 85:             INSERT INTO baseline_hashes (norm_path, hash, size, mtime, updated_at)
- 86:             VALUES (?, ?, ?, ?, ?)
- 87:             ON CONFLICT(norm_path) DO UPDATE SET
- 88:                 hash = excluded.hash,
- 89:                 size = excluded.size,
- 90:                 mtime = excluded.mtime,
- 91:                 updated_at = excluded.updated_at
- 92:         """, (norm, digest, size, mtime, now))
- 93:         conn.commit()
- 94: 
- 95: 
- 96: def get_baseline(filepath: str) -> dict | None:
- 97:     if not filepath:
- 98:         return None
- 99:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
-100:     with _db_lock, _get_connection() as conn:
-101:         row = conn.execute(
-102:             "SELECT norm_path, hash, size, mtime, updated_at FROM baseline_hashes WHERE norm_path = ?",
-103:             (norm,)
-104:         ).fetchone()
-105:         if row:
-106:             return dict(row)
-107:     return None
-108: 
-109: 
-110: def remove_baseline(filepath: str):
-111:     if not filepath:
-112:         return
-113:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
-114:     with _db_lock, _get_connection() as conn:
-115:         conn.execute("DELETE FROM baseline_hashes WHERE norm_path = ?", (norm,))
-116:         conn.commit()
-117: 
-118: 
-119: def get_all_baselines() -> dict[str, str]:
-120:     with _db_lock, _get_connection() as conn:
-121:         rows = conn.execute("SELECT norm_path, hash FROM baseline_hashes").fetchall()
-122:         return {r["norm_path"]: r["hash"] for r in rows}
-123: 
-124: 
-125: # ── Monitored Directories Functions ──────────────────────────────────────────
-126: 
-127: def get_monitored_directories() -> list[str]:
-128:     with _db_lock, _get_connection() as conn:
-129:         rows = conn.execute(
-130:             "SELECT path FROM monitored_directories WHERE is_active = 1 ORDER BY path ASC"
-131:         ).fetchall()
-132:         return [r["path"] for r in rows]
-133: 
-134: 
-135: def add_monitored_directory(path: str) -> bool:
-136:     if not path or not os.path.isdir(path):
-137:         return False
-138:     norm = os.path.normpath(os.path.abspath(path))
-139:     with _db_lock, _get_connection() as conn:
-140:         conn.execute("""
-141:             INSERT INTO monitored_directories (path, added_at, is_active)
-142:             VALUES (?, ?, 1)
-143:             ON CONFLICT(path) DO UPDATE SET is_active = 1
-144:         """, (norm, time.time()))
-145:         conn.commit()
-146:     return True
-147: 
-148: 
-149: def remove_monitored_directory(path: str) -> bool:
-150:     if not path:
-151:         return False
-152:     norm = os.path.normpath(os.path.abspath(path))
-153:     with _db_lock, _get_connection() as conn:
-154:         conn.execute("DELETE FROM monitored_directories WHERE path = ?", (norm,))
-155:         conn.commit()
-156:     return True
-157: 
-158: 
-159: # ── Allowlist Functions ──────────────────────────────────────────────────────
-160: 
-161: def add_to_allowlist(entry: str, entry_type: str = "path", reason: str = "") -> bool:
-162:     if not entry:
-163:         return False
-164:     norm = os.path.normcase(os.path.normpath(entry)) if entry_type == "path" else entry.strip().lower()
-165:     with _db_lock, _get_connection() as conn:
-166:         conn.execute("""
-167:             INSERT INTO allowlist (entry, entry_type, reason, added_at)
-168:             VALUES (?, ?, ?, ?)
-169:             ON CONFLICT(entry) DO UPDATE SET reason = excluded.reason
-170:         """, (norm, entry_type, reason, time.time()))
-171:         conn.commit()
-172:     return True
-173: 
-174: 
-175: def is_allowlisted(filepath: str, digest: str = None) -> bool:
-176:     if not filepath:
-177:         return False
-178:     norm_path = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
-179:     _, ext = os.path.splitext(norm_path)
-180: 
-181:     with _db_lock, _get_connection() as conn:
-182:         # Check path
-183:         row = conn.execute("SELECT 1 FROM allowlist WHERE entry = ? AND entry_type = 'path'", (norm_path,)).fetchone()
-184:         if row:
-185:             return True
-186:         # Check extension
-187:         if ext:
-188:             row = conn.execute("SELECT 1 FROM allowlist WHERE entry = ? AND entry_type = 'ext'", (ext,)).fetchone()
-189:             if row:
-190:                 return True
-191:         # Check hash
-192:         if digest:
-193:             row = conn.execute("SELECT 1 FROM allowlist WHERE entry = ? AND entry_type = 'hash'", (digest.lower(),)).fetchone()
-194:             if row:
-195:                 return True
-196:     return False
-197: 
-198: 
-199: def get_allowlist() -> list[dict]:
-200:     with _db_lock, _get_connection() as conn:
-201:         rows = conn.execute("SELECT entry, entry_type, reason, added_at FROM allowlist ORDER BY added_at DESC").fetchall()
-202:         return [dict(r) for r in rows]
-203: 
-204: 
-205: # ── Quarantine Vault Functions ───────────────────────────────────────────────
-206: 
-207: def quarantine_file(src_path: str, reason: str = "User Initiated Quarantine") -> dict:
-208:     """
-209:     Safely relocate a file to the isolated quarantine vault,
-210:     rename it with .quarantine extension, and make it read-only.
-211:     """
-212:     if not src_path or not os.path.exists(src_path):
-213:         return {"success": False, "error": f"File does not exist on disk: '{src_path}'"}
-214: 
-215:     norm_src = os.path.normpath(os.path.abspath(src_path))
-216:     try:
-217:         size = os.path.getsize(norm_src)
-218:     except OSError:
-219:         size = 0
-220: 
-221:     basename = os.path.basename(norm_src)
-222:     ts = int(time.time())
-223:     dest_filename = f"{ts}_{basename}.quarantine"
-224:     dest_path = os.path.join(QUARANTINE_DIR, dest_filename)
-225: 
-226:     try:
-227:         shutil.move(norm_src, dest_path)
-228:         # Set read-only permissions on quarantined file
-229:         try:
-230:             os.chmod(dest_path, 0o444)
-231:         except OSError:
-232:             pass
-233: 
-234:         with _db_lock, _get_connection() as conn:
-235:             conn.execute("""
-236:                 INSERT INTO quarantine_vault (original_path, quarantined_path, quarantined_at, file_size, reason)
-237:                 VALUES (?, ?, ?, ?, ?)
-238:             """, (norm_src, dest_path, time.time(), size, reason))
-239:             conn.commit()
-240: 
-241:         # Remove from baseline registry
-242:         remove_baseline(norm_src)
-243: 
-244:         return {
-245:             "success": True,
-246:             "original_path": norm_src,
-247:             "quarantined_path": dest_path,
-248:             "size": size,
-249:             "message": f"Successfully quarantined {basename} to vault."
-250:         }
-251:     except Exception as e:
-252:         return {"success": False, "error": str(e)}
-253: 
-254: 
-255: def get_quarantined_files() -> list[dict]:
-256:     with _db_lock, _get_connection() as conn:
-257:         rows = conn.execute("""
-258:             SELECT id, original_path, quarantined_path, quarantined_at, file_size, reason
-259:             FROM quarantine_vault ORDER BY quarantined_at DESC
-260:         """).fetchall()
-261:         return [dict(r) for r in rows]
-</file>
-
 <file path="diff_tracker.py">
   1: """
   2: diff_tracker.py - Exact File Content Diff & Change Tracking Engine
@@ -2108,6 +1844,87 @@ This section contains the contents of the repository's files.
 345:             logger.AUDIT_LOG_PATH = orig_log
 346:             import shutil
 347:             shutil.rmtree(test_dir, ignore_errors=True)
+348: 
+349:     def test_quarantine_and_restore_lifecycle(self):
+350:         """Test file quarantine and subsequent safe restoration to original location."""
+351:         import db
+352: 
+353:         with tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".txt") as f:
+354:             f.write("Quarantine test payload data")
+355:             orig_path = f.name
+356: 
+357:         try:
+358:             # Quarantine
+359:             q_res = db.quarantine_file(orig_path, reason="Automated Unit Test")
+360:             self.assertTrue(q_res["success"])
+361:             record_id = q_res["record_id"]
+362:             self.assertFalse(os.path.exists(orig_path))
+363: 
+364:             # Verify in vault list
+365:             vault_list = db.get_quarantined_files()
+366:             self.assertTrue(any(item["id"] == record_id for item in vault_list))
+367: 
+368:             # Restore
+369:             rest_res = db.restore_quarantined_file(record_id)
+370:             self.assertTrue(rest_res["success"])
+371:             self.assertTrue(os.path.exists(orig_path))
+372: 
+373:             # Verify removed from vault
+374:             vault_after = db.get_quarantined_files()
+375:             self.assertFalse(any(item["id"] == record_id for item in vault_after))
+376:         finally:
+377:             if os.path.exists(orig_path):
+378:                 os.unlink(orig_path)
+379: 
+380:     def test_timeframe_stats_filtering(self):
+381:         """Test relative timeframe calculation in logger.load_logs and logger.get_stats."""
+382:         import json
+383:         import logger
+384:         from datetime import datetime, timedelta
+385: 
+386:         orig_log = logger.AUDIT_LOG_PATH
+387:         test_dir = tempfile.mkdtemp(prefix="test_tf_")
+388:         test_file = os.path.join(test_dir, "audit.log")
+389:         logger.AUDIT_LOG_PATH = test_file
+390: 
+391:         try:
+392:             now = datetime.now()
+393:             ts_recent = (now - timedelta(minutes=10)).isoformat()
+394:             ts_yesterday = (now - timedelta(hours=12)).isoformat()
+395:             ts_old = (now - timedelta(days=5)).isoformat()
+396: 
+397:             logger.log_event("CREATED", "C:\\recent.txt", "", "user1", "p1", "", "", "INTACT", "INFO")
+398:             logger.log_event("MODIFIED", "C:\\yesterday.txt", "", "user2", "p2", "", "", "INTACT", "WARNING")
+399:             logger.log_event("DELETED", "C:\\old.txt", "", "user3", "p3", "", "", "INTACT", "CRITICAL")
+400: 
+401:             # Rewrite timestamps in test file to simulate past events
+402:             entries = []
+403:             with open(test_file, "r") as f:
+404:                 for line in f:
+405:                     entries.append(json.loads(line))
+406:             entries[0]["timestamp"] = ts_recent
+407:             entries[1]["timestamp"] = ts_yesterday
+408:             entries[2]["timestamp"] = ts_old
+409: 
+410:             with open(test_file, "w") as f:
+411:                 for e in entries:
+412:                     f.write(json.dumps(e) + "\n")
+413: 
+414:             # 1h should only contain 1 event
+415:             stats_1h = logger.get_stats(timeframe="1h")
+416:             self.assertEqual(stats_1h["total"], 1)
+417: 
+418:             # 24h should contain 2 events
+419:             stats_24h = logger.get_stats(timeframe="24h")
+420:             self.assertEqual(stats_24h["total"], 2)
+421: 
+422:             # all should contain 3 events
+423:             stats_all = logger.get_stats(timeframe="all")
+424:             self.assertEqual(stats_all["total"], 3)
+425:         finally:
+426:             logger.AUDIT_LOG_PATH = orig_log
+427:             import shutil
+428:             shutil.rmtree(test_dir, ignore_errors=True)
 </file>
 
 <file path="app_desktop.py">
@@ -2450,6 +2267,307 @@ This section contains the contents of the repository's files.
 109: Write-Host "========================================================`n" -ForegroundColor Green
 </file>
 
+<file path="db.py">
+  1: """
+  2: db.py - Persistent SQLite Database Engine for FileSentinel
+  3: Manages persistent baseline file hashes, custom monitored directories,
+  4: SOC allowlists, and quarantine vault metadata across system reboots.
+  5: """
+  6: 
+  7: import os
+  8: import sqlite3
+  9: import threading
+ 10: import time
+ 11: import shutil
+ 12: from config import BASE_DIR
+ 13: 
+ 14: DATA_DIR = os.path.join(BASE_DIR, "data")
+ 15: VAULT_DIR = os.path.join(BASE_DIR, "vault")
+ 16: QUARANTINE_DIR = os.path.join(VAULT_DIR, "quarantine")
+ 17: DB_PATH = os.path.join(DATA_DIR, "filesentinel.db")
+ 18: 
+ 19: os.makedirs(DATA_DIR, exist_ok=True)
+ 20: os.makedirs(QUARANTINE_DIR, exist_ok=True)
+ 21: 
+ 22: _db_lock = threading.Lock()
+ 23: 
+ 24: 
+ 25: def _get_connection() -> sqlite3.Connection:
+ 26:     conn = sqlite3.connect(DB_PATH, timeout=10.0)
+ 27:     conn.row_factory = sqlite3.Row
+ 28:     return conn
+ 29: 
+ 30: 
+ 31: def init_db():
+ 32:     """Create tables and indexes if they do not exist."""
+ 33:     with _db_lock, _get_connection() as conn:
+ 34:         conn.execute("""
+ 35:             CREATE TABLE IF NOT EXISTS baseline_hashes (
+ 36:                 norm_path TEXT PRIMARY KEY,
+ 37:                 hash TEXT NOT NULL,
+ 38:                 size INTEGER NOT NULL,
+ 39:                 mtime REAL NOT NULL,
+ 40:                 updated_at REAL NOT NULL
+ 41:             )
+ 42:         """)
+ 43:         conn.execute("""
+ 44:             CREATE TABLE IF NOT EXISTS monitored_directories (
+ 45:                 path TEXT PRIMARY KEY,
+ 46:                 added_at REAL NOT NULL,
+ 47:                 is_active INTEGER NOT NULL DEFAULT 1
+ 48:             )
+ 49:         """)
+ 50:         conn.execute("""
+ 51:             CREATE TABLE IF NOT EXISTS allowlist (
+ 52:                 entry TEXT PRIMARY KEY,
+ 53:                 entry_type TEXT NOT NULL,
+ 54:                 reason TEXT,
+ 55:                 added_at REAL NOT NULL
+ 56:             )
+ 57:         """)
+ 58:         conn.execute("""
+ 59:             CREATE TABLE IF NOT EXISTS quarantine_vault (
+ 60:                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+ 61:                 original_path TEXT NOT NULL,
+ 62:                 quarantined_path TEXT NOT NULL,
+ 63:                 quarantined_at REAL NOT NULL,
+ 64:                 file_size INTEGER NOT NULL,
+ 65:                 original_hash TEXT,
+ 66:                 reason TEXT
+ 67:             )
+ 68:         """)
+ 69:         conn.commit()
+ 70: 
+ 71: 
+ 72: # Initialize database schema immediately on module import
+ 73: init_db()
+ 74: 
+ 75: 
+ 76: # ── Baseline Hash Functions ──────────────────────────────────────────────────
+ 77: 
+ 78: def set_baseline(filepath: str, digest: str, size: int = 0, mtime: float = 0.0):
+ 79:     if not filepath or not digest:
+ 80:         return
+ 81:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
+ 82:     now = time.time()
+ 83:     with _db_lock, _get_connection() as conn:
+ 84:         conn.execute("""
+ 85:             INSERT INTO baseline_hashes (norm_path, hash, size, mtime, updated_at)
+ 86:             VALUES (?, ?, ?, ?, ?)
+ 87:             ON CONFLICT(norm_path) DO UPDATE SET
+ 88:                 hash = excluded.hash,
+ 89:                 size = excluded.size,
+ 90:                 mtime = excluded.mtime,
+ 91:                 updated_at = excluded.updated_at
+ 92:         """, (norm, digest, size, mtime, now))
+ 93:         conn.commit()
+ 94: 
+ 95: 
+ 96: def get_baseline(filepath: str) -> dict | None:
+ 97:     if not filepath:
+ 98:         return None
+ 99:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
+100:     with _db_lock, _get_connection() as conn:
+101:         row = conn.execute(
+102:             "SELECT norm_path, hash, size, mtime, updated_at FROM baseline_hashes WHERE norm_path = ?",
+103:             (norm,)
+104:         ).fetchone()
+105:         if row:
+106:             return dict(row)
+107:     return None
+108: 
+109: 
+110: def remove_baseline(filepath: str):
+111:     if not filepath:
+112:         return
+113:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
+114:     with _db_lock, _get_connection() as conn:
+115:         conn.execute("DELETE FROM baseline_hashes WHERE norm_path = ?", (norm,))
+116:         conn.commit()
+117: 
+118: 
+119: def get_all_baselines() -> dict[str, str]:
+120:     with _db_lock, _get_connection() as conn:
+121:         rows = conn.execute("SELECT norm_path, hash FROM baseline_hashes").fetchall()
+122:         return {r["norm_path"]: r["hash"] for r in rows}
+123: 
+124: 
+125: # ── Monitored Directories Functions ──────────────────────────────────────────
+126: 
+127: def get_monitored_directories() -> list[str]:
+128:     with _db_lock, _get_connection() as conn:
+129:         rows = conn.execute(
+130:             "SELECT path FROM monitored_directories WHERE is_active = 1 ORDER BY path ASC"
+131:         ).fetchall()
+132:         return [r["path"] for r in rows]
+133: 
+134: 
+135: def add_monitored_directory(path: str) -> bool:
+136:     if not path or not os.path.isdir(path):
+137:         return False
+138:     norm = os.path.normpath(os.path.abspath(path))
+139:     with _db_lock, _get_connection() as conn:
+140:         conn.execute("""
+141:             INSERT INTO monitored_directories (path, added_at, is_active)
+142:             VALUES (?, ?, 1)
+143:             ON CONFLICT(path) DO UPDATE SET is_active = 1
+144:         """, (norm, time.time()))
+145:         conn.commit()
+146:     return True
+147: 
+148: 
+149: def remove_monitored_directory(path: str) -> bool:
+150:     if not path:
+151:         return False
+152:     norm = os.path.normpath(os.path.abspath(path))
+153:     with _db_lock, _get_connection() as conn:
+154:         conn.execute("DELETE FROM monitored_directories WHERE path = ?", (norm,))
+155:         conn.commit()
+156:     return True
+157: 
+158: 
+159: # ── Allowlist Functions ──────────────────────────────────────────────────────
+160: 
+161: def add_to_allowlist(entry: str, entry_type: str = "path", reason: str = "") -> bool:
+162:     if not entry:
+163:         return False
+164:     norm = os.path.normcase(os.path.normpath(entry)) if entry_type == "path" else entry.strip().lower()
+165:     with _db_lock, _get_connection() as conn:
+166:         conn.execute("""
+167:             INSERT INTO allowlist (entry, entry_type, reason, added_at)
+168:             VALUES (?, ?, ?, ?)
+169:             ON CONFLICT(entry) DO UPDATE SET reason = excluded.reason
+170:         """, (norm, entry_type, reason, time.time()))
+171:         conn.commit()
+172:     return True
+173: 
+174: 
+175: def is_allowlisted(filepath: str, digest: str = None) -> bool:
+176:     if not filepath:
+177:         return False
+178:     norm_path = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
+179:     _, ext = os.path.splitext(norm_path)
+180: 
+181:     with _db_lock, _get_connection() as conn:
+182:         # Check path
+183:         row = conn.execute("SELECT 1 FROM allowlist WHERE entry = ? AND entry_type = 'path'", (norm_path,)).fetchone()
+184:         if row:
+185:             return True
+186:         # Check extension
+187:         if ext:
+188:             row = conn.execute("SELECT 1 FROM allowlist WHERE entry = ? AND entry_type = 'ext'", (ext,)).fetchone()
+189:             if row:
+190:                 return True
+191:         # Check hash
+192:         if digest:
+193:             row = conn.execute("SELECT 1 FROM allowlist WHERE entry = ? AND entry_type = 'hash'", (digest.lower(),)).fetchone()
+194:             if row:
+195:                 return True
+196:     return False
+197: 
+198: 
+199: def get_allowlist() -> list[dict]:
+200:     with _db_lock, _get_connection() as conn:
+201:         rows = conn.execute("SELECT entry, entry_type, reason, added_at FROM allowlist ORDER BY added_at DESC").fetchall()
+202:         return [dict(r) for r in rows]
+203: 
+204: 
+205: # ── Quarantine Vault Functions ───────────────────────────────────────────────
+206: 
+207: def quarantine_file(src_path: str, reason: str = "User Initiated Quarantine") -> dict:
+208:     """
+209:     Safely relocate a file to the isolated quarantine vault,
+210:     rename it with .quarantine extension, and make it read-only.
+211:     """
+212:     if not src_path or not os.path.exists(src_path):
+213:         return {"success": False, "error": f"File does not exist on disk: '{src_path}'"}
+214: 
+215:     norm_src = os.path.normpath(os.path.abspath(src_path))
+216:     try:
+217:         size = os.path.getsize(norm_src)
+218:     except OSError:
+219:         size = 0
+220: 
+221:     basename = os.path.basename(norm_src)
+222:     ts = int(time.time())
+223:     dest_filename = f"{ts}_{basename}.quarantine"
+224:     dest_path = os.path.join(QUARANTINE_DIR, dest_filename)
+225: 
+226:     try:
+227:         shutil.move(norm_src, dest_path)
+228:         # Set read-only permissions on quarantined file
+229:         try:
+230:             os.chmod(dest_path, 0o444)
+231:         except OSError:
+232:             pass
+233: 
+234:         with _db_lock, _get_connection() as conn:
+235:             cursor = conn.execute("""
+236:                 INSERT INTO quarantine_vault (original_path, quarantined_path, quarantined_at, file_size, reason)
+237:                 VALUES (?, ?, ?, ?, ?)
+238:             """, (norm_src, dest_path, time.time(), size, reason))
+239:             conn.commit()
+240:             record_id = cursor.lastrowid
+241: 
+242:         # Remove from baseline registry
+243:         remove_baseline(norm_src)
+244: 
+245:         return {
+246:             "success": True,
+247:             "record_id": record_id,
+248:             "original_path": norm_src,
+249:             "quarantined_path": dest_path,
+250:             "size": size,
+251:             "message": f"Successfully quarantined {basename} to vault."
+252:         }
+253:     except Exception as e:
+254:         return {"success": False, "error": str(e)}
+255: 
+256: 
+257: def get_quarantined_files() -> list[dict]:
+258:     with _db_lock, _get_connection() as conn:
+259:         rows = conn.execute("""
+260:             SELECT id, original_path, quarantined_path, quarantined_at, file_size, reason
+261:             FROM quarantine_vault ORDER BY quarantined_at DESC
+262:         """).fetchall()
+263:         return [dict(r) for r in rows]
+264: 
+265: 
+266: def restore_quarantined_file(record_id: int) -> dict:
+267:     """Safely restore a quarantined file back to its original location."""
+268:     with _db_lock, _get_connection() as conn:
+269:         row = conn.execute("SELECT * FROM quarantine_vault WHERE id = ?", (record_id,)).fetchone()
+270:         if not row:
+271:             return {"success": False, "error": f"Quarantine record ID {record_id} not found."}
+272: 
+273:         orig_path = row["original_path"]
+274:         vault_path = row["quarantined_path"]
+275: 
+276:         if not os.path.exists(vault_path):
+277:             return {"success": False, "error": f"Quarantined file missing from vault: '{vault_path}'"}
+278: 
+279:         try:
+280:             # Re-enable write permissions
+281:             try:
+282:                 os.chmod(vault_path, 0o666)
+283:             except OSError:
+284:                 pass
+285: 
+286:             os.makedirs(os.path.dirname(orig_path), exist_ok=True)
+287:             shutil.move(vault_path, orig_path)
+288: 
+289:             conn.execute("DELETE FROM quarantine_vault WHERE id = ?", (record_id,))
+290:             conn.commit()
+291: 
+292:             return {
+293:                 "success": True,
+294:                 "original_path": orig_path,
+295:                 "message": f"Successfully restored '{os.path.basename(orig_path)}' to its original location."
+296:             }
+297:         except Exception as e:
+298:             return {"success": False, "error": str(e)}
+</file>
+
 <file path="FileSentinel.spec">
  1: # -*- mode: python ; coding: utf-8 -*-
  2: from PyInstaller.utils.hooks import collect_all
@@ -2517,38 +2635,6 @@ This section contains the contents of the repository's files.
 12: pywebview>=5.0.0       # Native Windows desktop window for dashboard (Edge/Chromium)
 13: pystray>=0.19.0        # System tray icon & native Windows notifications
 14: Pillow>=10.0.0         # Icon rendering & graphics processing
-</file>
-
-<file path=".gitignore">
- 1: # Python bytecode
- 2: __pycache__/
- 3: *.py[cod]
- 4: *$py.class
- 5: 
- 6: # Application runtime logs and reports
- 7: logs/*.log
- 8: reports/*.txt
- 9: data/*.db
-10: data/quarantine/*
-11: vault/
-12: 
-13: # Packaging & compiler artifacts
-14: build/
-15: dist/
-16: tools/
-17: *.wixobj
-18: *.wixpdb
-19: 
-20: # OS metadata
-21: desktop.ini
-22: thumbs.db
-23: .DS_Store
-24: 
-25: # Virtual environment / IDE
-26: venv/
-27: .env
-28: .vscode/
-29: .idea/
 </file>
 
 <file path="alerter.py">
@@ -3244,7 +3330,7 @@ This section contains the contents of the repository's files.
   9: import json
  10: import os
  11: import sys
- 12: from datetime import datetime
+ 12: from datetime import datetime, timedelta
  13: 
  14: from colorama import Fore, Style, init as colorama_init
  15: 
@@ -3367,187 +3453,216 @@ This section contains the contents of the repository's files.
 132:     directory: str = None,
 133:     start_time: str = None,
 134:     end_time: str = None,
-135: ) -> list[dict]:
-136:     """
-137:     Read and parse audit.log entries with multi-criteria filtering,
-138:     time-window slicing, smart token query parsing, and custom sorting.
-139:     """
-140:     if not os.path.exists(AUDIT_LOG_PATH):
-141:         return []
-142: 
-143:     # Parse search tokens if present in keyword (e.g. user:admin ext:pem level:crit)
-144:     token_filters = {}
-145:     free_text_terms = []
-146:     if keyword:
-147:         parts = keyword.strip().split()
-148:         for p in parts:
-149:             if ":" in p:
-150:                 k, v = p.split(":", 1)
-151:                 token_filters[k.lower()] = v.lower()
-152:             else:
-153:                 free_text_terms.append(p.lower())
-154: 
-155:     entries = []
-156:     with open(AUDIT_LOG_PATH, "r", encoding="utf-8") as f:
-157:         for line in f:
-158:             line = line.strip()
-159:             if not line:
-160:                 continue
-161:             try:
-162:                 entry = json.loads(line)
-163:                 ts = entry.get("timestamp", "")
-164: 
-165:                 # 1. Date/Time Window Filter
-166:                 if start_time and ts < start_time:
-167:                     continue
-168:                 if end_time and ts > end_time:
-169:                     continue
-170: 
-171:                 # 2. Alert Level Filter
-172:                 if level_filter and entry.get("alert_level") != level_filter:
-173:                     continue
-174: 
-175:                 # 3. File Type / Category Filter
-176:                 if file_type:
-177:                     ft_lower = file_type.lower()
-178:                     src_path = entry.get("source", "")
-179:                     dest_path = entry.get("destination", "")
-180:                     target = dest_path if (entry.get("event_type") == "MOVED" and dest_path) else src_path
-181:                     _, ext = os.path.splitext(target.lower())
-182:                     if ft_lower in _FILE_TYPE_MAP:
-183:                         if ext not in _FILE_TYPE_MAP[ft_lower]:
-184:                             continue
-185:                     else:
-186:                         norm_ft = ft_lower if ft_lower.startswith(".") else f".{ft_lower}"
-187:                         if ext != norm_ft:
-188:                             continue
-189: 
-190:                 # 4. Directory Filter
-191:                 if directory:
-192:                     dir_lower = directory.lower()
-193:                     src_lower = entry.get("source", "").lower()
-194:                     dest_lower = entry.get("destination", "").lower()
-195:                     if dir_lower not in src_lower and dir_lower not in dest_lower:
-196:                         continue
-197: 
-198:                 # 5. Smart Token & Keyword Filters
-199:                 if token_filters:
-200:                     # user: token
-201:                     if "user" in token_filters:
-202:                         if token_filters["user"] not in entry.get("user", "").lower():
-203:                             continue
-204:                     # ext: token
-205:                     if "ext" in token_filters:
-206:                         t_ext = token_filters["ext"]
-207:                         target_ext = os.path.splitext(entry.get("source", "").lower())[1].lstrip(".")
-208:                         if t_ext.lstrip(".") != target_ext:
-209:                             continue
-210:                     # level: token
-211:                     if "level" in token_filters:
-212:                         if token_filters["level"] not in entry.get("alert_level", "").lower():
-213:                             continue
-214:                     # event: token
-215:                     if "event" in token_filters:
-216:                         if token_filters["event"] not in entry.get("event_type", "").lower():
-217:                             continue
-218:                     # dir: token
-219:                     if "dir" in token_filters:
-220:                         d_val = token_filters["dir"]
-221:                         if d_val not in entry.get("source", "").lower() and d_val not in entry.get("destination", "").lower():
-222:                             continue
-223:                     # risk:>N or risk:N
-224:                     if "risk" in token_filters:
-225:                         r_val = token_filters["risk"]
-226:                         e_risk = entry.get("risk_score", 0)
-227:                         if r_val.startswith(">="):
-228:                             if e_risk < int(r_val[2:]):
-229:                                 continue
-230:                         elif r_val.startswith(">"):
-231:                             if e_risk <= int(r_val[1:]):
-232:                                 continue
-233:                         elif r_val.startswith("<="):
-234:                             if e_risk > int(r_val[2:]):
-235:                                 continue
-236:                         elif r_val.startswith("<"):
-237:                             if e_risk >= int(r_val[1:]):
-238:                                 continue
-239:                         elif int(r_val) != e_risk:
-240:                             continue
-241: 
-242:                 if free_text_terms:
-243:                     combined_text = " ".join([
-244:                         entry.get("source", ""),
-245:                         entry.get("destination", ""),
-246:                         entry.get("event_type", ""),
-247:                         entry.get("user", ""),
-248:                         entry.get("process", ""),
-249:                         str(entry.get("cmdline", "")),
-250:                         str(entry.get("dlp_summary", ""))
-251:                     ]).lower()
-252:                     if not all(term in combined_text for term in free_text_terms):
-253:                         continue
-254: 
-255:                 entries.append(entry)
-256:             except json.JSONDecodeError:
-257:                 continue
+135:     timeframe: str = None,
+136: ) -> list[dict]:
+137:     """
+138:     Read and parse audit.log entries with multi-criteria filtering,
+139:     time-window slicing, smart token query parsing, and custom sorting.
+140:     """
+141:     if not os.path.exists(AUDIT_LOG_PATH):
+142:         return []
+143: 
+144:     # Calculate dynamic relative timeframe threshold
+145:     start_threshold = None
+146:     end_threshold = None
+147: 
+148:     if timeframe == "1h":
+149:         start_threshold = (datetime.now() - timedelta(hours=1)).isoformat()
+150:     elif timeframe == "24h":
+151:         start_threshold = (datetime.now() - timedelta(hours=24)).isoformat()
+152:     elif timeframe == "7d":
+153:         start_threshold = (datetime.now() - timedelta(days=7)).isoformat()
+154:     elif start_time:
+155:         start_threshold = start_time.replace("Z", "").split("+")[0]
+156: 
+157:     if end_time:
+158:         end_threshold = end_time.replace("Z", "").split("+")[0]
+159: 
+160:     # Parse search tokens if present in keyword (e.g. user:admin ext:pem level:crit)
+161:     token_filters = {}
+162:     free_text_terms = []
+163:     if keyword:
+164:         parts = keyword.strip().split()
+165:         for p in parts:
+166:             if ":" in p:
+167:                 k, v = p.split(":", 1)
+168:                 token_filters[k.lower()] = v.lower()
+169:             else:
+170:                 free_text_terms.append(p.lower())
+171: 
+172:     entries = []
+173:     with open(AUDIT_LOG_PATH, "r", encoding="utf-8") as f:
+174:         for line in f:
+175:             line = line.strip()
+176:             if not line:
+177:                 continue
+178:             try:
+179:                 entry = json.loads(line)
+180:                 ts = entry.get("timestamp", "")
+181: 
+182:                 # 1. Date/Time Window Filter
+183:                 if start_threshold and ts < start_threshold:
+184:                     continue
+185:                 if end_threshold and ts > end_threshold:
+186:                     continue
+187: 
+188:                 # 2. Alert Level Filter
+189:                 if level_filter and entry.get("alert_level") != level_filter:
+190:                     continue
+191: 
+192:                 # 3. File Type / Category Filter
+193:                 if file_type:
+194:                     ft_lower = file_type.lower()
+195:                     src_path = entry.get("source", "")
+196:                     dest_path = entry.get("destination", "")
+197:                     target = dest_path if (entry.get("event_type") == "MOVED" and dest_path) else src_path
+198:                     _, ext = os.path.splitext(target.lower())
+199:                     if ft_lower in _FILE_TYPE_MAP:
+200:                         if ext not in _FILE_TYPE_MAP[ft_lower]:
+201:                             continue
+202:                     else:
+203:                         norm_ft = ft_lower if ft_lower.startswith(".") else f".{ft_lower}"
+204:                         if ext != norm_ft:
+205:                             continue
+206: 
+207:                 # 4. Directory Filter
+208:                 if directory:
+209:                     dir_lower = directory.lower()
+210:                     src_lower = entry.get("source", "").lower()
+211:                     dest_lower = entry.get("destination", "").lower()
+212:                     if dir_lower not in src_lower and dir_lower not in dest_lower:
+213:                         continue
+214: 
+215:                 # 5. Smart Token & Keyword Filters
+216:                 if token_filters:
+217:                     # user: token
+218:                     if "user" in token_filters:
+219:                         if token_filters["user"] not in entry.get("user", "").lower():
+220:                             continue
+221:                     # ext: token
+222:                     if "ext" in token_filters:
+223:                         t_ext = token_filters["ext"]
+224:                         target_ext = os.path.splitext(entry.get("source", "").lower())[1].lstrip(".")
+225:                         if t_ext.lstrip(".") != target_ext:
+226:                             continue
+227:                     # level: token
+228:                     if "level" in token_filters:
+229:                         if token_filters["level"] not in entry.get("alert_level", "").lower():
+230:                             continue
+231:                     # event: token
+232:                     if "event" in token_filters:
+233:                         if token_filters["event"] not in entry.get("event_type", "").lower():
+234:                             continue
+235:                     # dir: token
+236:                     if "dir" in token_filters:
+237:                         d_val = token_filters["dir"]
+238:                         if d_val not in entry.get("source", "").lower() and d_val not in entry.get("destination", "").lower():
+239:                             continue
+240:                     # risk:>N or risk:N
+241:                     if "risk" in token_filters:
+242:                         r_val = token_filters["risk"]
+243:                         e_risk = entry.get("risk_score", 0)
+244:                         if r_val.startswith(">="):
+245:                             if e_risk < int(r_val[2:]):
+246:                                 continue
+247:                         elif r_val.startswith(">"):
+248:                             if e_risk <= int(r_val[1:]):
+249:                                 continue
+250:                         elif r_val.startswith("<="):
+251:                             if e_risk > int(r_val[2:]):
+252:                                 continue
+253:                         elif r_val.startswith("<"):
+254:                             if e_risk >= int(r_val[1:]):
+255:                                 continue
+256:                         elif int(r_val) != e_risk:
+257:                             continue
 258: 
-259:     # Apply sorting if requested
-260:     if sort_by:
-261:         s = sort_by.lower()
-262:         if s in ("timestamp", "date"):
-263:             key_fn = lambda e: e.get("timestamp", "")
-264:         elif s in ("level", "alert_level", "severity"):
-265:             key_fn = lambda e: _ALERT_LEVEL_WEIGHT.get(e.get("alert_level", "").upper(), 0)
-266:         elif s in ("risk", "risk_score"):
-267:             key_fn = lambda e: e.get("risk_score", 0)
-268:         elif s in ("source", "directory", "dir", "path"):
-269:             key_fn = lambda e: e.get("source", "").lower()
-270:         elif s in ("destination", "dest"):
-271:             key_fn = lambda e: e.get("destination", "").lower()
-272:         elif s in ("event", "event_type"):
-273:             key_fn = lambda e: e.get("event_type", "").lower()
-274:         elif s in ("ext", "extension", "file_type"):
-275:             key_fn = lambda e: os.path.splitext(e.get("source", ""))[1].lower()
-276:         elif s in ("integrity", "integrity_status"):
-277:             key_fn = lambda e: e.get("integrity_status", "").lower()
-278:         else:
-279:             key_fn = lambda e: e.get("timestamp", "")
-280: 
-281:         is_desc = (order.lower() == "desc")
-282:         entries.sort(key=key_fn, reverse=is_desc)
-283: 
-284:     if limit:
-285:         entries = entries[:limit] if sort_by else entries[-limit:]
-286:     return entries
-287: 
-288: 
-289: def get_stats() -> dict:
-290:     """Return summary statistics from the audit log."""
-291:     entries = load_logs()
-292:     stats = {
-293:         "total":              len(entries),
-294:         "info":               sum(1 for e in entries if e.get("alert_level") == "INFO"),
-295:         "warning":            sum(1 for e in entries if e.get("alert_level") == "WARNING"),
-296:         "critical":           sum(1 for e in entries if e.get("alert_level") == "CRITICAL"),
-297:         "integrity_tampered": sum(1 for e in entries if e.get("integrity_status") == "TAMPERED"),
-298:         "integrity_ok":       sum(1 for e in entries if e.get("integrity_status") == "INTACT"),
-299:     }
-300:     return stats
-301: 
-302: 
-303: def print_banner():
-304:     """Print styled startup banner to the console safely across Windows terminals."""
-305:     line = "=" * 62
-306:     banner = f"""
-307: {Fore.CYAN}+{line}+
-308: |       SECURE FILE TRANSFER MONITORING SYSTEM                 |
-309: |       Blue Team DLP & Integrity Checker  |  v1.0             |
-310: +{line}+{Style.RESET_ALL}
-311: """
-312:     try:
-313:         print(banner)
-314:     except UnicodeEncodeError:
-315:         print(banner.encode("ascii", errors="replace").decode("ascii"))
+259:                 if free_text_terms:
+260:                     combined_text = " ".join([
+261:                         entry.get("source", ""),
+262:                         entry.get("destination", ""),
+263:                         entry.get("event_type", ""),
+264:                         entry.get("user", ""),
+265:                         entry.get("process", ""),
+266:                         str(entry.get("cmdline", "")),
+267:                         str(entry.get("dlp_summary", ""))
+268:                     ]).lower()
+269:                     if not all(term in combined_text for term in free_text_terms):
+270:                         continue
+271: 
+272:                 entries.append(entry)
+273:             except json.JSONDecodeError:
+274:                 continue
+275: 
+276:     # Apply sorting if requested
+277:     if sort_by:
+278:         s = sort_by.lower()
+279:         if s in ("timestamp", "date"):
+280:             key_fn = lambda e: e.get("timestamp", "")
+281:         elif s in ("level", "alert_level", "severity"):
+282:             key_fn = lambda e: _ALERT_LEVEL_WEIGHT.get(e.get("alert_level", "").upper(), 0)
+283:         elif s in ("risk", "risk_score"):
+284:             key_fn = lambda e: e.get("risk_score", 0)
+285:         elif s in ("source", "directory", "dir", "path"):
+286:             key_fn = lambda e: e.get("source", "").lower()
+287:         elif s in ("destination", "dest"):
+288:             key_fn = lambda e: e.get("destination", "").lower()
+289:         elif s in ("event", "event_type"):
+290:             key_fn = lambda e: e.get("event_type", "").lower()
+291:         elif s in ("ext", "extension", "file_type"):
+292:             key_fn = lambda e: os.path.splitext(e.get("source", ""))[1].lower()
+293:         elif s in ("integrity", "integrity_status"):
+294:             key_fn = lambda e: e.get("integrity_status", "").lower()
+295:         else:
+296:             key_fn = lambda e: e.get("timestamp", "")
+297: 
+298:         is_desc = (order.lower() == "desc")
+299:         entries.sort(key=key_fn, reverse=is_desc)
+300: 
+301:     if limit:
+302:         entries = entries[:limit] if sort_by else entries[-limit:]
+303:     return entries
+304: 
+305: 
+306: def get_stats(
+307:     start_time: str = None,
+308:     end_time: str = None,
+309:     timeframe: str = None,
+310:     keyword: str = None,
+311:     file_type: str = None,
+312: ) -> dict:
+313:     """Return summary statistics from the audit log, optionally filtered by timeframe/search."""
+314:     entries = load_logs(
+315:         start_time=start_time,
+316:         end_time=end_time,
+317:         timeframe=timeframe,
+318:         keyword=keyword,
+319:         file_type=file_type,
+320:     )
+321:     stats = {
+322:         "total":              len(entries),
+323:         "info":               sum(1 for e in entries if e.get("alert_level") == "INFO"),
+324:         "warning":            sum(1 for e in entries if e.get("alert_level") == "WARNING"),
+325:         "critical":           sum(1 for e in entries if e.get("alert_level") == "CRITICAL"),
+326:         "integrity_tampered": sum(1 for e in entries if e.get("integrity_status") == "TAMPERED"),
+327:         "integrity_ok":       sum(1 for e in entries if e.get("integrity_status") == "INTACT"),
+328:     }
+329:     return stats
+330: 
+331: 
+332: def print_banner():
+333:     """Print styled startup banner to the console safely across Windows terminals."""
+334:     line = "=" * 62
+335:     banner = f"""
+336: {Fore.CYAN}+{line}+
+337: |       SECURE FILE TRANSFER MONITORING SYSTEM                 |
+338: |       Blue Team DLP & Integrity Checker  |  v1.0             |
+339: +{line}+{Style.RESET_ALL}
+340: """
+341:     try:
+342:         print(banner)
+343:     except UnicodeEncodeError:
+344:         print(banner.encode("ascii", errors="replace").decode("ascii"))
 </file>
 
 <file path="main.py">
@@ -3722,6 +3837,238 @@ This section contains the contents of the repository's files.
 169: 
 170: if __name__ == "__main__":
 171:     main()
+</file>
+
+<file path=".gitignore">
+ 1: # Python bytecode
+ 2: __pycache__/
+ 3: *.py[cod]
+ 4: *$py.class
+ 5: 
+ 6: # Application runtime logs and reports
+ 7: logs/*.log
+ 8: reports/*.txt
+ 9: data/*.db
+10: data/quarantine/*
+11: vault/
+12: 
+13: # Packaging & compiler artifacts
+14: build/
+15: dist/
+16: tools/
+17: *.wixobj
+18: *.wixpdb
+19: 
+20: # OS metadata
+21: desktop.ini
+22: thumbs.db
+23: .DS_Store
+24: 
+25: # Virtual environment / IDE
+26: venv/
+27: .env
+28: .vscode/
+29: .idea/
+</file>
+
+<file path="hasher.py">
+  1: """
+  2: hasher.py - File Integrity Hashing Module
+  3: Uses Python's built-in hashlib — no installation required.
+  4: Supports SHA256, SHA512, MD5, and Sparse Tri-Point Hashing for large files (>50MB),
+  5: with Windows file-lock retry backoff and persistent SQLite baseline database.
+  6: """
+  7: 
+  8: from __future__ import annotations
+  9: 
+ 10: import hashlib
+ 11: import os
+ 12: import time
+ 13: from config import HASH_ALGORITHM, HASH_CHUNK_SIZE
+ 14: import db
+ 15: 
+ 16: # Sparse hashing threshold: 50 MB
+ 17: SPARSE_HASH_THRESHOLD = 50 * 1024 * 1024
+ 18: SPARSE_CHUNK_SIZE = 1024 * 1024  # 1 MB
+ 19: 
+ 20: # In-memory snapshot: {filepath: hash_digest}
+ 21: _hash_snapshot: dict[str, str] = {}
+ 22: 
+ 23: # In-memory baseline cache: {norm_path: hash_digest}
+ 24: _baseline_hashes: dict[str, str] = {}
+ 25: 
+ 26: 
+ 27: def compute_hash(
+ 28:     filepath: str,
+ 29:     algorithm: str = HASH_ALGORITHM,
+ 30:     retries: int = 3,
+ 31:     retry_delay: float = 0.05,
+ 32:     force_full: bool = False,
+ 33: ) -> str | None:
+ 34:     """
+ 35:     Compute cryptographic hash of a file.
+ 36:     Uses sparse tri-point hashing for files > 50MB to prevent I/O lockups,
+ 37:     and includes automated retry backoff to handle transient Windows write locks.
+ 38: 
+ 39:     Args:
+ 40:         filepath:    Absolute path to the file.
+ 41:         algorithm:   Hash algorithm name ('sha256', 'sha512', 'md5').
+ 42:         retries:     Number of retry attempts if file is temporarily locked.
+ 43:         retry_delay: Initial delay in seconds between retries.
+ 44:         force_full:  If True, forces full byte hashing even for large files.
+ 45: 
+ 46:     Returns:
+ 47:         Hex digest string, or None if the file cannot be read.
+ 48:     """
+ 49:     if not filepath:
+ 50:         return None
+ 51: 
+ 52:     for attempt in range(max(1, retries)):
+ 53:         try:
+ 54:             if not os.path.exists(filepath):
+ 55:                 return None
+ 56: 
+ 57:             file_size = os.path.getsize(filepath)
+ 58: 
+ 59:             # Sparse Hashing Optimization for Large Files (>50 MB)
+ 60:             if not force_full and file_size > SPARSE_HASH_THRESHOLD:
+ 61:                 return _compute_sparse_hash(filepath, file_size, algorithm)
+ 62: 
+ 63:             # Standard Full Hash for normal files
+ 64:             h = hashlib.new(algorithm)
+ 65:             with open(filepath, "rb") as f:
+ 66:                 while chunk := f.read(HASH_CHUNK_SIZE):
+ 67:                     h.update(chunk)
+ 68:             return h.hexdigest()
+ 69: 
+ 70:         except PermissionError:
+ 71:             # Windows file locking (WinError 32) during active application flush
+ 72:             if attempt < retries - 1:
+ 73:                 time.sleep(retry_delay * (attempt + 1))
+ 74:             else:
+ 75:                 return None
+ 76:         except (FileNotFoundError, OSError, ValueError):
+ 77:             return None
+ 78:     return None
+ 79: 
+ 80: 
+ 81: def _compute_sparse_hash(filepath: str, file_size: int, algorithm: str) -> str:
+ 82:     """
+ 83:     Compute a fast sparse tri-point hash:
+ 84:     Samples 1 MB from header, 1 MB from midpoint, and 1 MB from footer,
+ 85:     combined with file size and modification time.
+ 86:     """
+ 87:     h = hashlib.new(algorithm)
+ 88:     mtime = os.path.getmtime(filepath)
+ 89:     h.update(f"SPARSE_V1:{file_size}:{mtime}:".encode("utf-8"))
+ 90: 
+ 91:     with open(filepath, "rb") as f:
+ 92:         # 1. Header chunk (1 MB)
+ 93:         h.update(f.read(SPARSE_CHUNK_SIZE))
+ 94: 
+ 95:         # 2. Middle chunk (1 MB)
+ 96:         mid_offset = max(0, (file_size // 2) - (SPARSE_CHUNK_SIZE // 2))
+ 97:         f.seek(mid_offset)
+ 98:         h.update(f.read(SPARSE_CHUNK_SIZE))
+ 99: 
+100:         # 3. Footer chunk (1 MB)
+101:         tail_offset = max(0, file_size - SPARSE_CHUNK_SIZE)
+102:         f.seek(tail_offset)
+103:         h.update(f.read(SPARSE_CHUNK_SIZE))
+104: 
+105:     return h.hexdigest()
+106: 
+107: 
+108: def verify_integrity(pre_hash: str | None, post_hash: str | None) -> tuple[bool, str]:
+109:     """
+110:     Compare pre- and post-transfer hashes.
+111: 
+112:     Returns:
+113:         (True, "INTACT")       if hashes match
+114:         (False, "TAMPERED")    if hashes differ
+115:         (False, "UNAVAILABLE") if either hash is None
+116:     """
+117:     if pre_hash is None or post_hash is None:
+118:         return False, "UNAVAILABLE"
+119:     if pre_hash == post_hash:
+120:         return True, "INTACT"
+121:     return False, "TAMPERED"
+122: 
+123: 
+124: def snapshot_file(filepath: str) -> str | None:
+125:     """Compute and store hash of a file in memory snapshot and persistent database."""
+126:     digest = compute_hash(filepath)
+127:     if digest:
+128:         _hash_snapshot[filepath] = digest
+129:         set_baseline_hash(filepath, digest)
+130:     return digest
+131: 
+132: 
+133: def check_against_snapshot(filepath: str) -> tuple[bool, str, str | None, str | None]:
+134:     pre_hash = _hash_snapshot.get(filepath) or get_baseline_hash(filepath)
+135:     post_hash = compute_hash(filepath)
+136:     ok, status = verify_integrity(pre_hash, post_hash)
+137:     return ok, status, pre_hash, post_hash
+138: 
+139: 
+140: def clear_snapshot(filepath: str = None):
+141:     if filepath:
+142:         _hash_snapshot.pop(filepath, None)
+143:     else:
+144:         _hash_snapshot.clear()
+145: 
+146: 
+147: def get_snapshot() -> dict:
+148:     return dict(_hash_snapshot)
+149: 
+150: 
+151: # ── Baseline Registry Functions (Dual Memory & SQLite Persistence) ───────────
+152: 
+153: def set_baseline_hash(filepath: str, digest: str | None = None) -> str | None:
+154:     """Store or update the baseline hash in memory and persistent SQLite."""
+155:     if not filepath:
+156:         return None
+157:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
+158:     if digest is None:
+159:         digest = compute_hash(filepath)
+160:     if digest:
+161:         _baseline_hashes[norm] = digest
+162:         size = 0
+163:         mtime = 0.0
+164:         try:
+165:             if os.path.exists(filepath):
+166:                 size = os.path.getsize(filepath)
+167:                 mtime = os.path.getmtime(filepath)
+168:         except OSError:
+169:             pass
+170:         db.set_baseline(filepath, digest, size, mtime)
+171:     return digest
+172: 
+173: 
+174: def get_baseline_hash(filepath: str) -> str | None:
+175:     """Retrieve the last recorded baseline hash (memory cache with SQLite fallback)."""
+176:     if not filepath:
+177:         return None
+178:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
+179:     cached = _baseline_hashes.get(norm)
+180:     if cached:
+181:         return cached
+182: 
+183:     # Persistent SQLite lookup
+184:     row = db.get_baseline(filepath)
+185:     if row and row.get("hash"):
+186:         _baseline_hashes[norm] = row["hash"]
+187:         return row["hash"]
+188:     return None
+189: 
+190: 
+191: def remove_baseline_hash(filepath: str) -> str | None:
+192:     """Remove a file from baseline memory cache and persistent SQLite."""
+193:     if not filepath:
+194:         return None
+195:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
+196:     db.remove_baseline(filepath)
+197:     return _baseline_hashes.pop(norm, None)
 </file>
 
 <file path="dashboard/static/style.css">
@@ -5139,6 +5486,164 @@ This section contains the contents of the repository's files.
 1412:   color: var(--info-color);
 1413:   border-color: rgba(88, 166, 255, 0.3);
 1414: }
+1415: 
+1416: /* ═══════════════════════════════════════════════════════════════════════
+1417:    Quarantine Vault Modal & Folder Browser Enhancements
+1418:    ═══════════════════════════════════════════════════════════════════════ */
+1419: .vault-info-banner {
+1420:   display: flex;
+1421:   align-items: center;
+1422:   justify-content: space-between;
+1423:   gap: 12px;
+1424:   background: var(--bg-card);
+1425:   border: 1px solid var(--border-subtle);
+1426:   border-radius: var(--radius);
+1427:   padding: 10px 14px;
+1428: }
+1429: .vault-path-box {
+1430:   display: flex;
+1431:   flex-direction: column;
+1432:   gap: 2px;
+1433:   min-width: 0;
+1434:   flex: 1;
+1435: }
+1436: .vault-path-label {
+1437:   font-size: 10px;
+1438:   text-transform: uppercase;
+1439:   color: var(--text-muted);
+1440:   font-weight: 700;
+1441:   letter-spacing: 0.5px;
+1442: }
+1443: .vault-path-text {
+1444:   font-size: 11px;
+1445:   color: #a5d6ff;
+1446:   word-break: break-all;
+1447: }
+1448: .btn-open-vault {
+1449:   background: rgba(88, 166, 255, 0.12);
+1450:   border: 1px solid rgba(88, 166, 255, 0.3);
+1451:   color: var(--accent);
+1452:   padding: 6px 12px;
+1453:   border-radius: var(--radius);
+1454:   font-size: 11.5px;
+1455:   font-weight: 600;
+1456:   cursor: pointer;
+1457:   white-space: nowrap;
+1458:   transition: all 0.15s ease;
+1459: }
+1460: .btn-open-vault:hover {
+1461:   background: rgba(88, 166, 255, 0.25);
+1462:   color: #fff;
+1463:   border-color: var(--accent);
+1464: }
+1465: .vault-modal-item {
+1466:   flex-direction: column;
+1467:   align-items: stretch !important;
+1468:   gap: 6px !important;
+1469:   background: var(--bg-card);
+1470:   border: 1px solid var(--border-subtle);
+1471:   border-left: 3px solid var(--crit-color);
+1472:   padding: 10px 12px;
+1473: }
+1474: .vault-item-top {
+1475:   display: flex;
+1476:   align-items: center;
+1477:   justify-content: space-between;
+1478:   gap: 8px;
+1479: }
+1480: .vault-item-name-group {
+1481:   display: flex;
+1482:   align-items: center;
+1483:   gap: 6px;
+1484:   flex-wrap: wrap;
+1485: }
+1486: .vault-item-icon {
+1487:   font-size: 13px;
+1488: }
+1489: .vault-item-name {
+1490:   font-size: 12.5px;
+1491:   color: #ff7b72;
+1492: }
+1493: .vault-item-time {
+1494:   font-size: 10.5px;
+1495:   color: var(--text-muted);
+1496:   white-space: nowrap;
+1497: }
+1498: .vault-item-meta {
+1499:   font-size: 11px;
+1500:   display: flex;
+1501:   gap: 6px;
+1502: }
+1503: .vault-label {
+1504:   color: var(--text-muted);
+1505:   width: 58px;
+1506:   flex-shrink: 0;
+1507: }
+1508: .vault-val {
+1509:   color: var(--text-secondary);
+1510:   word-break: break-all;
+1511: }
+1512: .vault-item-actions {
+1513:   display: flex;
+1514:   justify-content: flex-end;
+1515:   margin-top: 4px;
+1516: }
+1517: .btn-restore-file {
+1518:   background: rgba(63, 185, 80, 0.12);
+1519:   border: 1px solid rgba(63, 185, 80, 0.35);
+1520:   color: #56d364;
+1521:   padding: 4px 10px;
+1522:   border-radius: var(--radius);
+1523:   font-size: 11px;
+1524:   font-weight: 600;
+1525:   cursor: pointer;
+1526:   transition: all 0.15s ease;
+1527: }
+1528: .btn-restore-file:hover {
+1529:   background: rgba(63, 185, 80, 0.28);
+1530:   color: #fff;
+1531: }
+1532: 
+1533: /* Browser Files List */
+1534: .browser-summary-badge {
+1535:   font-size: 10.5px;
+1536:   font-weight: 600;
+1537:   color: var(--text-muted);
+1538:   padding: 4px 6px;
+1539:   border-bottom: 1px solid var(--border-subtle);
+1540:   margin-bottom: 4px;
+1541: }
+1542: .browser-file-item {
+1543:   display: flex;
+1544:   align-items: center;
+1545:   justify-content: space-between;
+1546:   gap: 8px;
+1547:   padding: 4px 8px;
+1548:   border-radius: 4px;
+1549:   font-size: 11.5px;
+1550:   color: var(--text-secondary);
+1551:   transition: background 0.15s;
+1552: }
+1553: .browser-file-item:hover {
+1554:   background: var(--bg-hover);
+1555:   color: var(--text-primary);
+1556: }
+1557: .browser-file-left {
+1558:   display: flex;
+1559:   align-items: center;
+1560:   gap: 6px;
+1561:   min-width: 0;
+1562:   flex: 1;
+1563: }
+1564: .browser-file-name {
+1565:   word-break: break-all;
+1566: }
+1567: .browser-file-size {
+1568:   font-size: 10.5px;
+1569:   color: var(--text-muted);
+1570:   font-family: var(--font-mono);
+1571:   white-space: nowrap;
+1572: }
 </file>
 
 <file path="dashboard/templates/index.html">
@@ -5358,1016 +5863,1136 @@ This section contains the contents of the repository's files.
  214:   // ── Stats ────────────────────────────────────────────────────────────────
  215:   async function fetchStats() {
  216:     try {
- 217:       const res  = await fetch("/api/stats");
- 218:       const data = await res.json();
- 219:       document.getElementById("statTotal").textContent    = data.total    ?? 0;
- 220:       document.getElementById("statInfo").textContent     = data.info     ?? 0;
- 221:       document.getElementById("statWarning").textContent  = data.warning  ?? 0;
- 222:       document.getElementById("statCritical").textContent = data.critical  ?? 0;
- 223:       document.getElementById("statTampered").textContent = data.integrity_tampered ?? 0;
- 224:       setConnected(true);
- 225:     } catch (e) {
- 226:       setConnected(false);
- 227:     }
- 228:   }
- 229: 
- 230:   // ── Sorting Handlers ─────────────────────────────────────────────────────
- 231:   function toggleSort(col) {
- 232:     if (currentSortBy === col) {
- 233:       currentOrder = currentOrder === "asc" ? "desc" : "asc";
- 234:     } else {
- 235:       currentSortBy = col;
- 236:       currentOrder = (col === "level" || col === "timestamp") ? "desc" : "asc";
- 237:     }
- 238:     const matchVal = `${currentSortBy}_${currentOrder}`;
- 239:     const sortSelect = document.getElementById("sortSelect");
- 240:     if (sortSelect && sortSelect.querySelector(`option[value="${matchVal}"]`)) {
- 241:       sortSelect.value = matchVal;
- 242:     }
- 243:     updateSortHeaderIcons();
- 244:     fetchLogs(1);
- 245:   }
- 246: 
- 247:   function onSortSelectChange() {
- 248:     const val = document.getElementById("sortSelect").value;
- 249:     const parts = val.split("_");
- 250:     currentSortBy = parts[0];
- 251:     currentOrder = parts[1] || "desc";
- 252:     updateSortHeaderIcons();
- 253:     fetchLogs(1);
- 254:   }
- 255: 
- 256:   function updateSortHeaderIcons() {
- 257:     document.querySelectorAll(".sort-icon").forEach(el => el.textContent = "");
- 258:     const activeIcon = document.getElementById(`th-${currentSortBy}`);
- 259:     if (activeIcon) {
- 260:       activeIcon.textContent = currentOrder === "asc" ? " ▲" : " ▼";
- 261:     }
- 262:   }
- 263: 
- 264:   // ── Time Presets & Range State ──────────────────────────────────────────
- 265:   let activeTimePreset = "all";
- 266:   let activeStartTime  = null;
- 267:   let activeEndTime    = null;
- 268: 
- 269:   function setTimePreset(preset) {
- 270:     activeTimePreset = preset;
- 271:     document.querySelectorAll(".time-pill").forEach(p => p.classList.remove("active"));
- 272:     const pill = document.getElementById("pill-" + preset);
- 273:     if (pill) pill.classList.add("active");
- 274: 
- 275:     const customRow = document.getElementById("customTimeRow");
- 276:     if (preset !== "custom") {
- 277:       customRow.style.display = "none";
- 278:     }
- 279: 
- 280:     const now = new Date();
- 281:     if (preset === "all") {
- 282:       activeStartTime = null;
- 283:       activeEndTime = null;
- 284:     } else if (preset === "1h") {
- 285:       activeStartTime = new Date(now.getTime() - 3600 * 1000).toISOString();
- 286:       activeEndTime = null;
- 287:     } else if (preset === "24h") {
- 288:       activeStartTime = new Date(now.getTime() - 24 * 3600 * 1000).toISOString();
- 289:       activeEndTime = null;
- 290:     } else if (preset === "7d") {
- 291:       activeStartTime = new Date(now.getTime() - 7 * 24 * 3600 * 1000).toISOString();
- 292:       activeEndTime = null;
- 293:     }
- 294:     fetchLogs(1);
- 295:   }
- 296: 
- 297:   function toggleCustomTime() {
- 298:     const customRow = document.getElementById("customTimeRow");
- 299:     if (customRow.style.display === "none" || !customRow.style.display) {
- 300:       customRow.style.display = "flex";
- 301:       document.querySelectorAll(".time-pill").forEach(p => p.classList.remove("active"));
- 302:       document.getElementById("pill-custom").classList.add("active");
- 303:     } else {
- 304:       customRow.style.display = "none";
- 305:     }
- 306:   }
- 307: 
- 308:   function applyCustomTime() {
- 309:     const startVal = document.getElementById("startTimeInput").value;
- 310:     const endVal = document.getElementById("endTimeInput").value;
- 311:     activeStartTime = startVal ? new Date(startVal).toISOString() : null;
- 312:     activeEndTime = endVal ? new Date(endVal).toISOString() : null;
- 313:     fetchLogs(1);
- 314:   }
- 315: 
- 316:   function clearCustomTime() {
- 317:     document.getElementById("startTimeInput").value = "";
- 318:     document.getElementById("endTimeInput").value = "";
- 319:     setTimePreset("all");
- 320:   }
- 321: 
- 322:   // ── Logs ─────────────────────────────────────────────────────────────────
- 323:   async function fetchLogs(page = currentPage) {
- 324:     const level    = document.getElementById("levelFilter").value;
- 325:     const fileType = document.getElementById("fileTypeFilter").value;
- 326:     const keyword  = document.getElementById("searchInput").value.trim();
- 327:     let url = `/api/logs?page=${page}&sort_by=${encodeURIComponent(currentSortBy)}&order=${encodeURIComponent(currentOrder)}`;
- 328:     if (level)    url += `&level=${encodeURIComponent(level)}`;
- 329:     if (fileType) url += `&file_type=${encodeURIComponent(fileType)}`;
- 330:     if (keyword)  url += `&keyword=${encodeURIComponent(keyword)}`;
- 331:     if (activeStartTime) url += `&start_time=${encodeURIComponent(activeStartTime)}`;
- 332:     if (activeEndTime)   url += `&end_time=${encodeURIComponent(activeEndTime)}`;
- 333: 
- 334:     try {
- 335:       const res  = await fetch(url);
- 336:       const data = await res.json();
- 337:       currentLogs = data.logs || [];
- 338:       renderLogs(currentLogs);
- 339:       renderPagination(data.page, data.total_pages, data.total);
- 340:       document.getElementById("tableMeta").textContent =
- 341:         `Showing ${currentLogs.length} of ${data.total} events`;
- 342:     } catch (e) {
- 343:       document.getElementById("tableMeta").textContent = "Could not load logs.";
- 344:     }
- 345:   }
- 346: 
- 347:   function renderLogs(logs) {
- 348:     const tbody = document.getElementById("logBody");
- 349:     if (!logs || logs.length === 0) {
- 350:       tbody.innerHTML = `<tr><td colspan="8" class="empty-row">No matching events.</td></tr>`;
- 351:       return;
- 352:     }
- 353:     tbody.innerHTML = logs.map((e, idx) => {
- 354:       const isSelected = selectedEventId === (e.timestamp + e.source);
- 355:       const selectedClass = isSelected ? "selected-row" : "";
- 356:       const risk = (e.risk_score !== undefined && e.risk_score !== null) ? e.risk_score : (e.alert_level === 'CRITICAL' ? 85 : (e.alert_level === 'WARNING' ? 45 : 10));
- 357:       const riskClass = risk >= 70 ? 'r-high' : (risk >= 40 ? 'r-med' : 'r-low');
- 358:       const lineageText = e.process_lineage || e.process || "—";
- 359:       return `
- 360:         <tr class="row-${(e.alert_level||"INFO").toLowerCase()} ${selectedClass}"
- 361:             onclick="selectLogEvent(${idx}, this)"
- 362:             title="Click to inspect this security event in chat format">
- 363:           <td class="mono ts">${(e.timestamp||"").slice(0,19).replace("T"," ")}</td>
- 364:           <td><span class="badge-risk ${riskClass}">${risk}</span></td>
- 365:           <td><span class="badge-level ${(e.alert_level||"INFO").toLowerCase()}">${e.alert_level||"—"}</span></td>
- 366:           <td><span class="event-type">${e.event_type||"—"}</span></td>
- 367:           <td class="mono path" title="${escapeHtml(e.source||"")}">${truncate(e.source||"", 30)}</td>
- 368:           <td class="mono path" title="${escapeHtml(e.destination||"")}">${truncate(e.destination||"—", 22)}</td>
- 369:           <td class="mono lineage" title="${escapeHtml(e.process_cmdline || lineageText)}">${truncate(lineageText, 24)}</td>
- 370:           <td><span class="integrity-badge ${(e.integrity_status||"").toLowerCase()}">${e.integrity_status||"—"}</span></td>
- 371:         </tr>
- 372:       `;
- 373:     }).join("");
- 374:   }
- 375: 
- 376:   // ── Vertical Chat Report Selection ────────────────────────────────────────
- 377:   function selectLogEvent(index, rowEl) {
- 378:     const event = currentLogs[index];
- 379:     if (!event) return;
- 380: 
- 381:     selectedEventId = (event.timestamp + event.source);
- 382: 
- 383:     // Update row highlights
- 384:     document.querySelectorAll("#logTable tbody tr").forEach(tr => tr.classList.remove("selected-row"));
- 385:     if (rowEl) rowEl.classList.add("selected-row");
- 386: 
- 387:     // Open drawer
- 388:     const layout = document.getElementById("mainLayout");
- 389:     layout.classList.add("drawer-open");
- 390: 
- 391:     // Update subtitle
- 392:     const fileName = getBasename(event.source);
- 393:     document.getElementById("drawerSub").textContent = `${event.event_type} • ${fileName}`;
- 394: 
- 395:     // Render Chat Blocks
- 396:     renderChatReport(event);
- 397:   }
- 398: 
- 399:   function closeDrawer() {
- 400:     document.getElementById("mainLayout").classList.remove("drawer-open");
- 401:     selectedEventId = null;
- 402:     document.querySelectorAll("#logTable tbody tr").forEach(tr => tr.classList.remove("selected-row"));
- 403:   }
- 404: 
- 405:   function renderFormattedDiff(snippet) {
- 406:     if (!snippet) return "";
- 407:     const lines = snippet.split("\n");
- 408:     return lines.map(line => {
- 409:       const escaped = escapeHtml(line);
- 410:       if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("@@")) {
- 411:         return `<span class="diff-line-meta">${escaped}</span>`;
- 412:       } else if (line.startsWith("+")) {
- 413:         return `<span class="diff-line-add">${escaped}</span>`;
- 414:       } else if (line.startsWith("-")) {
- 415:         return `<span class="diff-line-del">${escaped}</span>`;
- 416:       }
- 417:       return `<span class="diff-line-ctx">${escaped}</span>`;
- 418:     }).join("\n");
- 419:   }
- 420: 
- 421:   function renderChatReport(e) {
- 422:     const stream = document.getElementById("chatStream");
- 423:     const level = (e.alert_level || "INFO").toUpperCase();
- 424:     const fileName = getBasename(e.source);
- 425:     const tsFormatted = (e.timestamp || "").replace("T", " ").slice(0, 19);
+ 217:       let url = `/api/stats?timeframe=${encodeURIComponent(activeTimePreset)}`;
+ 218:       if (activeStartTime) url += `&start_time=${encodeURIComponent(activeStartTime)}`;
+ 219:       if (activeEndTime)   url += `&end_time=${encodeURIComponent(activeEndTime)}`;
+ 220:       const res  = await fetch(url);
+ 221:       const data = await res.json();
+ 222:       document.getElementById("statTotal").textContent    = data.total    ?? 0;
+ 223:       document.getElementById("statInfo").textContent     = data.info     ?? 0;
+ 224:       document.getElementById("statWarning").textContent  = data.warning  ?? 0;
+ 225:       document.getElementById("statCritical").textContent = data.critical  ?? 0;
+ 226:       document.getElementById("statTampered").textContent = data.integrity_tampered ?? 0;
+ 227:       setConnected(true);
+ 228:     } catch (e) {
+ 229:       setConnected(false);
+ 230:     }
+ 231:   }
+ 232: 
+ 233:   // ── Sorting Handlers ─────────────────────────────────────────────────────
+ 234:   function toggleSort(col) {
+ 235:     if (currentSortBy === col) {
+ 236:       currentOrder = currentOrder === "asc" ? "desc" : "asc";
+ 237:     } else {
+ 238:       currentSortBy = col;
+ 239:       currentOrder = (col === "level" || col === "timestamp") ? "desc" : "asc";
+ 240:     }
+ 241:     const matchVal = `${currentSortBy}_${currentOrder}`;
+ 242:     const sortSelect = document.getElementById("sortSelect");
+ 243:     if (sortSelect && sortSelect.querySelector(`option[value="${matchVal}"]`)) {
+ 244:       sortSelect.value = matchVal;
+ 245:     }
+ 246:     updateSortHeaderIcons();
+ 247:     fetchLogs(1);
+ 248:   }
+ 249: 
+ 250:   function onSortSelectChange() {
+ 251:     const val = document.getElementById("sortSelect").value;
+ 252:     const parts = val.split("_");
+ 253:     currentSortBy = parts[0];
+ 254:     currentOrder = parts[1] || "desc";
+ 255:     updateSortHeaderIcons();
+ 256:     fetchLogs(1);
+ 257:   }
+ 258: 
+ 259:   function updateSortHeaderIcons() {
+ 260:     document.querySelectorAll(".sort-icon").forEach(el => el.textContent = "");
+ 261:     const activeIcon = document.getElementById(`th-${currentSortBy}`);
+ 262:     if (activeIcon) {
+ 263:       activeIcon.textContent = currentOrder === "asc" ? " ▲" : " ▼";
+ 264:     }
+ 265:   }
+ 266: 
+ 267:   // ── Time Presets & Range State ──────────────────────────────────────────
+ 268:   let activeTimePreset = "all";
+ 269:   let activeStartTime  = null;
+ 270:   let activeEndTime    = null;
+ 271: 
+ 272:   function setTimePreset(preset) {
+ 273:     activeTimePreset = preset;
+ 274:     document.querySelectorAll(".time-pill").forEach(p => p.classList.remove("active"));
+ 275:     const pill = document.getElementById("pill-" + preset);
+ 276:     if (pill) pill.classList.add("active");
+ 277: 
+ 278:     const customRow = document.getElementById("customTimeRow");
+ 279:     if (preset !== "custom") {
+ 280:       customRow.style.display = "none";
+ 281:       activeStartTime = null;
+ 282:       activeEndTime = null;
+ 283:     }
+ 284:     fetchStats();
+ 285:     fetchLogs(1);
+ 286:   }
+ 287: 
+ 288:   function toggleCustomTime() {
+ 289:     const customRow = document.getElementById("customTimeRow");
+ 290:     if (customRow.style.display === "none" || !customRow.style.display) {
+ 291:       customRow.style.display = "flex";
+ 292:       document.querySelectorAll(".time-pill").forEach(p => p.classList.remove("active"));
+ 293:       document.getElementById("pill-custom").classList.add("active");
+ 294:     } else {
+ 295:       customRow.style.display = "none";
+ 296:     }
+ 297:   }
+ 298: 
+ 299:   function applyCustomTime() {
+ 300:     const startVal = document.getElementById("startTimeInput").value;
+ 301:     const endVal = document.getElementById("endTimeInput").value;
+ 302:     activeStartTime = startVal || null;
+ 303:     activeEndTime = endVal || null;
+ 304:     activeTimePreset = "custom";
+ 305:     fetchStats();
+ 306:     fetchLogs(1);
+ 307:   }
+ 308: 
+ 309:   function clearCustomTime() {
+ 310:     document.getElementById("startTimeInput").value = "";
+ 311:     document.getElementById("endTimeInput").value = "";
+ 312:     setTimePreset("all");
+ 313:   }
+ 314: 
+ 315:   // ── Logs ─────────────────────────────────────────────────────────────────
+ 316:   async function fetchLogs(page = currentPage) {
+ 317:     const level    = document.getElementById("levelFilter").value;
+ 318:     const fileType = document.getElementById("fileTypeFilter").value;
+ 319:     const keyword  = document.getElementById("searchInput").value.trim();
+ 320:     let url = `/api/logs?page=${page}&sort_by=${encodeURIComponent(currentSortBy)}&order=${encodeURIComponent(currentOrder)}&timeframe=${encodeURIComponent(activeTimePreset)}`;
+ 321:     if (level)    url += `&level=${encodeURIComponent(level)}`;
+ 322:     if (fileType) url += `&file_type=${encodeURIComponent(fileType)}`;
+ 323:     if (keyword)  url += `&keyword=${encodeURIComponent(keyword)}`;
+ 324:     if (activeStartTime) url += `&start_time=${encodeURIComponent(activeStartTime)}`;
+ 325:     if (activeEndTime)   url += `&end_time=${encodeURIComponent(activeEndTime)}`;
+ 326: 
+ 327:     try {
+ 328:       const res  = await fetch(url);
+ 329:       const data = await res.json();
+ 330:       currentLogs = data.logs || [];
+ 331:       renderLogs(currentLogs);
+ 332:       renderPagination(data.page, data.total_pages, data.total);
+ 333:       const tfLabel = activeTimePreset === '1h' ? 'Last 1 Hour' :
+ 334:                       activeTimePreset === '24h' ? 'Last 24 Hours' :
+ 335:                       activeTimePreset === '7d' ? 'Last 7 Days' :
+ 336:                       activeTimePreset === 'custom' ? 'Custom Range' : 'All Time';
+ 337:       document.getElementById("tableMeta").textContent =
+ 338:         `Showing ${currentLogs.length} of ${data.total} events (${tfLabel})`;
+ 339:     } catch (e) {
+ 340:       document.getElementById("tableMeta").textContent = "Could not load logs.";
+ 341:     }
+ 342:   }
+ 343: 
+ 344:   function renderLogs(logs) {
+ 345:     const tbody = document.getElementById("logBody");
+ 346:     if (!logs || logs.length === 0) {
+ 347:       tbody.innerHTML = `<tr><td colspan="8" class="empty-row">No matching events.</td></tr>`;
+ 348:       return;
+ 349:     }
+ 350:     tbody.innerHTML = logs.map((e, idx) => {
+ 351:       const isSelected = selectedEventId === (e.timestamp + e.source);
+ 352:       const selectedClass = isSelected ? "selected-row" : "";
+ 353:       const risk = (e.risk_score !== undefined && e.risk_score !== null) ? e.risk_score : (e.alert_level === 'CRITICAL' ? 85 : (e.alert_level === 'WARNING' ? 45 : 10));
+ 354:       const riskClass = risk >= 70 ? 'r-high' : (risk >= 40 ? 'r-med' : 'r-low');
+ 355:       const lineageText = e.process_lineage || e.process || "—";
+ 356:       return `
+ 357:         <tr class="row-${(e.alert_level||"INFO").toLowerCase()} ${selectedClass}"
+ 358:             onclick="selectLogEvent(${idx}, this)"
+ 359:             title="Click to inspect this security event in chat format">
+ 360:           <td class="mono ts">${(e.timestamp||"").slice(0,19).replace("T"," ")}</td>
+ 361:           <td><span class="badge-risk ${riskClass}">${risk}</span></td>
+ 362:           <td><span class="badge-level ${(e.alert_level||"INFO").toLowerCase()}">${e.alert_level||"—"}</span></td>
+ 363:           <td><span class="event-type">${e.event_type||"—"}</span></td>
+ 364:           <td class="mono path" title="${escapeHtml(e.source||"")}">${truncate(e.source||"", 30)}</td>
+ 365:           <td class="mono path" title="${escapeHtml(e.destination||"")}">${truncate(e.destination||"—", 22)}</td>
+ 366:           <td class="mono lineage" title="${escapeHtml(e.process_cmdline || lineageText)}">${truncate(lineageText, 24)}</td>
+ 367:           <td><span class="integrity-badge ${(e.integrity_status||"").toLowerCase()}">${e.integrity_status||"—"}</span></td>
+ 368:         </tr>
+ 369:       `;
+ 370:     }).join("");
+ 371:   }
+ 372: 
+ 373:   // ── Vertical Chat Report Selection ────────────────────────────────────────
+ 374:   function selectLogEvent(index, rowEl) {
+ 375:     const event = currentLogs[index];
+ 376:     if (!event) return;
+ 377: 
+ 378:     selectedEventId = (event.timestamp + event.source);
+ 379: 
+ 380:     // Update row highlights
+ 381:     document.querySelectorAll("#logTable tbody tr").forEach(tr => tr.classList.remove("selected-row"));
+ 382:     if (rowEl) rowEl.classList.add("selected-row");
+ 383: 
+ 384:     // Open drawer
+ 385:     const layout = document.getElementById("mainLayout");
+ 386:     layout.classList.add("drawer-open");
+ 387: 
+ 388:     // Update subtitle
+ 389:     const fileName = getBasename(event.source);
+ 390:     document.getElementById("drawerSub").textContent = `${event.event_type} • ${fileName}`;
+ 391: 
+ 392:     // Render Chat Blocks
+ 393:     renderChatReport(event);
+ 394:   }
+ 395: 
+ 396:   function closeDrawer() {
+ 397:     document.getElementById("mainLayout").classList.remove("drawer-open");
+ 398:     selectedEventId = null;
+ 399:     document.querySelectorAll("#logTable tbody tr").forEach(tr => tr.classList.remove("selected-row"));
+ 400:   }
+ 401: 
+ 402:   function renderFormattedDiff(snippet) {
+ 403:     if (!snippet) return "";
+ 404:     const lines = snippet.split("\n");
+ 405:     return lines.map(line => {
+ 406:       const escaped = escapeHtml(line);
+ 407:       if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("@@")) {
+ 408:         return `<span class="diff-line-meta">${escaped}</span>`;
+ 409:       } else if (line.startsWith("+")) {
+ 410:         return `<span class="diff-line-add">${escaped}</span>`;
+ 411:       } else if (line.startsWith("-")) {
+ 412:         return `<span class="diff-line-del">${escaped}</span>`;
+ 413:       }
+ 414:       return `<span class="diff-line-ctx">${escaped}</span>`;
+ 415:     }).join("\n");
+ 416:   }
+ 417: 
+ 418:   function renderChatReport(e) {
+ 419:     const stream = document.getElementById("chatStream");
+ 420:     const level = (e.alert_level || "INFO").toUpperCase();
+ 421:     const fileName = getBasename(e.source);
+ 422:     const tsFormatted = (e.timestamp || "").replace("T", " ").slice(0, 19);
+ 423: 
+ 424:     const risk = (e.risk_score !== undefined && e.risk_score !== null) ? e.risk_score : (level === 'CRITICAL' ? 85 : (level === 'WARNING' ? 45 : 10));
+ 425:     const riskClass = risk >= 70 ? 'r-high' : (risk >= 40 ? 'r-med' : 'r-low');
  426: 
- 427:     const risk = (e.risk_score !== undefined && e.risk_score !== null) ? e.risk_score : (level === 'CRITICAL' ? 85 : (level === 'WARNING' ? 45 : 10));
- 428:     const riskClass = risk >= 70 ? 'r-high' : (risk >= 40 ? 'r-med' : 'r-low');
- 429: 
- 430:     // Dynamic advice and policy text
- 431:     let policyText = "";
- 432:     let recText = "";
- 433:     if (level === "CRITICAL") {
- 434:       policyText = "High-Risk Security Policy Triggered: Sensitive file moved or transferred to an unauthorized destination (e.g. external USB drive, cloud folder, or network UNC share).";
- 435:       recText = "🚨 Immediate Action Required: Verify user identity and confirm if transfer was authorized. Isolate destination storage or block exfiltration path.";
- 436:     } else if (level === "WARNING") {
- 437:       policyText = "Data Loss Prevention (DLP) Warning: Creation or modification of a restricted sensitive file type in a monitored directory.";
- 438:       recText = "⚠️ Monitoring Advisory: Verify user context and ensure sensitive file adheres to corporate retention policies.";
- 439:     } else {
- 440:       policyText = "Standard Operational Event: Normal file activity within monitored local parameters.";
- 441:       recText = "✅ Routine Logging: No further blue team action needed. Activity cataloged in audit ledger.";
- 442:     }
- 443: 
- 444:     const html = `
- 445:       <!-- Block 1: Incident Trigger (System Alert) -->
- 446:       <div class="chat-block bot-block">
- 447:         <div class="chat-avatar system-av ${level.toLowerCase()}">🤖</div>
- 448:         <div class="chat-body">
- 449:           <div class="chat-meta">
- 450:             <span class="chat-sender">FileSentinel Agent</span>
- 451:             <span class="chat-time">${tsFormatted}</span>
- 452:           </div>
- 453:           <div class="chat-bubble ${level.toLowerCase()}">
- 454:             <div class="bubble-headline">
- 455:               <span class="badge-level ${level.toLowerCase()}">${level}</span>
- 456:               <strong>${escapeHtml(e.event_type)} event detected</strong>
- 457:             </div>
- 458:             <p class="bubble-p">Filesystem monitor intercepted a file <strong>${escapeHtml(e.event_type)}</strong> operation for <code>${escapeHtml(fileName)}</code>.</p>
- 459:             <div class="risk-meter-container">
- 460:               <div class="risk-meter-header">
- 461:                 <span class="risk-meter-label">Calculated Risk Score</span>
- 462:                 <span class="risk-score-num ${riskClass}">${risk}/100</span>
+ 427:     // Dynamic advice and policy text
+ 428:     let policyText = "";
+ 429:     let recText = "";
+ 430:     if (level === "CRITICAL") {
+ 431:       policyText = "High-Risk Security Policy Triggered: Sensitive file moved or transferred to an unauthorized destination (e.g. external USB drive, cloud folder, or network UNC share).";
+ 432:       recText = "🚨 Immediate Action Required: Verify user identity and confirm if transfer was authorized. Isolate destination storage or block exfiltration path.";
+ 433:     } else if (level === "WARNING") {
+ 434:       policyText = "Data Loss Prevention (DLP) Warning: Creation or modification of a restricted sensitive file type in a monitored directory.";
+ 435:       recText = "⚠️ Monitoring Advisory: Verify user context and ensure sensitive file adheres to corporate retention policies.";
+ 436:     } else {
+ 437:       policyText = "Standard Operational Event: Normal file activity within monitored local parameters.";
+ 438:       recText = "✅ Routine Logging: No further blue team action needed. Activity cataloged in audit ledger.";
+ 439:     }
+ 440: 
+ 441:     const html = `
+ 442:       <!-- Block 1: Incident Trigger (System Alert) -->
+ 443:       <div class="chat-block bot-block">
+ 444:         <div class="chat-avatar system-av ${level.toLowerCase()}">🤖</div>
+ 445:         <div class="chat-body">
+ 446:           <div class="chat-meta">
+ 447:             <span class="chat-sender">FileSentinel Agent</span>
+ 448:             <span class="chat-time">${tsFormatted}</span>
+ 449:           </div>
+ 450:           <div class="chat-bubble ${level.toLowerCase()}">
+ 451:             <div class="bubble-headline">
+ 452:               <span class="badge-level ${level.toLowerCase()}">${level}</span>
+ 453:               <strong>${escapeHtml(e.event_type)} event detected</strong>
+ 454:             </div>
+ 455:             <p class="bubble-p">Filesystem monitor intercepted a file <strong>${escapeHtml(e.event_type)}</strong> operation for <code>${escapeHtml(fileName)}</code>.</p>
+ 456:             <div class="risk-meter-container">
+ 457:               <div class="risk-meter-header">
+ 458:                 <span class="risk-meter-label">Calculated Risk Score</span>
+ 459:                 <span class="risk-score-num ${riskClass}">${risk}/100</span>
+ 460:               </div>
+ 461:               <div class="risk-bar-track">
+ 462:                 <div class="risk-bar-fill ${riskClass}" style="width: ${risk}%"></div>
  463:               </div>
- 464:               <div class="risk-bar-track">
- 465:                 <div class="risk-bar-fill ${riskClass}" style="width: ${risk}%"></div>
- 466:               </div>
- 467:             </div>
- 468:           </div>
- 469:         </div>
- 470:       </div>
- 471: 
- 472:       <!-- Block 2: File & Transfer Telemetry -->
- 473:       <div class="chat-block bot-block">
- 474:         <div class="chat-avatar file-av">📁</div>
- 475:         <div class="chat-body">
- 476:           <div class="chat-meta">
- 477:             <span class="chat-sender">Filesystem Telemetry</span>
- 478:             <span class="chat-tag">Transfer Details</span>
- 479:           </div>
- 480:           <div class="chat-bubble info-bubble">
- 481:             <div class="kv-grid">
- 482:               <div class="kv-item">
- 483:                 <span class="kv-label">Source Path:</span>
- 484:                 <div class="kv-val mono break-all" id="srcPathVal">${escapeHtml(e.source || "—")}</div>
- 485:               </div>
- 486:               ${e.destination ? `
- 487:               <div class="kv-item">
- 488:                 <span class="kv-label">Destination Path:</span>
- 489:                 <div class="kv-val mono break-all text-amber">${escapeHtml(e.destination)}</div>
- 490:               </div>` : ""}
- 491:               <div class="kv-item flex-row">
- 492:                 <div>
- 493:                   <span class="kv-label">User / Account:</span>
- 494:                   <div class="kv-val font-semibold">${escapeHtml(e.user || "N/A")}</div>
- 495:                 </div>
- 496:                 <div>
- 497:                   <span class="kv-label">Process / PID:</span>
- 498:                   <div class="kv-val mono">${escapeHtml(e.process || "N/A")} ${e.process_pid ? `(PID: ${e.process_pid})` : ""}</div>
- 499:                 </div>
- 500:               </div>
- 501:               ${e.process_lineage ? `
- 502:               <div class="kv-item">
- 503:                 <span class="kv-label">Process Lineage:</span>
- 504:                 <div class="kv-val mono lineage break-all">${escapeHtml(e.process_lineage)}</div>
- 505:               </div>` : ""}
- 506:               ${e.process_cmdline ? `
- 507:               <div class="kv-item">
- 508:                 <span class="kv-label">Command Line:</span>
- 509:                 <div class="cmdline-box">${escapeHtml(e.process_cmdline)}</div>
- 510:               </div>` : ""}
- 511:             </div>
- 512:           </div>
- 513:         </div>
- 514:       </div>
- 515: 
- 516:       ${e.download_metadata || e.event_type === 'DOWNLOADED' ? `
- 517:       <!-- Block 2.5: Web Download Origin (NTFS Zone.Identifier) -->
- 518:       <div class="chat-block bot-block">
- 519:         <div class="chat-avatar file-av">🌐</div>
- 520:         <div class="chat-body">
- 521:           <div class="chat-meta">
- 522:             <span class="chat-sender">NTFS Zone.Identifier Engine</span>
- 523:             <span class="chat-tag">Origin URL Telemetry</span>
- 524:           </div>
- 525:           <div class="chat-bubble download-bubble">
- 526:             <div class="kv-grid">
- 527:               <div class="kv-item">
- 528:                 <span class="kv-label">Origin Host URL:</span>
- 529:                 <div class="download-url-box">${escapeHtml((e.download_metadata && e.download_metadata.host_url) || "Unknown Host URL")}</div>
- 530:               </div>
- 531:               ${(e.download_metadata && e.download_metadata.referrer_url) ? `
- 532:               <div class="kv-item">
- 533:                 <span class="kv-label">Referrer URL:</span>
- 534:                 <div class="download-url-box">${escapeHtml(e.download_metadata.referrer_url)}</div>
- 535:               </div>` : ""}
- 536:               <div class="kv-item">
- 537:                 <span class="kv-label">Zone Security Identifier:</span>
- 538:                 <div class="kv-val mono text-amber">Zone 3 (Internet Security Zone)</div>
- 539:               </div>
- 540:             </div>
- 541:           </div>
- 542:         </div>
- 543:       </div>
- 544:       ` : ""}
- 545: 
- 546:       ${(e.dlp_findings && Object.keys(e.dlp_findings).length > 0) ? `
- 547:       <!-- Block 2.6: DLP Regex Content Inspection Findings -->
- 548:       <div class="chat-block bot-block">
- 549:         <div class="chat-avatar system-av critical">🔍</div>
- 550:         <div class="chat-body">
- 551:           <div class="chat-meta">
- 552:             <span class="chat-sender">DLP Content Inspection Engine</span>
- 553:             <span class="chat-tag">Confidential Data Detected</span>
- 554:           </div>
- 555:           <div class="chat-bubble dlp-bubble">
- 556:             <div class="bubble-headline">
- 557:               <span class="badge-level critical">DLP ALERT</span>
- 558:               <strong>Pattern matches detected in content</strong>
- 559:             </div>
- 560:             ${Object.entries(e.dlp_findings).map(([ruleName, data]) => `
- 561:               <div class="dlp-item">
- 562:                 <div class="dlp-type-header">
- 563:                   <span>⚠️ ${escapeHtml(ruleName.toUpperCase().replace(/_/g, ' '))}</span>
- 564:                   <span class="dlp-count-pill">${data.count || (Array.isArray(data) ? data.length : 1)} match(es)</span>
- 565:                 </div>
- 566:                 <div class="dlp-sample-box">${escapeHtml(Array.isArray(data.samples) ? data.samples.join(", ") : (Array.isArray(data) ? data.join(", ") : JSON.stringify(data)))}</div>
- 567:               </div>
- 568:             `).join("")}
- 569:           </div>
- 570:         </div>
- 571:       </div>
- 572:       ` : ""}
- 573: 
- 574:       <!-- Block 3: Exact Content Changes & Diff Telemetry -->
- 575:       ${e.diff ? `
- 576:       <div class="chat-block bot-block">
- 577:         <div class="chat-avatar diff-av">📝</div>
- 578:         <div class="chat-body">
- 579:           <div class="chat-meta">
- 580:             <span class="chat-sender">Diff Analysis Engine</span>
- 581:             <span class="chat-tag">${e.diff.type === 'text' ? 'Unified Text Diff' : (e.diff.type === 'binary' ? 'Binary Delta' : 'Lifecycle Event')}</span>
- 582:           </div>
- 583:           <div class="chat-bubble diff-bubble">
- 584:             <div class="diff-summary-row">
- 585:               <span class="diff-summary-text">${escapeHtml(e.diff.summary || "Change recorded")}</span>
- 586:               ${e.diff.size_delta !== undefined ? `<span class="diff-badge-delta ${e.diff.size_delta > 0 ? 'pos' : (e.diff.size_delta < 0 ? 'neg' : 'zero')}">${e.diff.size_delta > 0 ? '+' : ''}${e.diff.size_delta} bytes</span>` : ''}
- 587:             </div>
- 588:             ${e.diff.snippet ? `
- 589:             <div class="diff-code-wrapper">
- 590:               <pre class="diff-code"><code>${renderFormattedDiff(e.diff.snippet)}</code></pre>
- 591:             </div>` : ''}
- 592:           </div>
- 593:         </div>
- 594:       </div>
- 595:       ` : `
- 596:       <div class="chat-block bot-block">
- 597:         <div class="chat-avatar diff-av">📝</div>
- 598:         <div class="chat-body">
- 599:           <div class="chat-meta">
- 600:             <span class="chat-sender">Diff Analysis Engine</span>
- 601:             <span class="chat-tag">Change Telemetry</span>
+ 464:             </div>
+ 465:           </div>
+ 466:         </div>
+ 467:       </div>
+ 468: 
+ 469:       <!-- Block 2: File & Transfer Telemetry -->
+ 470:       <div class="chat-block bot-block">
+ 471:         <div class="chat-avatar file-av">📁</div>
+ 472:         <div class="chat-body">
+ 473:           <div class="chat-meta">
+ 474:             <span class="chat-sender">Filesystem Telemetry</span>
+ 475:             <span class="chat-tag">Transfer Details</span>
+ 476:           </div>
+ 477:           <div class="chat-bubble info-bubble">
+ 478:             <div class="kv-grid">
+ 479:               <div class="kv-item">
+ 480:                 <span class="kv-label">Source Path:</span>
+ 481:                 <div class="kv-val mono break-all" id="srcPathVal">${escapeHtml(e.source || "—")}</div>
+ 482:               </div>
+ 483:               ${e.destination ? `
+ 484:               <div class="kv-item">
+ 485:                 <span class="kv-label">Destination Path:</span>
+ 486:                 <div class="kv-val mono break-all text-amber">${escapeHtml(e.destination)}</div>
+ 487:               </div>` : ""}
+ 488:               <div class="kv-item flex-row">
+ 489:                 <div>
+ 490:                   <span class="kv-label">User / Account:</span>
+ 491:                   <div class="kv-val font-semibold">${escapeHtml(e.user || "N/A")}</div>
+ 492:                 </div>
+ 493:                 <div>
+ 494:                   <span class="kv-label">Process / PID:</span>
+ 495:                   <div class="kv-val mono">${escapeHtml(e.process || "N/A")} ${e.process_pid ? `(PID: ${e.process_pid})` : ""}</div>
+ 496:                 </div>
+ 497:               </div>
+ 498:               ${e.process_lineage ? `
+ 499:               <div class="kv-item">
+ 500:                 <span class="kv-label">Process Lineage:</span>
+ 501:                 <div class="kv-val mono lineage break-all">${escapeHtml(e.process_lineage)}</div>
+ 502:               </div>` : ""}
+ 503:               ${e.process_cmdline ? `
+ 504:               <div class="kv-item">
+ 505:                 <span class="kv-label">Command Line:</span>
+ 506:                 <div class="cmdline-box">${escapeHtml(e.process_cmdline)}</div>
+ 507:               </div>` : ""}
+ 508:             </div>
+ 509:           </div>
+ 510:         </div>
+ 511:       </div>
+ 512: 
+ 513:       ${e.download_metadata || e.event_type === 'DOWNLOADED' ? `
+ 514:       <!-- Block 2.5: Web Download Origin (NTFS Zone.Identifier) -->
+ 515:       <div class="chat-block bot-block">
+ 516:         <div class="chat-avatar file-av">🌐</div>
+ 517:         <div class="chat-body">
+ 518:           <div class="chat-meta">
+ 519:             <span class="chat-sender">NTFS Zone.Identifier Engine</span>
+ 520:             <span class="chat-tag">Origin URL Telemetry</span>
+ 521:           </div>
+ 522:           <div class="chat-bubble download-bubble">
+ 523:             <div class="kv-grid">
+ 524:               <div class="kv-item">
+ 525:                 <span class="kv-label">Origin Host URL:</span>
+ 526:                 <div class="download-url-box">${escapeHtml((e.download_metadata && e.download_metadata.host_url) || "Unknown Host URL")}</div>
+ 527:               </div>
+ 528:               ${(e.download_metadata && e.download_metadata.referrer_url) ? `
+ 529:               <div class="kv-item">
+ 530:                 <span class="kv-label">Referrer URL:</span>
+ 531:                 <div class="download-url-box">${escapeHtml(e.download_metadata.referrer_url)}</div>
+ 532:               </div>` : ""}
+ 533:               <div class="kv-item">
+ 534:                 <span class="kv-label">Zone Security Identifier:</span>
+ 535:                 <div class="kv-val mono text-amber">Zone 3 (Internet Security Zone)</div>
+ 536:               </div>
+ 537:             </div>
+ 538:           </div>
+ 539:         </div>
+ 540:       </div>
+ 541:       ` : ""}
+ 542: 
+ 543:       ${(e.dlp_findings && Object.keys(e.dlp_findings).length > 0) ? `
+ 544:       <!-- Block 2.6: DLP Regex Content Inspection Findings -->
+ 545:       <div class="chat-block bot-block">
+ 546:         <div class="chat-avatar system-av critical">🔍</div>
+ 547:         <div class="chat-body">
+ 548:           <div class="chat-meta">
+ 549:             <span class="chat-sender">DLP Content Inspection Engine</span>
+ 550:             <span class="chat-tag">Confidential Data Detected</span>
+ 551:           </div>
+ 552:           <div class="chat-bubble dlp-bubble">
+ 553:             <div class="bubble-headline">
+ 554:               <span class="badge-level critical">DLP ALERT</span>
+ 555:               <strong>Pattern matches detected in content</strong>
+ 556:             </div>
+ 557:             ${Object.entries(e.dlp_findings).map(([ruleName, data]) => `
+ 558:               <div class="dlp-item">
+ 559:                 <div class="dlp-type-header">
+ 560:                   <span>⚠️ ${escapeHtml(ruleName.toUpperCase().replace(/_/g, ' '))}</span>
+ 561:                   <span class="dlp-count-pill">${data.count || (Array.isArray(data) ? data.length : 1)} match(es)</span>
+ 562:                 </div>
+ 563:                 <div class="dlp-sample-box">${escapeHtml(Array.isArray(data.samples) ? data.samples.join(", ") : (Array.isArray(data) ? data.join(", ") : JSON.stringify(data)))}</div>
+ 564:               </div>
+ 565:             `).join("")}
+ 566:           </div>
+ 567:         </div>
+ 568:       </div>
+ 569:       ` : ""}
+ 570: 
+ 571:       <!-- Block 3: Exact Content Changes & Diff Telemetry -->
+ 572:       ${e.diff ? `
+ 573:       <div class="chat-block bot-block">
+ 574:         <div class="chat-avatar diff-av">📝</div>
+ 575:         <div class="chat-body">
+ 576:           <div class="chat-meta">
+ 577:             <span class="chat-sender">Diff Analysis Engine</span>
+ 578:             <span class="chat-tag">${e.diff.type === 'text' ? 'Unified Text Diff' : (e.diff.type === 'binary' ? 'Binary Delta' : 'Lifecycle Event')}</span>
+ 579:           </div>
+ 580:           <div class="chat-bubble diff-bubble">
+ 581:             <div class="diff-summary-row">
+ 582:               <span class="diff-summary-text">${escapeHtml(e.diff.summary || "Change recorded")}</span>
+ 583:               ${e.diff.size_delta !== undefined ? `<span class="diff-badge-delta ${e.diff.size_delta > 0 ? 'pos' : (e.diff.size_delta < 0 ? 'neg' : 'zero')}">${e.diff.size_delta > 0 ? '+' : ''}${e.diff.size_delta} bytes</span>` : ''}
+ 584:             </div>
+ 585:             ${e.diff.snippet ? `
+ 586:             <div class="diff-code-wrapper">
+ 587:               <pre class="diff-code"><code>${renderFormattedDiff(e.diff.snippet)}</code></pre>
+ 588:             </div>` : ''}
+ 589:           </div>
+ 590:         </div>
+ 591:       </div>
+ 592:       ` : `
+ 593:       <div class="chat-block bot-block">
+ 594:         <div class="chat-avatar diff-av">📝</div>
+ 595:         <div class="chat-body">
+ 596:           <div class="chat-meta">
+ 597:             <span class="chat-sender">Diff Analysis Engine</span>
+ 598:             <span class="chat-tag">Change Telemetry</span>
+ 599:           </div>
+ 600:           <div class="chat-bubble info-bubble">
+ 601:             <p class="bubble-p text-muted">No line-by-line diff recorded for this historical log entry.</p>
  602:           </div>
- 603:           <div class="chat-bubble info-bubble">
- 604:             <p class="bubble-p text-muted">No line-by-line diff recorded for this historical log entry.</p>
- 605:           </div>
- 606:         </div>
- 607:       </div>
- 608:       `}
- 609: 
- 610:       <!-- Block 4: Cryptographic Integrity Hashing -->
- 611:       <div class="chat-block bot-block">
- 612:         <div class="chat-avatar hash-av">🔐</div>
- 613:         <div class="chat-body">
- 614:           <div class="chat-meta">
- 615:             <span class="chat-sender">Integrity Engine</span>
- 616:             <span class="chat-tag">${(e.hash_algorithm || "SHA256").toUpperCase()}</span>
- 617:           </div>
- 618:           <div class="chat-bubble">
- 619:             <div class="bubble-headline">
- 620:               <span class="integrity-badge ${(e.integrity_status||"").toLowerCase()}">
- 621:                 ${e.integrity_status === "INTACT" ? "✓ INTACT" : (e.integrity_status === "TAMPERED" ? "🚨 TAMPERED" : "UNAVAILABLE")}
+ 603:         </div>
+ 604:       </div>
+ 605:       `}
+ 606: 
+ 607:       <!-- Block 4: Cryptographic Integrity Hashing -->
+ 608:       <div class="chat-block bot-block">
+ 609:         <div class="chat-avatar hash-av">🔐</div>
+ 610:         <div class="chat-body">
+ 611:           <div class="chat-meta">
+ 612:             <span class="chat-sender">Integrity Engine</span>
+ 613:             <span class="chat-tag">${(e.hash_algorithm || "SHA256").toUpperCase()}</span>
+ 614:           </div>
+ 615:           <div class="chat-bubble">
+ 616:             <div class="bubble-headline">
+ 617:               <span class="integrity-badge ${(e.integrity_status||"").toLowerCase()}">
+ 618:                 ${e.integrity_status === "INTACT" ? "✓ INTACT" : (e.integrity_status === "TAMPERED" ? "🚨 TAMPERED" : "UNAVAILABLE")}
+ 619:               </span>
+ 620:               <span class="hash-status-text">
+ 621:                 ${e.integrity_status === "INTACT" ? "Cryptographic checksum matched baseline." : (e.integrity_status === "TAMPERED" ? "Hash disparity detected (content changed)." : "Hash snapshot unavailable.")}
  622:               </span>
- 623:               <span class="hash-status-text">
- 624:                 ${e.integrity_status === "INTACT" ? "Cryptographic checksum matched baseline." : (e.integrity_status === "TAMPERED" ? "Hash disparity detected (content changed)." : "Hash snapshot unavailable.")}
- 625:               </span>
- 626:             </div>
- 627:             <div class="hash-box">
- 628:               <div class="hash-line">
- 629:                 <span class="hash-label">Pre-Hash:</span>
- 630:                 <code class="mono-code">${e.hash_pre || "N/A"}</code>
- 631:               </div>
- 632:               <div class="hash-line">
- 633:                 <span class="hash-label">Post-Hash:</span>
- 634:                 <code class="mono-code">${e.hash_post || "N/A"}</code>
- 635:               </div>
- 636:             </div>
- 637:           </div>
- 638:         </div>
- 639:       </div>
- 640: 
- 641:       <!-- Block 5: Policy Verdict & Recommendation -->
- 642:       <div class="chat-block bot-block">
- 643:         <div class="chat-avatar verdict-av ${level.toLowerCase()}">🛡️</div>
- 644:         <div class="chat-body">
- 645:           <div class="chat-meta">
- 646:             <span class="chat-sender">SOC Policy Advisor</span>
- 647:             <span class="chat-tag">Blue Team Brief</span>
- 648:           </div>
- 649:           <div class="chat-bubble policy-bubble ${level.toLowerCase()}">
- 650:             <div class="policy-section">
- 651:               <div class="sec-title">Security Policy Evaluation</div>
- 652:               <div class="sec-body">${policyText}</div>
- 653:             </div>
- 654:             <div class="policy-section mt-8">
- 655:               <div class="sec-title">Recommended Action</div>
- 656:               <div class="sec-body font-medium">${recText}</div>
- 657:             </div>
- 658:           </div>
- 659:         </div>
- 660:       </div>
- 661: 
- 662:       <!-- Block 6: Remediation & Quick Actions -->
- 663:       <div class="remediation-box">
- 664:         <div class="remediation-title">SOC One-Click Remediation</div>
- 665:         <div class="remediation-btn-row">
- 666:           <button class="btn-remedy btn-quarantine" onclick="actionQuarantine('${encodeURIComponent(e.source || "")}')">
- 667:             🛡️ Quarantine File
- 668:           </button>
- 669:           ${e.process_pid && e.process_pid > 4 ? `
- 670:           <button class="btn-remedy btn-terminate" onclick="actionTerminate(${e.process_pid}, '${encodeURIComponent(e.process || "")}')">
- 671:             🛑 Terminate Process
- 672:           </button>` : ""}
- 673:           <button class="btn-remedy btn-allowlist" onclick="actionAllowlist('${encodeURIComponent(e.source || "")}', 'path')">
- 674:             ✅ Add to Allowlist
- 675:           </button>
- 676:         </div>
- 677:       </div>
- 678: 
- 679:       <div class="action-footer">
- 680:         <button class="btn-action" onclick="copyLogJson('${encodeURIComponent(JSON.stringify(e))}')">📋 Copy JSON</button>
- 681:         <button class="btn-action" onclick="copyText('${encodeURIComponent(e.source || "")}')">📁 Copy Source</button>
- 682:         <button class="btn-action secondary" onclick="closeDrawer()">✕ Close</button>
- 683:       </div>
- 684:     `;
- 685: 
- 686:     stream.innerHTML = html;
- 687:     stream.scrollTop = 0;
- 688:   }
- 689: 
- 690:   function renderPagination(page, totalPages, total) {
- 691:     currentPage = page;
- 692:     const el = document.getElementById("pagination");
- 693:     if (totalPages <= 1) { el.innerHTML = ""; return; }
- 694: 
- 695:     let html = "";
- 696:     if (page > 1) html += `<button onclick="fetchLogs(${page-1})">‹ Prev</button>`;
- 697:     html += `<span class="page-info">Page ${page} / ${totalPages}</span>`;
- 698:     if (page < totalPages) html += `<button onclick="fetchLogs(${page+1})">Next ›</button>`;
- 699:     el.innerHTML = html;
- 700:   }
- 701: 
- 702:   // ── Alerts & Live Alert Inspection ───────────────────────────────────────
- 703:   async function fetchAlerts() {
- 704:     try {
- 705:       const res    = await fetch("/api/alerts?limit=30");
- 706:       const alerts = await res.json();
- 707:       currentAlerts = alerts || [];
- 708:       const feed   = document.getElementById("alertFeed");
- 709:       document.getElementById("alertCount").textContent = currentAlerts.length;
- 710: 
- 711:       if (currentAlerts.length === 0) {
- 712:         feed.innerHTML = `<div class="alert-empty">No alerts yet.</div>`;
- 713:         return;
- 714:       }
- 715:       feed.innerHTML = currentAlerts.map((a, idx) => `
- 716:         <div class="alert-item ${(a.level||"INFO").toLowerCase()}" onclick="inspectAlert(${idx})" title="Click to view live alert report">
- 717:           <div class="alert-item-top">
- 718:             <span class="alert-ts">${(a.timestamp||"").slice(0,19).replace("T"," ")}</span>
- 719:             <span class="badge-level ${(a.level||"INFO").toLowerCase()}">${a.level||""}</span>
- 720:           </div>
- 721:           <div class="alert-msg">${escapeHtml(a.message||"")}</div>
- 722:           ${a.event_data && a.event_data.source ? `<div class="alert-src mono">${truncate(a.event_data.source,36)}</div>` : ""}
- 723:           <div class="alert-action-row">
- 724:             <a href="javascript:void(0)" class="alert-link" onclick="event.stopPropagation(); inspectAlert(${idx})">
- 725:               🔍 View Live Report →
- 726:             </a>
- 727:           </div>
- 728:         </div>
- 729:       `).join("");
- 730:     } catch (e) { /* sidebar alert failure is non-critical */ }
- 731:   }
- 732: 
- 733:   function inspectAlert(alertIndex) {
- 734:     const alertObj = currentAlerts[alertIndex];
- 735:     if (!alertObj) return;
- 736: 
- 737:     let matchingIndex = -1;
- 738:     const alertSrc = (alertObj.event_data && alertObj.event_data.source) || "";
- 739:     const alertTs = (alertObj.timestamp || "").slice(0, 19);
- 740: 
- 741:     for (let i = 0; i < currentLogs.length; i++) {
- 742:       const log = currentLogs[i];
- 743:       if (log.source === alertSrc && (log.timestamp || "").slice(0, 19) === alertTs) {
- 744:         matchingIndex = i;
- 745:         break;
- 746:       }
- 747:     }
- 748: 
- 749:     if (matchingIndex === -1 && alertSrc) {
- 750:       for (let i = 0; i < currentLogs.length; i++) {
- 751:         if (currentLogs[i].source === alertSrc) {
- 752:           matchingIndex = i;
- 753:           break;
- 754:         }
- 755:       }
- 756:     }
- 757: 
- 758:     if (matchingIndex !== -1) {
- 759:       const tableRows = document.querySelectorAll("#logTable tbody tr");
- 760:       const targetRow = tableRows[matchingIndex];
- 761:       selectLogEvent(matchingIndex, targetRow);
- 762:       if (targetRow) {
- 763:         targetRow.scrollIntoView({ behavior: "smooth", block: "center" });
- 764:       }
- 765:     } else {
- 766:       const synthEvent = {
- 767:         timestamp: alertObj.timestamp,
- 768:         alert_level: alertObj.level,
- 769:         event_type: (alertObj.event_data && alertObj.event_data.event_type) || "ALERT",
- 770:         source: alertSrc || "Unknown Source",
- 771:         destination: (alertObj.event_data && alertObj.event_data.destination) || "",
- 772:         user: (alertObj.event_data && alertObj.event_data.user) || "N/A",
- 773:         process: (alertObj.event_data && alertObj.event_data.process) || "N/A",
- 774:         hash_pre: (alertObj.event_data && alertObj.event_data.hash_pre) || "N/A",
- 775:         hash_post: (alertObj.event_data && alertObj.event_data.hash_post) || "N/A",
- 776:         integrity_status: (alertObj.event_data && alertObj.event_data.integrity_status) || "TAMPERED",
- 777:         hash_algorithm: "SHA256",
- 778:         diff: alertObj.event_data && alertObj.event_data.diff,
- 779:       };
- 780:       selectedEventId = synthEvent.timestamp + synthEvent.source;
- 781:       document.getElementById("mainLayout").classList.add("drawer-open");
- 782:       const fileName = getBasename(synthEvent.source);
- 783:       document.getElementById("drawerSub").textContent = `LIVE ALERT • ${fileName}`;
- 784:       renderChatReport(synthEvent);
- 785:     }
- 786:   }
- 787: 
- 788:   // ── Utilities ────────────────────────────────────────────────────────────
- 789:   function truncate(str, n) {
- 790:     if (!str) return "—";
- 791:     return str.length > n ? "…" + str.slice(-(n-1)) : str;
- 792:   }
- 793: 
- 794:   function shortHash(h) {
- 795:     if (!h || h === "N/A") return "N/A";
- 796:     return h.length > 12 ? h.slice(0, 8) + "…" + h.slice(-4) : h;
- 797:   }
- 798: 
- 799:   function getBasename(path) {
- 800:     if (!path) return "Unknown File";
- 801:     const parts = path.split(/[\/\\]/);
- 802:     return parts[parts.length - 1] || path;
- 803:   }
- 804: 
- 805:   function escapeQuotes(str) {
- 806:     return str.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
- 807:   }
- 808: 
- 809:   function escapeHtml(str) {
- 810:     if (str === null || str === undefined) return "";
- 811:     return String(str)
- 812:       .replace(/&/g, "&amp;")
- 813:       .replace(/</g, "&lt;")
- 814:       .replace(/>/g, "&gt;")
- 815:       .replace(/"/g, "&quot;")
- 816:       .replace(/'/g, "&#039;");
- 817:   }
- 818: 
- 819:   function copyLogJson(jsonStr) {
- 820:     try {
- 821:       const parsed = JSON.parse(decodeURIComponent(jsonStr));
- 822:       navigator.clipboard.writeText(JSON.stringify(parsed, null, 2));
- 823:       alert("✓ Log JSON copied to clipboard!");
- 824:     } catch (e) {
- 825:       console.error(e);
- 826:     }
- 827:   }
- 828: 
- 829:   function copyText(encodedTxt) {
- 830:     const txt = decodeURIComponent(encodedTxt || "");
- 831:     navigator.clipboard.writeText(txt);
- 832:     alert("✓ Copied to clipboard:\n" + txt);
- 833:   }
- 834: 
- 835:   function setConnected(ok) {
- 836:     isConnected = ok;
- 837:     document.getElementById("statusDot").className   = "status-dot " + (ok ? "online" : "offline");
- 838:     document.getElementById("statusLabel").textContent = ok ? "Monitoring Active" : "Disconnected";
- 839:   }
- 840: 
- 841:   // ── Search / filter listeners ─────────────────────────────────────────────
- 842:   let searchDebounce;
- 843:   document.getElementById("searchInput").addEventListener("input", () => {
- 844:     clearTimeout(searchDebounce);
- 845:     searchDebounce = setTimeout(() => fetchLogs(1), 400);
- 846:   });
- 847:   document.getElementById("levelFilter").addEventListener("change", () => fetchLogs(1));
- 848:   document.getElementById("fileTypeFilter").addEventListener("change", () => fetchLogs(1));
- 849: 
- 850:   // ── Auto-refresh every 5 seconds ──────────────────────────────────────────
- 851:   function startRefresh() {
- 852:     fetchAll();
- 853:     refreshTimer = setInterval(fetchAll, 5000);
- 854:   }
- 855: 
- 856:   // ── SOC Remediation Handlers ─────────────────────────────────────────────
- 857:   async function actionQuarantine(encodedFilePath) {
- 858:     const filePath = decodeURIComponent(encodedFilePath || "");
- 859:     if (!filePath || filePath === "—") {
- 860:       alert("⚠️ No valid file path associated with this event.");
- 861:       return;
- 862:     }
- 863:     if (!confirm(`Are you sure you want to isolate & quarantine this file?\n\n${filePath}`)) return;
- 864:     try {
- 865:       const res = await fetch("/api/action/quarantine", {
- 866:         method: "POST",
- 867:         headers: { "Content-Type": "application/json" },
- 868:         body: JSON.stringify({ source: filePath, file_path: filePath, path: filePath })
- 869:       });
- 870:       const data = await res.json();
- 871:       if (res.ok && data.success) {
- 872:         alert(`✓ File successfully moved to Quarantine Vault:\nVault: ${data.quarantined_path || data.quarantine_vault_path || data.message}`);
- 873:         fetchAll();
- 874:       } else {
- 875:         alert(`⚠️ Quarantine failed: ${data.error || "Unknown error"}`);
- 876:       }
- 877:     } catch (e) {
- 878:       alert(`⚠️ Quarantine request failed: ${e.message}`);
+ 623:             </div>
+ 624:             <div class="hash-box">
+ 625:               <div class="hash-line">
+ 626:                 <span class="hash-label">Pre-Hash:</span>
+ 627:                 <code class="mono-code">${e.hash_pre || "N/A"}</code>
+ 628:               </div>
+ 629:               <div class="hash-line">
+ 630:                 <span class="hash-label">Post-Hash:</span>
+ 631:                 <code class="mono-code">${e.hash_post || "N/A"}</code>
+ 632:               </div>
+ 633:             </div>
+ 634:           </div>
+ 635:         </div>
+ 636:       </div>
+ 637: 
+ 638:       <!-- Block 5: Policy Verdict & Recommendation -->
+ 639:       <div class="chat-block bot-block">
+ 640:         <div class="chat-avatar verdict-av ${level.toLowerCase()}">🛡️</div>
+ 641:         <div class="chat-body">
+ 642:           <div class="chat-meta">
+ 643:             <span class="chat-sender">SOC Policy Advisor</span>
+ 644:             <span class="chat-tag">Blue Team Brief</span>
+ 645:           </div>
+ 646:           <div class="chat-bubble policy-bubble ${level.toLowerCase()}">
+ 647:             <div class="policy-section">
+ 648:               <div class="sec-title">Security Policy Evaluation</div>
+ 649:               <div class="sec-body">${policyText}</div>
+ 650:             </div>
+ 651:             <div class="policy-section mt-8">
+ 652:               <div class="sec-title">Recommended Action</div>
+ 653:               <div class="sec-body font-medium">${recText}</div>
+ 654:             </div>
+ 655:           </div>
+ 656:         </div>
+ 657:       </div>
+ 658: 
+ 659:       <!-- Block 6: Remediation & Quick Actions -->
+ 660:       <div class="remediation-box">
+ 661:         <div class="remediation-title">SOC One-Click Remediation</div>
+ 662:         <div class="remediation-btn-row">
+ 663:           <button class="btn-remedy btn-quarantine" onclick="actionQuarantine('${encodeURIComponent(e.source || "")}')">
+ 664:             🛡️ Quarantine File
+ 665:           </button>
+ 666:           ${e.process_pid && e.process_pid > 4 ? `
+ 667:           <button class="btn-remedy btn-terminate" onclick="actionTerminate(${e.process_pid}, '${encodeURIComponent(e.process || "")}')">
+ 668:             🛑 Terminate Process
+ 669:           </button>` : ""}
+ 670:           <button class="btn-remedy btn-allowlist" onclick="actionAllowlist('${encodeURIComponent(e.source || "")}', 'path')">
+ 671:             ✅ Add to Allowlist
+ 672:           </button>
+ 673:         </div>
+ 674:       </div>
+ 675: 
+ 676:       <div class="action-footer">
+ 677:         <button class="btn-action" onclick="copyLogJson('${encodeURIComponent(JSON.stringify(e))}')">📋 Copy JSON</button>
+ 678:         <button class="btn-action" onclick="copyText('${encodeURIComponent(e.source || "")}')">📁 Copy Source</button>
+ 679:         <button class="btn-action secondary" onclick="closeDrawer()">✕ Close</button>
+ 680:       </div>
+ 681:     `;
+ 682: 
+ 683:     stream.innerHTML = html;
+ 684:     stream.scrollTop = 0;
+ 685:   }
+ 686: 
+ 687:   function renderPagination(page, totalPages, total) {
+ 688:     currentPage = page;
+ 689:     const el = document.getElementById("pagination");
+ 690:     if (totalPages <= 1) { el.innerHTML = ""; return; }
+ 691: 
+ 692:     let html = "";
+ 693:     if (page > 1) html += `<button onclick="fetchLogs(${page-1})">‹ Prev</button>`;
+ 694:     html += `<span class="page-info">Page ${page} / ${totalPages}</span>`;
+ 695:     if (page < totalPages) html += `<button onclick="fetchLogs(${page+1})">Next ›</button>`;
+ 696:     el.innerHTML = html;
+ 697:   }
+ 698: 
+ 699:   // ── Alerts & Live Alert Inspection ───────────────────────────────────────
+ 700:   async function fetchAlerts() {
+ 701:     try {
+ 702:       const res    = await fetch("/api/alerts?limit=30");
+ 703:       const alerts = await res.json();
+ 704:       currentAlerts = alerts || [];
+ 705:       const feed   = document.getElementById("alertFeed");
+ 706:       document.getElementById("alertCount").textContent = currentAlerts.length;
+ 707: 
+ 708:       if (currentAlerts.length === 0) {
+ 709:         feed.innerHTML = `<div class="alert-empty">No alerts yet.</div>`;
+ 710:         return;
+ 711:       }
+ 712:       feed.innerHTML = currentAlerts.map((a, idx) => `
+ 713:         <div class="alert-item ${(a.level||"INFO").toLowerCase()}" onclick="inspectAlert(${idx})" title="Click to view live alert report">
+ 714:           <div class="alert-item-top">
+ 715:             <span class="alert-ts">${(a.timestamp||"").slice(0,19).replace("T"," ")}</span>
+ 716:             <span class="badge-level ${(a.level||"INFO").toLowerCase()}">${a.level||""}</span>
+ 717:           </div>
+ 718:           <div class="alert-msg">${escapeHtml(a.message||"")}</div>
+ 719:           ${a.event_data && a.event_data.source ? `<div class="alert-src mono">${truncate(a.event_data.source,36)}</div>` : ""}
+ 720:           <div class="alert-action-row">
+ 721:             <a href="javascript:void(0)" class="alert-link" onclick="event.stopPropagation(); inspectAlert(${idx})">
+ 722:               🔍 View Live Report →
+ 723:             </a>
+ 724:           </div>
+ 725:         </div>
+ 726:       `).join("");
+ 727:     } catch (e) { /* sidebar alert failure is non-critical */ }
+ 728:   }
+ 729: 
+ 730:   function inspectAlert(alertIndex) {
+ 731:     const alertObj = currentAlerts[alertIndex];
+ 732:     if (!alertObj) return;
+ 733: 
+ 734:     let matchingIndex = -1;
+ 735:     const alertSrc = (alertObj.event_data && alertObj.event_data.source) || "";
+ 736:     const alertTs = (alertObj.timestamp || "").slice(0, 19);
+ 737: 
+ 738:     for (let i = 0; i < currentLogs.length; i++) {
+ 739:       const log = currentLogs[i];
+ 740:       if (log.source === alertSrc && (log.timestamp || "").slice(0, 19) === alertTs) {
+ 741:         matchingIndex = i;
+ 742:         break;
+ 743:       }
+ 744:     }
+ 745: 
+ 746:     if (matchingIndex === -1 && alertSrc) {
+ 747:       for (let i = 0; i < currentLogs.length; i++) {
+ 748:         if (currentLogs[i].source === alertSrc) {
+ 749:           matchingIndex = i;
+ 750:           break;
+ 751:         }
+ 752:       }
+ 753:     }
+ 754: 
+ 755:     if (matchingIndex !== -1) {
+ 756:       const tableRows = document.querySelectorAll("#logTable tbody tr");
+ 757:       const targetRow = tableRows[matchingIndex];
+ 758:       selectLogEvent(matchingIndex, targetRow);
+ 759:       if (targetRow) {
+ 760:         targetRow.scrollIntoView({ behavior: "smooth", block: "center" });
+ 761:       }
+ 762:     } else {
+ 763:       const synthEvent = {
+ 764:         timestamp: alertObj.timestamp,
+ 765:         alert_level: alertObj.level,
+ 766:         event_type: (alertObj.event_data && alertObj.event_data.event_type) || "ALERT",
+ 767:         source: alertSrc || "Unknown Source",
+ 768:         destination: (alertObj.event_data && alertObj.event_data.destination) || "",
+ 769:         user: (alertObj.event_data && alertObj.event_data.user) || "N/A",
+ 770:         process: (alertObj.event_data && alertObj.event_data.process) || "N/A",
+ 771:         hash_pre: (alertObj.event_data && alertObj.event_data.hash_pre) || "N/A",
+ 772:         hash_post: (alertObj.event_data && alertObj.event_data.hash_post) || "N/A",
+ 773:         integrity_status: (alertObj.event_data && alertObj.event_data.integrity_status) || "TAMPERED",
+ 774:         hash_algorithm: "SHA256",
+ 775:         diff: alertObj.event_data && alertObj.event_data.diff,
+ 776:       };
+ 777:       selectedEventId = synthEvent.timestamp + synthEvent.source;
+ 778:       document.getElementById("mainLayout").classList.add("drawer-open");
+ 779:       const fileName = getBasename(synthEvent.source);
+ 780:       document.getElementById("drawerSub").textContent = `LIVE ALERT • ${fileName}`;
+ 781:       renderChatReport(synthEvent);
+ 782:     }
+ 783:   }
+ 784: 
+ 785:   // ── Utilities ────────────────────────────────────────────────────────────
+ 786:   function truncate(str, n) {
+ 787:     if (!str) return "—";
+ 788:     return str.length > n ? "…" + str.slice(-(n-1)) : str;
+ 789:   }
+ 790: 
+ 791:   function shortHash(h) {
+ 792:     if (!h || h === "N/A") return "N/A";
+ 793:     return h.length > 12 ? h.slice(0, 8) + "…" + h.slice(-4) : h;
+ 794:   }
+ 795: 
+ 796:   function getBasename(path) {
+ 797:     if (!path) return "Unknown File";
+ 798:     const parts = path.split(/[\/\\]/);
+ 799:     return parts[parts.length - 1] || path;
+ 800:   }
+ 801: 
+ 802:   function formatVaultTime(ts) {
+ 803:     if (!ts) return "—";
+ 804:     if (typeof ts === "number") {
+ 805:       return new Date(ts * 1000).toLocaleString();
+ 806:     }
+ 807:     const d = new Date(ts);
+ 808:     if (!isNaN(d.getTime())) {
+ 809:       return d.toLocaleString();
+ 810:     }
+ 811:     return String(ts).replace("T", " ").slice(0, 19);
+ 812:   }
+ 813: 
+ 814:   function formatBytes(bytes) {
+ 815:     if (!bytes || bytes === 0) return "0 B";
+ 816:     const k = 1024;
+ 817:     const sizes = ["B", "KB", "MB", "GB"];
+ 818:     const i = Math.floor(Math.log(bytes) / Math.log(k));
+ 819:     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+ 820:   }
+ 821: 
+ 822:   function escapeQuotes(str) {
+ 823:     return str.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+ 824:   }
+ 825: 
+ 826:   function escapeHtml(str) {
+ 827:     if (str === null || str === undefined) return "";
+ 828:     return String(str)
+ 829:       .replace(/&/g, "&amp;")
+ 830:       .replace(/</g, "&lt;")
+ 831:       .replace(/>/g, "&gt;")
+ 832:       .replace(/"/g, "&quot;")
+ 833:       .replace(/'/g, "&#039;");
+ 834:   }
+ 835: 
+ 836:   function copyLogJson(jsonStr) {
+ 837:     try {
+ 838:       const parsed = JSON.parse(decodeURIComponent(jsonStr));
+ 839:       navigator.clipboard.writeText(JSON.stringify(parsed, null, 2));
+ 840:       alert("✓ Log JSON copied to clipboard!");
+ 841:     } catch (e) {
+ 842:       console.error(e);
+ 843:     }
+ 844:   }
+ 845: 
+ 846:   function copyText(encodedTxt) {
+ 847:     const txt = decodeURIComponent(encodedTxt || "");
+ 848:     navigator.clipboard.writeText(txt);
+ 849:     alert("✓ Copied to clipboard:\n" + txt);
+ 850:   }
+ 851: 
+ 852:   function setConnected(ok) {
+ 853:     isConnected = ok;
+ 854:     document.getElementById("statusDot").className   = "status-dot " + (ok ? "online" : "offline");
+ 855:     document.getElementById("statusLabel").textContent = ok ? "Monitoring Active" : "Disconnected";
+ 856:   }
+ 857: 
+ 858:   // ── Search / filter listeners ─────────────────────────────────────────────
+ 859:   let searchDebounce;
+ 860:   document.getElementById("searchInput").addEventListener("input", () => {
+ 861:     clearTimeout(searchDebounce);
+ 862:     searchDebounce = setTimeout(() => fetchLogs(1), 400);
+ 863:   });
+ 864:   document.getElementById("levelFilter").addEventListener("change", () => fetchLogs(1));
+ 865:   document.getElementById("fileTypeFilter").addEventListener("change", () => fetchLogs(1));
+ 866: 
+ 867:   // ── Auto-refresh every 5 seconds ──────────────────────────────────────────
+ 868:   function startRefresh() {
+ 869:     fetchAll();
+ 870:     refreshTimer = setInterval(fetchAll, 5000);
+ 871:   }
+ 872: 
+ 873:   // ── SOC Remediation Handlers ─────────────────────────────────────────────
+ 874:   async function actionQuarantine(encodedFilePath) {
+ 875:     const filePath = decodeURIComponent(encodedFilePath || "");
+ 876:     if (!filePath || filePath === "—") {
+ 877:       alert("⚠️ No valid file path associated with this event.");
+ 878:       return;
  879:     }
- 880:   }
- 881: 
- 882:   async function actionTerminate(pid, encodedProcName) {
- 883:     const procName = decodeURIComponent(encodedProcName || "");
- 884:     if (!pid || pid <= 4) {
- 885:       alert("No valid process PID available for termination.");
- 886:       return;
- 887:     }
- 888:     if (!confirm(`⚠️ CRITICAL SOC ACTION:\nTerminate process "${procName}" (PID: ${pid})?`)) return;
- 889:     try {
- 890:       const res = await fetch("/api/action/terminate", {
- 891:         method: "POST",
- 892:         headers: { "Content-Type": "application/json" },
- 893:         body: JSON.stringify({ pid: pid })
- 894:       });
- 895:       const data = await res.json();
- 896:       if (res.ok && data.success) {
- 897:         alert(`✓ Process ${pid} (${procName}) terminated successfully.`);
- 898:       } else {
- 899:         alert(`⚠️ Termination failed: ${data.error || "Could not terminate process."}`);
- 900:       }
- 901:     } catch (e) {
- 902:       alert(`⚠️ Terminate request failed: ${e.message}`);
- 903:     }
- 904:   }
- 905: 
- 906:   async function actionAllowlist(encodedEntry, entryType = "path") {
- 907:     const entry = decodeURIComponent(encodedEntry || "");
- 908:     if (!entry) return;
- 909:     if (!confirm(`Add ${entryType} to Allowlist to suppress future alerts?\n\n${entry}`)) return;
- 910:     try {
- 911:       const res = await fetch("/api/action/allowlist", {
- 912:         method: "POST",
- 913:         headers: { "Content-Type": "application/json" },
- 914:         body: JSON.stringify({ entry: entry, type: entryType, entry_type: entryType, reason: "Added from Incident Drawer" })
- 915:       });
- 916:       const data = await res.json();
- 917:       if (res.ok && data.success) {
- 918:         alert(`✓ Entry added to Allowlist.`);
- 919:       } else {
- 920:         alert(`⚠️ Could not add to allowlist: ${data.error || "Unknown error"}`);
- 921:       }
- 922:     } catch (e) {
- 923:       alert(`⚠️ Allowlist request failed: ${e.message}`);
- 924:     }
- 925:   }
- 926: 
- 927:   // ── Monitored Directories Modal & Browsing Handlers ───────────────────────
- 928:   let browserCurrentDir = "";
- 929:   let browserParentDir  = "";
- 930: 
- 931:   async function openDirectoriesModal() {
- 932:     document.getElementById("dirsModal").style.display = "flex";
- 933:     loadDirectories();
- 934:   }
- 935: 
- 936:   function closeDirectoriesModal() {
- 937:     document.getElementById("dirsModal").style.display = "none";
- 938:     document.getElementById("dirsFeedback").style.display = "none";
- 939:     const panel = document.getElementById("browserPanel");
- 940:     if (panel) panel.style.display = "none";
- 941:   }
- 942: 
- 943:   async function loadDirectories() {
- 944:     const listEl = document.getElementById("dirsList");
- 945:     try {
- 946:       const res = await fetch("/api/directories");
- 947:       const data = await res.json();
- 948:       const dirs = data.directories || [];
- 949:       if (dirs.length === 0) {
- 950:         listEl.innerHTML = `<div class="text-muted" style="padding: 10px; font-size: 12px;">No custom directories monitored yet.</div>`;
- 951:         return;
- 952:       }
- 953:       listEl.innerHTML = dirs.map(d => {
- 954:         const pathStr = typeof d === "string" ? d : (d.path || "");
- 955:         const isCustom = typeof d === "object" ? d.is_custom : true;
- 956:         const isActive = typeof d === "object" ? d.is_active : true;
- 957:         const encodedPath = encodeURIComponent(pathStr);
- 958:         return `
- 959:           <div class="modal-item">
- 960:             <div style="display:flex; flex-direction:column; gap:2px; flex:1; min-width:0;">
- 961:               <span class="modal-item-path" title="${escapeHtml(pathStr)}">${escapeHtml(pathStr)}</span>
- 962:               <div style="display:flex; gap:6px; font-size:10.5px;">
- 963:                 <span class="badge-status ${isActive ? 'active' : 'inactive'}">${isActive ? '● Active' : '○ Inactive'}</span>
- 964:                 ${isCustom ? '<span class="badge-tag">Custom</span>' : '<span class="badge-tag default">Default</span>'}
- 965:               </div>
- 966:             </div>
- 967:             ${isCustom ? `<button class="btn-item-del" onclick="removeDirectory('${encodedPath}')" title="Stop monitoring this folder">🗑️ Remove</button>` : `<span style="font-size:11px; color:var(--text-muted); padding:3px 6px;">Protected</span>`}
- 968:           </div>
- 969:         `;
- 970:       }).join("");
- 971:     } catch (e) {
- 972:       listEl.innerHTML = `<div class="text-crit" style="padding: 10px; font-size: 12px;">Failed to load directories: ${escapeHtml(e.message)}</div>`;
- 973:     }
- 974:   }
- 975: 
- 976:   function toggleFolderBrowser() {
- 977:     const panel = document.getElementById("browserPanel");
- 978:     if (panel.style.display === "none" || !panel.style.display) {
- 979:       panel.style.display = "flex";
- 980:       const existing = document.getElementById("newDirInput").value.trim();
- 981:       browseDirectory(existing || "");
- 982:     } else {
- 983:       panel.style.display = "none";
- 984:     }
- 985:   }
- 986: 
- 987:   async function browseDirectory(path = "") {
- 988:     const currentPathEl = document.getElementById("browserCurrentPath");
- 989:     const subfoldersEl  = document.getElementById("browserSubfolders");
- 990:     const quickBarEl    = document.getElementById("browserQuickBar");
- 991:     const upBtn         = document.getElementById("browserUpBtn");
- 992:     const useBtn        = document.getElementById("btnUseFolder");
- 993: 
- 994:     subfoldersEl.innerHTML = `<div class="text-muted" style="padding:6px; font-size:11px;">Scanning directories…</div>`;
- 995: 
- 996:     try {
- 997:       const url = path ? `/api/browse-directory?path=${encodeURIComponent(path)}` : `/api/browse-directory`;
- 998:       const res = await fetch(url);
- 999:       const data = await res.json();
-1000: 
-1001:       if (!res.ok) {
-1002:         subfoldersEl.innerHTML = `<div class="text-crit" style="padding:6px; font-size:11px;">${escapeHtml(data.error || "Cannot access folder")}</div>`;
-1003:         return;
-1004:       }
-1005: 
-1006:       browserCurrentDir = data.current || "";
-1007:       browserParentDir  = data.parent || "";
-1008: 
-1009:       currentPathEl.textContent = browserCurrentDir || "System Drives & User Folders";
-1010:       upBtn.disabled = !browserCurrentDir;
-1011:       upBtn.style.opacity = browserCurrentDir ? "1" : "0.5";
+ 880:     if (!confirm(`Are you sure you want to isolate & quarantine this file?\n\n${filePath}`)) return;
+ 881:     try {
+ 882:       const res = await fetch("/api/action/quarantine", {
+ 883:         method: "POST",
+ 884:         headers: { "Content-Type": "application/json" },
+ 885:         body: JSON.stringify({ source: filePath, file_path: filePath, path: filePath })
+ 886:       });
+ 887:       const data = await res.json();
+ 888:       if (res.ok && data.success) {
+ 889:         alert(`✓ File successfully moved to Quarantine Vault:\nVault: ${data.quarantined_path || data.quarantine_vault_path || data.message}`);
+ 890:         fetchAll();
+ 891:       } else {
+ 892:         alert(`⚠️ Quarantine failed: ${data.error || "Unknown error"}`);
+ 893:       }
+ 894:     } catch (e) {
+ 895:       alert(`⚠️ Quarantine request failed: ${e.message}`);
+ 896:     }
+ 897:   }
+ 898: 
+ 899:   async function actionTerminate(pid, encodedProcName) {
+ 900:     const procName = decodeURIComponent(encodedProcName || "");
+ 901:     if (!pid || pid <= 4) {
+ 902:       alert("No valid process PID available for termination.");
+ 903:       return;
+ 904:     }
+ 905:     if (!confirm(`⚠️ CRITICAL SOC ACTION:\nTerminate process "${procName}" (PID: ${pid})?`)) return;
+ 906:     try {
+ 907:       const res = await fetch("/api/action/terminate", {
+ 908:         method: "POST",
+ 909:         headers: { "Content-Type": "application/json" },
+ 910:         body: JSON.stringify({ pid: pid })
+ 911:       });
+ 912:       const data = await res.json();
+ 913:       if (res.ok && data.success) {
+ 914:         alert(`✓ Process ${pid} (${procName}) terminated successfully.`);
+ 915:       } else {
+ 916:         alert(`⚠️ Termination failed: ${data.error || "Could not terminate process."}`);
+ 917:       }
+ 918:     } catch (e) {
+ 919:       alert(`⚠️ Terminate request failed: ${e.message}`);
+ 920:     }
+ 921:   }
+ 922: 
+ 923:   async function actionAllowlist(encodedEntry, entryType = "path") {
+ 924:     const entry = decodeURIComponent(encodedEntry || "");
+ 925:     if (!entry) return;
+ 926:     if (!confirm(`Add ${entryType} to Allowlist to suppress future alerts?\n\n${entry}`)) return;
+ 927:     try {
+ 928:       const res = await fetch("/api/action/allowlist", {
+ 929:         method: "POST",
+ 930:         headers: { "Content-Type": "application/json" },
+ 931:         body: JSON.stringify({ entry: entry, type: entryType, entry_type: entryType, reason: "Added from Incident Drawer" })
+ 932:       });
+ 933:       const data = await res.json();
+ 934:       if (res.ok && data.success) {
+ 935:         alert(`✓ Entry added to Allowlist.`);
+ 936:       } else {
+ 937:         alert(`⚠️ Could not add to allowlist: ${data.error || "Unknown error"}`);
+ 938:       }
+ 939:     } catch (e) {
+ 940:       alert(`⚠️ Allowlist request failed: ${e.message}`);
+ 941:     }
+ 942:   }
+ 943: 
+ 944:   // ── Monitored Directories Modal & Browsing Handlers ───────────────────────
+ 945:   let browserCurrentDir = "";
+ 946:   let browserParentDir  = "";
+ 947: 
+ 948:   async function openDirectoriesModal() {
+ 949:     document.getElementById("dirsModal").style.display = "flex";
+ 950:     loadDirectories();
+ 951:   }
+ 952: 
+ 953:   function closeDirectoriesModal() {
+ 954:     document.getElementById("dirsModal").style.display = "none";
+ 955:     document.getElementById("dirsFeedback").style.display = "none";
+ 956:     const panel = document.getElementById("browserPanel");
+ 957:     if (panel) panel.style.display = "none";
+ 958:   }
+ 959: 
+ 960:   async function loadDirectories() {
+ 961:     const listEl = document.getElementById("dirsList");
+ 962:     try {
+ 963:       const res = await fetch("/api/directories");
+ 964:       const data = await res.json();
+ 965:       const dirs = data.directories || [];
+ 966:       if (dirs.length === 0) {
+ 967:         listEl.innerHTML = `<div class="text-muted" style="padding: 10px; font-size: 12px;">No custom directories monitored yet.</div>`;
+ 968:         return;
+ 969:       }
+ 970:       listEl.innerHTML = dirs.map(d => {
+ 971:         const pathStr = typeof d === "string" ? d : (d.path || "");
+ 972:         const isCustom = typeof d === "object" ? d.is_custom : true;
+ 973:         const isActive = typeof d === "object" ? d.is_active : true;
+ 974:         const encodedPath = encodeURIComponent(pathStr);
+ 975:         return `
+ 976:           <div class="modal-item">
+ 977:             <div style="display:flex; flex-direction:column; gap:2px; flex:1; min-width:0;">
+ 978:               <span class="modal-item-path" title="${escapeHtml(pathStr)}">${escapeHtml(pathStr)}</span>
+ 979:               <div style="display:flex; gap:6px; font-size:10.5px;">
+ 980:                 <span class="badge-status ${isActive ? 'active' : 'inactive'}">${isActive ? '● Active' : '○ Inactive'}</span>
+ 981:                 ${isCustom ? '<span class="badge-tag">Custom</span>' : '<span class="badge-tag default">Default</span>'}
+ 982:               </div>
+ 983:             </div>
+ 984:             ${isCustom ? `<button class="btn-item-del" onclick="removeDirectory('${encodedPath}')" title="Stop monitoring this folder">🗑️ Remove</button>` : `<span style="font-size:11px; color:var(--text-muted); padding:3px 6px;">Protected</span>`}
+ 985:           </div>
+ 986:         `;
+ 987:       }).join("");
+ 988:     } catch (e) {
+ 989:       listEl.innerHTML = `<div class="text-crit" style="padding: 10px; font-size: 12px;">Failed to load directories: ${escapeHtml(e.message)}</div>`;
+ 990:     }
+ 991:   }
+ 992: 
+ 993:   function toggleFolderBrowser() {
+ 994:     const panel = document.getElementById("browserPanel");
+ 995:     if (panel.style.display === "none" || !panel.style.display) {
+ 996:       panel.style.display = "flex";
+ 997:       const existing = document.getElementById("newDirInput").value.trim();
+ 998:       browseDirectory(existing || "");
+ 999:     } else {
+1000:       panel.style.display = "none";
+1001:     }
+1002:   }
+1003: 
+1004:   async function browseDirectory(path = "") {
+1005:     const currentPathEl = document.getElementById("browserCurrentPath");
+1006:     const subfoldersEl  = document.getElementById("browserSubfolders");
+1007:     const quickBarEl    = document.getElementById("browserQuickBar");
+1008:     const upBtn         = document.getElementById("browserUpBtn");
+1009:     const useBtn        = document.getElementById("btnUseFolder");
+1010: 
+1011:     subfoldersEl.innerHTML = `<div class="text-muted" style="padding:6px; font-size:11px;">Scanning directory…</div>`;
 1012: 
-1013:       // Render Quick Picks (Drives + Common User Folders)
-1014:       if (data.drives && data.drives.length > 0) {
-1015:         let quickHtml = "";
-1016:         data.drives.forEach(drv => {
-1017:           quickHtml += `<button type="button" class="browser-quick-pill" onclick="browseDirectory('${encodeURIComponent(drv)}')">💾 ${escapeHtml(drv)}</button>`;
-1018:         });
-1019:         if (data.folders && !path) {
-1020:           data.folders.forEach(f => {
-1021:             const name = getBasename(f);
-1022:             quickHtml += `<button type="button" class="browser-quick-pill" onclick="browseDirectory('${encodeURIComponent(f)}')">📁 ${escapeHtml(name)}</button>`;
-1023:           });
-1024:         }
-1025:         quickBarEl.innerHTML = quickHtml;
-1026:         quickBarEl.style.display = "flex";
-1027:       } else if (!path) {
-1028:         quickBarEl.style.display = "none";
-1029:       }
-1030: 
-1031:       // Render Subfolders
-1032:       const folders = data.folders || [];
-1033:       if (folders.length === 0) {
-1034:         subfoldersEl.innerHTML = `<div class="text-muted" style="padding:6px; font-size:11px;">No subdirectories found.</div>`;
-1035:       } else {
-1036:         subfoldersEl.innerHTML = folders.map(f => {
-1037:           const name = getBasename(f);
-1038:           const encodedF = encodeURIComponent(f);
-1039:           return `
-1040:             <div class="browser-folder-item" onclick="browseDirectory('${encodedF}')">
-1041:               <span>📁</span>
-1042:               <span class="mono" title="${escapeHtml(f)}">${escapeHtml(name)}</span>
-1043:             </div>
-1044:           `;
-1045:         }).join("");
-1046:       }
-1047: 
-1048:       // Update Use Button
-1049:       if (browserCurrentDir) {
-1050:         useBtn.disabled = false;
-1051:         useBtn.textContent = `✓ Use: ${getBasename(browserCurrentDir)}`;
-1052:       } else {
-1053:         useBtn.disabled = true;
-1054:         useBtn.textContent = `Select a folder above`;
-1055:       }
-1056:     } catch (e) {
-1057:       subfoldersEl.innerHTML = `<div class="text-crit" style="padding:6px; font-size:11px;">Error browsing directory: ${escapeHtml(e.message)}</div>`;
-1058:     }
-1059:   }
+1013:     try {
+1014:       const url = path ? `/api/browse-directory?path=${encodeURIComponent(path)}` : `/api/browse-directory`;
+1015:       const res = await fetch(url);
+1016:       const data = await res.json();
+1017: 
+1018:       if (!res.ok) {
+1019:         subfoldersEl.innerHTML = `<div class="text-crit" style="padding:6px; font-size:11px;">${escapeHtml(data.error || "Cannot access folder")}</div>`;
+1020:         return;
+1021:       }
+1022: 
+1023:       browserCurrentDir = data.current || "";
+1024:       browserParentDir  = data.parent || "";
+1025: 
+1026:       currentPathEl.textContent = browserCurrentDir || "System Drives & User Folders";
+1027:       upBtn.disabled = !browserCurrentDir;
+1028:       upBtn.style.opacity = browserCurrentDir ? "1" : "0.5";
+1029: 
+1030:       // Render Quick Picks (Drives + Common User Folders)
+1031:       if (data.drives && data.drives.length > 0) {
+1032:         let quickHtml = "";
+1033:         data.drives.forEach(drv => {
+1034:           quickHtml += `<button type="button" class="browser-quick-pill" onclick="browseDirectory('${encodeURIComponent(drv)}')">💾 ${escapeHtml(drv)}</button>`;
+1035:         });
+1036:         if (data.folders && !path) {
+1037:           data.folders.forEach(f => {
+1038:             const fPath = typeof f === "object" ? f.path : f;
+1039:             const fName = typeof f === "object" ? f.name : getBasename(fPath);
+1040:             quickHtml += `<button type="button" class="browser-quick-pill" onclick="browseDirectory('${encodeURIComponent(fPath)}')">📁 ${escapeHtml(fName)}</button>`;
+1041:           });
+1042:         }
+1043:         quickBarEl.innerHTML = quickHtml;
+1044:         quickBarEl.style.display = "flex";
+1045:       } else if (!path) {
+1046:         quickBarEl.style.display = "none";
+1047:       }
+1048: 
+1049:       // Render Subfolders and Files
+1050:       const folders = data.folders || [];
+1051:       const files   = data.files || [];
+1052: 
+1053:       if (folders.length === 0 && files.length === 0) {
+1054:         subfoldersEl.innerHTML = `<div class="text-muted" style="padding:10px; font-size:11px; text-align:center;">This folder is empty.</div>`;
+1055:       } else {
+1056:         let itemsHtml = "";
+1057:         if (browserCurrentDir) {
+1058:           itemsHtml += `<div class="browser-summary-badge">📁 ${folders.length} folder${folders.length === 1 ? '' : 's'}, 📄 ${files.length} file${files.length === 1 ? '' : 's'}</div>`;
+1059:         }
 1060: 
-1061:   function navigateBrowserUp() {
-1062:     browseDirectory(browserParentDir);
-1063:   }
-1064: 
-1065:   function selectCurrentBrowserFolder() {
-1066:     if (!browserCurrentDir) return;
-1067:     document.getElementById("newDirInput").value = browserCurrentDir;
-1068:     document.getElementById("browserPanel").style.display = "none";
-1069:   }
-1070: 
-1071:   async function addDirectory() {
-1072:     const input = document.getElementById("newDirInput");
-1073:     const dir = input.value.trim();
-1074:     const fb = document.getElementById("dirsFeedback");
-1075:     if (!dir) return;
-1076:     try {
-1077:       const res = await fetch("/api/directories/add", {
-1078:         method: "POST",
-1079:         headers: { "Content-Type": "application/json" },
-1080:         body: JSON.stringify({ directory: dir, path: dir })
-1081:       });
-1082:       const data = await res.json();
-1083:       if (res.ok && data.success) {
-1084:         fb.textContent = `✓ Added: ${dir}`;
-1085:         fb.className = "modal-feedback success";
-1086:         input.value = "";
-1087:         const panel = document.getElementById("browserPanel");
-1088:         if (panel) panel.style.display = "none";
-1089:         loadDirectories();
-1090:       } else {
-1091:         fb.textContent = `⚠️ Error: ${data.error || "Failed to add directory"}`;
-1092:         fb.className = "modal-feedback error";
-1093:       }
-1094:     } catch (e) {
-1095:       fb.textContent = `⚠️ Network error: ${e.message}`;
-1096:       fb.className = "modal-feedback error";
-1097:     }
-1098:   }
-1099: 
-1100:   async function removeDirectory(encodedDir) {
-1101:     const dir = decodeURIComponent(encodedDir || "");
-1102:     if (!confirm(`Stop monitoring folder?\n${dir}`)) return;
-1103:     try {
-1104:       const res = await fetch("/api/directories/remove", {
-1105:         method: "POST",
-1106:         headers: { "Content-Type": "application/json" },
-1107:         body: JSON.stringify({ directory: dir, path: dir })
-1108:       });
-1109:       const data = await res.json();
-1110:       if (res.ok && data.success) {
-1111:         loadDirectories();
-1112:       } else {
-1113:         alert(`⚠️ Error: ${data.error || "Failed to remove directory"}`);
-1114:       }
-1115:     } catch (e) {
-1116:       alert(`⚠️ Network error: ${e.message}`);
-1117:     }
-1118:   }
-1119: 
-1120:   // ── Quarantine Vault Modal Handlers ───────────────────────────────────────
-1121:   async function openVaultModal() {
-1122:     document.getElementById("vaultModal").style.display = "flex";
-1123:     loadVault();
-1124:   }
-1125: 
-1126:   function closeVaultModal() {
-1127:     document.getElementById("vaultModal").style.display = "none";
-1128:   }
-1129: 
-1130:   async function loadVault() {
-1131:     const listEl = document.getElementById("vaultList");
-1132:     try {
-1133:       const res = await fetch("/api/quarantine");
-1134:       const data = await res.json();
-1135:       const files = data.vault || data.quarantined_files || [];
-1136:       if (files.length === 0) {
-1137:         listEl.innerHTML = `<div class="text-muted" style="padding: 12px; font-size: 12px; text-align: center;">Quarantine Vault is currently empty.</div>`;
-1138:         return;
-1139:       }
-1140:       listEl.innerHTML = files.map(f => `
-1141:         <div class="modal-item" style="flex-direction: column; align-items: flex-start; gap: 4px;">
-1142:           <div style="display: flex; justify-content: space-between; width: 100%;">
-1143:             <strong style="color: #ff7b72; font-size: 12px;">${escapeHtml(getBasename(f.original_path))}</strong>
-1144:             <span style="font-size: 10.5px; color: var(--text-muted);">${(f.quarantined_at||"").replace("T"," ").slice(0,19)}</span>
-1145:           </div>
-1146:           <div class="mono" style="font-size: 11px; color: var(--text-secondary); word-break: break-all;">Original: ${escapeHtml(f.original_path)}</div>
-1147:           <div class="mono" style="font-size: 10.5px; color: var(--text-muted);">Vault: ${escapeHtml(f.quarantine_path)}</div>
-1148:         </div>
-1149:       `).join("");
-1150:     } catch (e) {
-1151:       listEl.innerHTML = `<div class="text-crit" style="padding: 10px; font-size: 12px;">Failed to load vault records.</div>`;
-1152:     }
-1153:   }
-1154: 
-1155:   startRefresh();
-1156: </script>
-1157: 
-1158: <!-- ═════════════════════════════ MODALS ══════════════════════════════════ -->
-1159: <!-- Monitored Directories Modal -->
-1160: <div class="modal-backdrop" id="dirsModal" style="display: none;" onclick="if(event.target===this) closeDirectoriesModal()">
-1161:   <div class="modal-box" style="width: 620px;">
-1162:     <div class="modal-header">
-1163:       <div class="modal-title">📁 Manage Monitored Directories</div>
-1164:       <button class="modal-close" onclick="closeDirectoriesModal()">✕</button>
-1165:     </div>
-1166:     <div class="modal-body">
-1167:       <div class="modal-section-title">Active Monitored Directories</div>
-1168:       <div class="modal-list" id="dirsList">
-1169:         <div class="text-muted">Loading monitored directories…</div>
-1170:       </div>
-1171:       
-1172:       <div class="modal-section-title" style="margin-top: 14px;">Add New Monitored Directory</div>
-1173:       <div class="modal-add-form">
-1174:         <input type="text" id="newDirInput" class="modal-input" placeholder="Type path or click Browse below..." />
-1175:         <button class="btn-modal-browse" type="button" onclick="toggleFolderBrowser()">📁 Browse...</button>
-1176:         <button class="btn-modal-add" type="button" onclick="addDirectory()">➕ Add Folder</button>
-1177:       </div>
-1178: 
-1179:       <!-- Interactive Folder Browser Drawer / Panel -->
-1180:       <div id="browserPanel" class="browser-panel" style="display: none;">
-1181:         <div class="browser-header">
-1182:           <span class="browser-title">📂 Folder Browser</span>
-1183:           <button class="btn-browser-nav" id="browserUpBtn" type="button" onclick="navigateBrowserUp()" title="Go to parent directory">⬆️ Up</button>
-1184:         </div>
-1185:         <div class="browser-current-path mono" id="browserCurrentPath">Select a drive or quick folder</div>
-1186:         
-1187:         <!-- Quick Picks: Drives & User Folders -->
-1188:         <div class="browser-quick-bar" id="browserQuickBar"></div>
-1189: 
-1190:         <!-- Subfolders List -->
-1191:         <div class="browser-subfolder-list" id="browserSubfolders"></div>
-1192: 
-1193:         <div class="browser-footer">
-1194:           <button class="btn-use-folder" id="btnUseFolder" type="button" onclick="selectCurrentBrowserFolder()">✓ Use This Folder</button>
-1195:         </div>
-1196:       </div>
-1197: 
-1198:       <div class="modal-feedback" id="dirsFeedback"></div>
-1199:     </div>
-1200:     <div class="modal-footer">
-1201:       <button class="btn-action secondary" onclick="closeDirectoriesModal()">Close</button>
-1202:     </div>
-1203:   </div>
-1204: </div>
-1205: 
-1206: <!-- Quarantine Vault Modal -->
-1207: <div class="modal-backdrop" id="vaultModal" style="display: none;" onclick="if(event.target===this) closeVaultModal()">
-1208:   <div class="modal-box">
-1209:     <div class="modal-header">
-1210:       <div class="modal-title">🛡️ Quarantined Files Vault</div>
-1211:       <button class="modal-close" onclick="closeVaultModal()">✕</button>
-1212:     </div>
-1213:     <div class="modal-body">
-1214:       <div class="modal-section-title">Quarantined File Records</div>
-1215:       <div class="modal-list" id="vaultList">
-1216:         <div class="text-muted">Loading vault…</div>
-1217:       </div>
-1218:     </div>
-1219:     <div class="modal-footer">
-1220:       <button class="btn-action secondary" onclick="closeVaultModal()">Close</button>
-1221:     </div>
-1222:   </div>
-1223: </div>
-1224: 
-1225: </body>
-1226: </html>
+1061:         // Subfolders
+1062:         folders.forEach(f => {
+1063:           const fPath = typeof f === "object" ? f.path : f;
+1064:           const fName = typeof f === "object" ? f.name : getBasename(fPath);
+1065:           const encodedF = encodeURIComponent(fPath);
+1066:           itemsHtml += `
+1067:             <div class="browser-folder-item" onclick="browseDirectory('${encodedF}')" title="Open ${escapeHtml(fPath)}">
+1068:               <span>📁</span>
+1069:               <span class="mono" style="font-weight:600;">${escapeHtml(fName)}/</span>
+1070:             </div>
+1071:           `;
+1072:         });
+1073: 
+1074:         // Files
+1075:         files.forEach(f => {
+1076:           const fPath = f.path;
+1077:           const fName = f.name;
+1078:           const fSize = formatBytes(f.size);
+1079:           itemsHtml += `
+1080:             <div class="browser-file-item" title="${escapeHtml(fPath)}">
+1081:               <div class="browser-file-left">
+1082:                 <span>📄</span>
+1083:                 <span class="mono browser-file-name">${escapeHtml(fName)}</span>
+1084:               </div>
+1085:               <span class="browser-file-size">${fSize}</span>
+1086:             </div>
+1087:           `;
+1088:         });
+1089: 
+1090:         subfoldersEl.innerHTML = itemsHtml;
+1091:       }
+1092: 
+1093:       // Update Use Button
+1094:       if (browserCurrentDir) {
+1095:         useBtn.disabled = false;
+1096:         useBtn.textContent = `✓ Use: ${getBasename(browserCurrentDir)}`;
+1097:       } else {
+1098:         useBtn.disabled = true;
+1099:         useBtn.textContent = `Select a folder above`;
+1100:       }
+1101:     } catch (e) {
+1102:       subfoldersEl.innerHTML = `<div class="text-crit" style="padding:6px; font-size:11px;">Error browsing directory: ${escapeHtml(e.message)}</div>`;
+1103:     }
+1104:   }
+1105: 
+1106:   function navigateBrowserUp() {
+1107:     browseDirectory(browserParentDir);
+1108:   }
+1109: 
+1110:   function selectCurrentBrowserFolder() {
+1111:     if (!browserCurrentDir) return;
+1112:     document.getElementById("newDirInput").value = browserCurrentDir;
+1113:     document.getElementById("browserPanel").style.display = "none";
+1114:   }
+1115: 
+1116:   async function addDirectory() {
+1117:     const input = document.getElementById("newDirInput");
+1118:     const dir = input.value.trim();
+1119:     const fb = document.getElementById("dirsFeedback");
+1120:     if (!dir) return;
+1121:     try {
+1122:       const res = await fetch("/api/directories/add", {
+1123:         method: "POST",
+1124:         headers: { "Content-Type": "application/json" },
+1125:         body: JSON.stringify({ directory: dir, path: dir })
+1126:       });
+1127:       const data = await res.json();
+1128:       if (res.ok && data.success) {
+1129:         fb.textContent = `✓ Added: ${dir}`;
+1130:         fb.className = "modal-feedback success";
+1131:         input.value = "";
+1132:         const panel = document.getElementById("browserPanel");
+1133:         if (panel) panel.style.display = "none";
+1134:         loadDirectories();
+1135:       } else {
+1136:         fb.textContent = `⚠️ Error: ${data.error || "Failed to add directory"}`;
+1137:         fb.className = "modal-feedback error";
+1138:       }
+1139:     } catch (e) {
+1140:       fb.textContent = `⚠️ Network error: ${e.message}`;
+1141:       fb.className = "modal-feedback error";
+1142:     }
+1143:   }
+1144: 
+1145:   async function removeDirectory(encodedDir) {
+1146:     const dir = decodeURIComponent(encodedDir || "");
+1147:     if (!confirm(`Stop monitoring folder?\n${dir}`)) return;
+1148:     try {
+1149:       const res = await fetch("/api/directories/remove", {
+1150:         method: "POST",
+1151:         headers: { "Content-Type": "application/json" },
+1152:         body: JSON.stringify({ directory: dir, path: dir })
+1153:       });
+1154:       const data = await res.json();
+1155:       if (res.ok && data.success) {
+1156:         loadDirectories();
+1157:       } else {
+1158:         alert(`⚠️ Error: ${data.error || "Failed to remove directory"}`);
+1159:       }
+1160:     } catch (e) {
+1161:       alert(`⚠️ Network error: ${e.message}`);
+1162:     }
+1163:   }
+1164: 
+1165:   // ── Quarantine Vault Modal Handlers ───────────────────────────────────────
+1166:   async function openVaultModal() {
+1167:     document.getElementById("vaultModal").style.display = "flex";
+1168:     loadVault();
+1169:   }
+1170: 
+1171:   function closeVaultModal() {
+1172:     document.getElementById("vaultModal").style.display = "none";
+1173:   }
+1174: 
+1175:   async function openVaultInExplorer() {
+1176:     try {
+1177:       const res = await fetch("/api/quarantine/open-folder", { method: "POST" });
+1178:       const data = await res.json();
+1179:       if (!data.success) {
+1180:         alert("Could not open folder in Explorer: " + (data.error || "Unknown error"));
+1181:       }
+1182:     } catch (e) {
+1183:       alert("Request failed: " + e.message);
+1184:     }
+1185:   }
+1186: 
+1187:   async function restoreQuarantinedFile(recordId, encodedOrigPath) {
+1188:     const origPath = decodeURIComponent(encodedOrigPath || "");
+1189:     if (!confirm(`Are you sure you want to restore this quarantined file back to its original location?\n\n${origPath}`)) return;
+1190:     try {
+1191:       const res = await fetch("/api/quarantine/restore", {
+1192:         method: "POST",
+1193:         headers: { "Content-Type": "application/json" },
+1194:         body: JSON.stringify({ id: recordId })
+1195:       });
+1196:       const data = await res.json();
+1197:       if (res.ok && data.success) {
+1198:         alert(data.message || "✓ File restored successfully.");
+1199:         loadVault();
+1200:         fetchAll();
+1201:       } else {
+1202:         alert(`⚠️ Restore failed: ${data.error || "Unknown error"}`);
+1203:       }
+1204:     } catch (e) {
+1205:       alert(`⚠️ Restore request failed: ${e.message}`);
+1206:     }
+1207:   }
+1208: 
+1209:   async function loadVault() {
+1210:     const listEl = document.getElementById("vaultList");
+1211:     const dirEl  = document.getElementById("vaultDirPath");
+1212:     try {
+1213:       const res = await fetch("/api/quarantine");
+1214:       const data = await res.json();
+1215:       if (dirEl && data.quarantine_dir) {
+1216:         dirEl.textContent = data.quarantine_dir;
+1217:       }
+1218:       const files = data.vault || data.quarantined_files || [];
+1219:       if (files.length === 0) {
+1220:         listEl.innerHTML = `<div class="text-muted" style="padding: 18px; font-size: 12px; text-align: center;">🛡️ Quarantine Vault is currently empty.<br><span style="font-size:11px; color:var(--text-muted);">Suspicious files isolated via the Incident Drawer will appear here.</span></div>`;
+1221:         return;
+1222:       }
+1223:       listEl.innerHTML = files.map(f => {
+1224:         const origPath = f.original_path || "";
+1225:         const vaultPath = f.quarantined_path || f.quarantine_path || "";
+1226:         const fileName = getBasename(origPath);
+1227:         const dateStr = formatVaultTime(f.quarantined_at);
+1228:         const sizeStr = f.file_size ? formatBytes(f.file_size) : "";
+1229:         const hashStr = f.file_hash ? shortHash(f.file_hash) : "";
+1230:         const encodedOrig = encodeURIComponent(origPath);
+1231: 
+1232:         return `
+1233:           <div class="modal-item vault-modal-item">
+1234:             <div class="vault-item-top">
+1235:               <div class="vault-item-name-group">
+1236:                 <span class="vault-item-icon">⚠️</span>
+1237:                 <strong class="vault-item-name" title="${escapeHtml(origPath)}">${escapeHtml(fileName)}</strong>
+1238:                 ${sizeStr ? `<span class="badge-tag">${sizeStr}</span>` : ""}
+1239:                 ${hashStr ? `<span class="badge-tag mono">${hashStr}</span>` : ""}
+1240:               </div>
+1241:               <span class="vault-item-time">${dateStr}</span>
+1242:             </div>
+1243:             <div class="vault-item-meta mono">
+1244:               <span class="vault-label">Original:</span>
+1245:               <span class="vault-val" title="${escapeHtml(origPath)}">${escapeHtml(origPath)}</span>
+1246:             </div>
+1247:             <div class="vault-item-meta mono">
+1248:               <span class="vault-label">Vault:</span>
+1249:               <span class="vault-val text-muted" title="${escapeHtml(vaultPath)}">${escapeHtml(vaultPath)}</span>
+1250:             </div>
+1251:             <div class="vault-item-actions">
+1252:               <button class="btn-restore-file" type="button" onclick="restoreQuarantinedFile(${f.id}, '${encodedOrig}')" title="Restore this file to its original path">
+1253:                 ↩️ Restore File
+1254:               </button>
+1255:             </div>
+1256:           </div>
+1257:         `;
+1258:       }).join("");
+1259:     } catch (e) {
+1260:       listEl.innerHTML = `<div class="text-crit" style="padding: 10px; font-size: 12px;">Failed to load vault records: ${escapeHtml(e.message)}</div>`;
+1261:     }
+1262:   }
+1263: 
+1264:   startRefresh();
+1265: </script>
+1266: 
+1267: <!-- ═════════════════════════════ MODALS ══════════════════════════════════ -->
+1268: <!-- Monitored Directories Modal -->
+1269: <div class="modal-backdrop" id="dirsModal" style="display: none;" onclick="if(event.target===this) closeDirectoriesModal()">
+1270:   <div class="modal-box" style="width: 620px;">
+1271:     <div class="modal-header">
+1272:       <div class="modal-title">📁 Manage Monitored Directories</div>
+1273:       <button class="modal-close" onclick="closeDirectoriesModal()">✕</button>
+1274:     </div>
+1275:     <div class="modal-body">
+1276:       <div class="modal-section-title">Active Monitored Directories</div>
+1277:       <div class="modal-list" id="dirsList">
+1278:         <div class="text-muted">Loading monitored directories…</div>
+1279:       </div>
+1280:       
+1281:       <div class="modal-section-title" style="margin-top: 14px;">Add New Monitored Directory</div>
+1282:       <div class="modal-add-form">
+1283:         <input type="text" id="newDirInput" class="modal-input" placeholder="Type path or click Browse below..." />
+1284:         <button class="btn-modal-browse" type="button" onclick="toggleFolderBrowser()">📁 Browse...</button>
+1285:         <button class="btn-modal-add" type="button" onclick="addDirectory()">➕ Add Folder</button>
+1286:       </div>
+1287: 
+1288:       <!-- Interactive Folder Browser Drawer / Panel -->
+1289:       <div id="browserPanel" class="browser-panel" style="display: none;">
+1290:         <div class="browser-header">
+1291:           <span class="browser-title">📂 Folder Browser</span>
+1292:           <button class="btn-browser-nav" id="browserUpBtn" type="button" onclick="navigateBrowserUp()" title="Go to parent directory">⬆️ Up</button>
+1293:         </div>
+1294:         <div class="browser-current-path mono" id="browserCurrentPath">Select a drive or quick folder</div>
+1295:         
+1296:         <!-- Quick Picks: Drives & User Folders -->
+1297:         <div class="browser-quick-bar" id="browserQuickBar"></div>
+1298: 
+1299:         <!-- Subfolders List -->
+1300:         <div class="browser-subfolder-list" id="browserSubfolders"></div>
+1301: 
+1302:         <div class="browser-footer">
+1303:           <button class="btn-use-folder" id="btnUseFolder" type="button" onclick="selectCurrentBrowserFolder()">✓ Use This Folder</button>
+1304:         </div>
+1305:       </div>
+1306: 
+1307:       <div class="modal-feedback" id="dirsFeedback"></div>
+1308:     </div>
+1309:     <div class="modal-footer">
+1310:       <button class="btn-action secondary" onclick="closeDirectoriesModal()">Close</button>
+1311:     </div>
+1312:   </div>
+1313: </div>
+1314: 
+1315: <!-- Quarantine Vault Modal -->
+1316: <div class="modal-backdrop" id="vaultModal" style="display: none;" onclick="if(event.target===this) closeVaultModal()">
+1317:   <div class="modal-box" style="width: 640px;">
+1318:     <div class="modal-header">
+1319:       <div class="modal-title">🛡️ Quarantined Files Vault</div>
+1320:       <button class="modal-close" onclick="closeVaultModal()">✕</button>
+1321:     </div>
+1322:     <div class="modal-body">
+1323:       <!-- Vault Storage Location Banner & Explorer Button -->
+1324:       <div class="vault-info-banner">
+1325:         <div class="vault-path-box">
+1326:           <span class="vault-path-label">Storage Location:</span>
+1327:           <span class="vault-path-text mono" id="vaultDirPath">Loading vault path…</span>
+1328:         </div>
+1329:         <button class="btn-open-vault" type="button" onclick="openVaultInExplorer()" title="Open quarantine vault folder in Windows File Explorer">
+1330:           📂 Open in File Explorer
+1331:         </button>
+1332:       </div>
+1333: 
+1334:       <div class="modal-section-title" style="margin-top: 8px;">Quarantined File Records</div>
+1335:       <div class="modal-list" id="vaultList" style="max-height: 320px;">
+1336:         <div class="text-muted">Loading vault…</div>
+1337:       </div>
+1338:     </div>
+1339:     <div class="modal-footer">
+1340:       <button class="btn-action secondary" onclick="closeVaultModal()">Close</button>
+1341:     </div>
+1342:   </div>
+1343: </div>
+1344: 
+1345: </body>
+1346: </html>
 </file>
 
 <file path="dashboard/app.py">
@@ -6416,408 +7041,290 @@ This section contains the contents of the repository's files.
  43:       - directory:  Filter by directory path substring
  44:       - start_time: ISO start timestamp filter (e.g. 2026-10-27T14:00)
  45:       - end_time:   ISO end timestamp filter (e.g. 2026-10-27T18:00)
- 46:       - page:       Page number (1-indexed)
- 47:     """
- 48:     level      = request.args.get("level", "").upper() or None
- 49:     keyword    = request.args.get("keyword", "") or None
- 50:     sort_by    = request.args.get("sort_by", "timestamp")
- 51:     order      = request.args.get("order", "desc").lower()
- 52:     file_type  = request.args.get("file_type", "") or None
- 53:     directory  = request.args.get("directory", "") or None
- 54:     start_time = request.args.get("start_time", "") or None
- 55:     end_time   = request.args.get("end_time", "") or None
- 56:     page       = max(1, int(request.args.get("page", 1)))
- 57: 
- 58:     entries = logger.load_logs(
- 59:         level_filter=level,
- 60:         keyword=keyword,
- 61:         sort_by=sort_by,
- 62:         order=order,
- 63:         file_type=file_type,
- 64:         directory=directory,
- 65:         start_time=start_time,
- 66:         end_time=end_time,
- 67:     )
- 68:     total = len(entries)
- 69:     start = (page - 1) * LOGS_PER_PAGE
- 70:     end   = start + LOGS_PER_PAGE
- 71:     page_entries = entries[start:end]
- 72: 
- 73:     return jsonify({
- 74:         "logs":        page_entries,
- 75:         "total":       total,
- 76:         "page":        page,
- 77:         "per_page":    LOGS_PER_PAGE,
- 78:         "total_pages": max(1, (total + LOGS_PER_PAGE - 1) // LOGS_PER_PAGE),
- 79:         "sort_by":     sort_by,
- 80:         "order":       order,
- 81:     })
- 82: 
- 83: 
- 84: @app.route("/api/stats")
- 85: def api_stats():
- 86:     """Return summary statistics."""
- 87:     return jsonify(logger.get_stats())
- 88: 
- 89: 
- 90: @app.route("/api/alerts")
- 91: def api_alerts():
- 92:     """Return the most recent alerts."""
- 93:     limit  = int(request.args.get("limit", 30))
- 94:     alerts = alerter.load_alerts(limit=limit)
- 95:     return jsonify(list(reversed(alerts)))  # Most recent first
- 96: 
- 97: 
- 98: # ── Directory Management Endpoints ───────────────────────────────────────────
- 99: 
-100: @app.route("/api/directories", methods=["GET"])
-101: def api_get_directories():
-102:     """Return active and configured monitored directories."""
-103:     monitor = get_active_monitor()
-104:     if monitor:
-105:         dirs = monitor.get_monitored_directories()
-106:     else:
-107:         db_dirs = db.get_monitored_directories()
-108:         dirs = [{"path": p, "is_active": True, "is_custom": True} for p in db_dirs]
-109:     return jsonify({"directories": dirs})
+ 46:       - timeframe:  Quick timeframe preset ('1h', '24h', '7d', 'all')
+ 47:       - page:       Page number (1-indexed)
+ 48:     """
+ 49:     level      = request.args.get("level", "").upper() or None
+ 50:     keyword    = request.args.get("keyword", "") or None
+ 51:     sort_by    = request.args.get("sort_by", "timestamp")
+ 52:     order      = request.args.get("order", "desc").lower()
+ 53:     file_type  = request.args.get("file_type", "") or None
+ 54:     directory  = request.args.get("directory", "") or None
+ 55:     start_time = request.args.get("start_time", "") or None
+ 56:     end_time   = request.args.get("end_time", "") or None
+ 57:     timeframe  = request.args.get("timeframe", "") or None
+ 58:     page       = max(1, int(request.args.get("page", 1)))
+ 59: 
+ 60:     entries = logger.load_logs(
+ 61:         level_filter=level,
+ 62:         keyword=keyword,
+ 63:         sort_by=sort_by,
+ 64:         order=order,
+ 65:         file_type=file_type,
+ 66:         directory=directory,
+ 67:         start_time=start_time,
+ 68:         end_time=end_time,
+ 69:         timeframe=timeframe,
+ 70:     )
+ 71:     total = len(entries)
+ 72:     start = (page - 1) * LOGS_PER_PAGE
+ 73:     end   = start + LOGS_PER_PAGE
+ 74:     page_entries = entries[start:end]
+ 75: 
+ 76:     return jsonify({
+ 77:         "logs":        page_entries,
+ 78:         "total":       total,
+ 79:         "page":        page,
+ 80:         "per_page":    LOGS_PER_PAGE,
+ 81:         "total_pages": max(1, (total + LOGS_PER_PAGE - 1) // LOGS_PER_PAGE),
+ 82:         "sort_by":     sort_by,
+ 83:         "order":       order,
+ 84:     })
+ 85: 
+ 86: 
+ 87: @app.route("/api/stats")
+ 88: def api_stats():
+ 89:     """Return summary statistics filtered by timeframe/search."""
+ 90:     timeframe  = request.args.get("timeframe", "") or None
+ 91:     start_time = request.args.get("start_time", "") or None
+ 92:     end_time   = request.args.get("end_time", "") or None
+ 93:     keyword    = request.args.get("keyword", "") or None
+ 94:     file_type  = request.args.get("file_type", "") or None
+ 95:     return jsonify(logger.get_stats(
+ 96:         timeframe=timeframe,
+ 97:         start_time=start_time,
+ 98:         end_time=end_time,
+ 99:         keyword=keyword,
+100:         file_type=file_type,
+101:     ))
+102: 
+103: 
+104: @app.route("/api/alerts")
+105: def api_alerts():
+106:     """Return the most recent alerts."""
+107:     limit  = int(request.args.get("limit", 30))
+108:     alerts = alerter.load_alerts(limit=limit)
+109:     return jsonify(list(reversed(alerts)))  # Most recent first
 110: 
 111: 
-112: @app.route("/api/directories/add", methods=["POST"])
-113: def api_add_directory():
-114:     """Add and schedule a new monitored directory dynamically."""
-115:     data = request.get_json(force=True, silent=True) or {}
-116:     path = (data.get("path") or data.get("directory") or "").strip()
-117:     if not path or not os.path.isdir(path):
-118:         return jsonify({"success": False, "error": f"Invalid or non-existent directory path: '{path}'"}), 400
-119: 
-120:     monitor = get_active_monitor()
-121:     if monitor:
-122:         ok = monitor.add_directory(path)
-123:     else:
-124:         ok = db.add_monitored_directory(path)
+112: # ── Directory Management Endpoints ───────────────────────────────────────────
+113: 
+114: @app.route("/api/directories", methods=["GET"])
+115: def api_get_directories():
+116:     """Return active and configured monitored directories."""
+117:     monitor = get_active_monitor()
+118:     if monitor:
+119:         dirs = monitor.get_monitored_directories()
+120:     else:
+121:         db_dirs = db.get_monitored_directories()
+122:         dirs = [{"path": p, "is_active": True, "is_custom": True} for p in db_dirs]
+123:     return jsonify({"directories": dirs})
+124: 
 125: 
-126:     return jsonify({
-127:         "success": ok,
-128:         "message": f"Successfully registered '{path}' for real-time monitoring." if ok else "Failed to register directory."
-129:     })
-130: 
-131: 
-132: @app.route("/api/directories/remove", methods=["POST"])
-133: def api_remove_directory():
-134:     """Remove and unschedule a monitored directory."""
-135:     data = request.get_json(force=True, silent=True) or {}
-136:     path = (data.get("path") or data.get("directory") or "").strip()
-137:     if not path:
-138:         return jsonify({"success": False, "error": "Missing directory path."}), 400
+126: @app.route("/api/directories/add", methods=["POST"])
+127: def api_add_directory():
+128:     """Add and schedule a new monitored directory dynamically."""
+129:     data = request.get_json(force=True, silent=True) or {}
+130:     path = (data.get("path") or data.get("directory") or "").strip()
+131:     if not path or not os.path.isdir(path):
+132:         return jsonify({"success": False, "error": f"Invalid or non-existent directory path: '{path}'"}), 400
+133: 
+134:     monitor = get_active_monitor()
+135:     if monitor:
+136:         ok = monitor.add_directory(path)
+137:     else:
+138:         ok = db.add_monitored_directory(path)
 139: 
-140:     monitor = get_active_monitor()
-141:     if monitor:
-142:         ok = monitor.remove_directory(path)
-143:     else:
-144:         ok = db.remove_monitored_directory(path)
+140:     return jsonify({
+141:         "success": ok,
+142:         "message": f"Successfully registered '{path}' for real-time monitoring." if ok else "Failed to register directory."
+143:     })
+144: 
 145: 
-146:     return jsonify({
-147:         "success": ok,
-148:         "message": f"Successfully removed '{path}' from monitoring." if ok else "Failed to remove directory."
-149:     })
-150: 
-151: 
-152: @app.route("/api/browse-directory", methods=["GET"])
-153: def api_browse_directory():
-154:     """List child directories of a given folder or system drives for GUI browsing."""
-155:     target = request.args.get("path", "").strip()
-156:     if not target:
-157:         # Return common user roots and drive letters
-158:         import string
-159:         common = [
-160:             os.path.normpath(os.path.expanduser("~/Desktop")),
-161:             os.path.normpath(os.path.expanduser("~/Documents")),
-162:             os.path.normpath(os.path.expanduser("~/Downloads")),
-163:         ]
-164:         if sys.platform == "win32":
-165:             import ctypes
-166:             bitmask = ctypes.windll.kernel32.GetLogicalDrives()
-167:             drives = [f"{letter}:\\" for i, letter in enumerate(string.ascii_uppercase) if bitmask & (1 << i)]
-168:             return jsonify({"current": "", "parent": "", "folders": [p for p in common if os.path.isdir(p)], "drives": drives})
-169:         return jsonify({"current": "", "parent": "", "folders": [p for p in common if os.path.isdir(p)], "drives": []})
-170: 
-171:     target = os.path.normpath(target)
-172:     if not os.path.isdir(target):
-173:         return jsonify({"error": f"Path is not a valid directory: '{target}'"}), 400
-174: 
-175:     try:
-176:         subfolders = []
-177:         for name in os.listdir(target):
-178:             full = os.path.join(target, name)
-179:             if os.path.isdir(full) and not name.startswith("$") and not name.startswith("."):
-180:                 subfolders.append(os.path.normpath(full))
-181:         subfolders.sort()
-182:         parent = os.path.dirname(target) if os.path.dirname(target) != target else ""
-183:         return jsonify({"current": target, "parent": parent, "folders": subfolders[:100], "drives": []})
-184:     except Exception as e:
-185:         return jsonify({"error": str(e)}), 500
-186: 
-187: 
-188: # ── SOC One-Click Remediation Endpoints ───────────────────────────────────────
-189: 
-190: @app.route("/api/action/quarantine", methods=["POST"])
-191: def api_action_quarantine():
-192:     """Quarantine a flagged file into the encrypted vault."""
-193:     data = request.get_json(force=True, silent=True) or {}
-194:     source = (data.get("source") or data.get("file_path") or data.get("path") or "").strip()
-195:     reason = data.get("reason", "SOC Operator Manual Action")
-196:     if not source:
-197:         return jsonify({"success": False, "error": "Missing file source path"}), 400
-198: 
-199:     res = db.quarantine_file(source, reason)
-200:     if res.get("success"):
-201:         res["quarantine_vault_path"] = res.get("quarantined_path")
-202:     return jsonify(res)
-203: 
-204: 
-205: @app.route("/api/action/terminate", methods=["POST"])
-206: def api_action_terminate():
-207:     """Terminate an unapproved exfiltration process."""
-208:     data = request.get_json(force=True, silent=True) or {}
-209:     pid = data.get("pid")
-210:     if not pid:
-211:         return jsonify({"success": False, "error": "Missing process PID"}), 400
-212: 
-213:     res = process_tracker.terminate_process(int(pid))
-214:     return jsonify(res)
-215: 
-216: 
-217: @app.route("/api/action/allowlist", methods=["POST"])
-218: def api_action_allowlist():
-219:     """Add a file path, extension, or hash to the SOC allowlist."""
-220:     data = request.get_json(force=True, silent=True) or {}
-221:     entry = (data.get("entry") or data.get("path") or "").strip()
-222:     entry_type = data.get("entry_type") or data.get("type") or "path"
-223:     reason = data.get("reason", "Operator Allowed")
-224:     if not entry:
-225:         return jsonify({"success": False, "error": "Missing entry value"}), 400
-226: 
-227:     ok = db.add_to_allowlist(entry, entry_type, reason)
-228:     return jsonify({"success": ok, "message": f"Successfully added '{entry}' to allowlist."})
+146: @app.route("/api/directories/remove", methods=["POST"])
+147: def api_remove_directory():
+148:     """Remove and unschedule a monitored directory."""
+149:     data = request.get_json(force=True, silent=True) or {}
+150:     path = (data.get("path") or data.get("directory") or "").strip()
+151:     if not path:
+152:         return jsonify({"success": False, "error": "Missing directory path."}), 400
+153: 
+154:     monitor = get_active_monitor()
+155:     if monitor:
+156:         ok = monitor.remove_directory(path)
+157:     else:
+158:         ok = db.remove_monitored_directory(path)
+159: 
+160:     return jsonify({
+161:         "success": ok,
+162:         "message": f"Successfully removed '{path}' from monitoring." if ok else "Failed to remove directory."
+163:     })
+164: 
+165: 
+166: @app.route("/api/browse-directory", methods=["GET"])
+167: def api_browse_directory():
+168:     """List child directories and files of a given folder or system drives for GUI browsing."""
+169:     target = request.args.get("path", "").strip()
+170:     if not target:
+171:         # Return common user roots and drive letters
+172:         import string
+173:         common = [
+174:             os.path.normpath(os.path.expanduser("~/Desktop")),
+175:             os.path.normpath(os.path.expanduser("~/Documents")),
+176:             os.path.normpath(os.path.expanduser("~/Downloads")),
+177:         ]
+178:         if sys.platform == "win32":
+179:             import ctypes
+180:             bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+181:             drives = [f"{letter}:\\" for i, letter in enumerate(string.ascii_uppercase) if bitmask & (1 << i)]
+182:             return jsonify({
+183:                 "current": "",
+184:                 "parent": "",
+185:                 "folders": [{"name": os.path.basename(p), "path": p, "type": "folder"} for p in common if os.path.isdir(p)],
+186:                 "files": [],
+187:                 "drives": drives
+188:             })
+189:         return jsonify({
+190:             "current": "",
+191:             "parent": "",
+192:             "folders": [{"name": os.path.basename(p), "path": p, "type": "folder"} for p in common if os.path.isdir(p)],
+193:             "files": [],
+194:             "drives": []
+195:         })
+196: 
+197:     target = os.path.normpath(target)
+198:     if not os.path.isdir(target):
+199:         return jsonify({"error": f"Path is not a valid directory: '{target}'"}), 400
+200: 
+201:     try:
+202:         subfolders = []
+203:         files = []
+204:         for name in os.listdir(target):
+205:             if name.startswith("$") or name.startswith("."):
+206:                 continue
+207:             full = os.path.join(target, name)
+208:             try:
+209:                 if os.path.isdir(full):
+210:                     subfolders.append({
+211:                         "name": name,
+212:                         "path": os.path.normpath(full),
+213:                         "type": "folder"
+214:                     })
+215:                 elif os.path.isfile(full):
+216:                     size = os.path.getsize(full)
+217:                     files.append({
+218:                         "name": name,
+219:                         "path": os.path.normpath(full),
+220:                         "size": size,
+221:                         "type": "file"
+222:                     })
+223:             except (OSError, PermissionError):
+224:                 continue
+225: 
+226:         subfolders.sort(key=lambda x: x["name"].lower())
+227:         files.sort(key=lambda x: x["name"].lower())
+228:         parent = os.path.dirname(target) if os.path.dirname(target) != target else ""
 229: 
-230: 
-231: @app.route("/api/allowlist", methods=["GET"])
-232: def api_get_allowlist():
-233:     """Return all active allowlist entries."""
-234:     return jsonify({"allowlist": db.get_allowlist()})
-235: 
-236: 
-237: @app.route("/api/quarantine", methods=["GET"])
-238: def api_get_quarantine():
-239:     """Return all quarantined files in vault."""
-240:     files = db.get_quarantined_files()
-241:     return jsonify({"vault": files, "quarantined_files": files})
+230:         return jsonify({
+231:             "current": target,
+232:             "parent": parent,
+233:             "folders": subfolders[:300],
+234:             "files": files[:300],
+235:             "total_folders": len(subfolders),
+236:             "total_files": len(files),
+237:             "drives": []
+238:         })
+239:     except Exception as e:
+240:         return jsonify({"error": str(e)}), 500
+241: 
 242: 
-243: 
-244: def run_dashboard(host: str = DASHBOARD_HOST, port: int = DASHBOARD_PORT):
-245:     """Start the Flask development server (blocking call)."""
-246:     print(f"\n  Dashboard → http://{host}:{port}  (local only, no internet needed)")
-247:     app.run(host=host, port=port, debug=DASHBOARD_DEBUG, use_reloader=False)
-</file>
-
-<file path="hasher.py">
-  1: """
-  2: hasher.py - File Integrity Hashing Module
-  3: Uses Python's built-in hashlib — no installation required.
-  4: Supports SHA256, SHA512, MD5, and Sparse Tri-Point Hashing for large files (>50MB),
-  5: with Windows file-lock retry backoff and persistent SQLite baseline database.
-  6: """
-  7: 
-  8: from __future__ import annotations
-  9: 
- 10: import hashlib
- 11: import os
- 12: import time
- 13: from config import HASH_ALGORITHM, HASH_CHUNK_SIZE
- 14: import db
- 15: 
- 16: # Sparse hashing threshold: 50 MB
- 17: SPARSE_HASH_THRESHOLD = 50 * 1024 * 1024
- 18: SPARSE_CHUNK_SIZE = 1024 * 1024  # 1 MB
- 19: 
- 20: # In-memory snapshot: {filepath: hash_digest}
- 21: _hash_snapshot: dict[str, str] = {}
- 22: 
- 23: # In-memory baseline cache: {norm_path: hash_digest}
- 24: _baseline_hashes: dict[str, str] = {}
- 25: 
- 26: 
- 27: def compute_hash(
- 28:     filepath: str,
- 29:     algorithm: str = HASH_ALGORITHM,
- 30:     retries: int = 3,
- 31:     retry_delay: float = 0.05,
- 32:     force_full: bool = False,
- 33: ) -> str | None:
- 34:     """
- 35:     Compute cryptographic hash of a file.
- 36:     Uses sparse tri-point hashing for files > 50MB to prevent I/O lockups,
- 37:     and includes automated retry backoff to handle transient Windows write locks.
- 38: 
- 39:     Args:
- 40:         filepath:    Absolute path to the file.
- 41:         algorithm:   Hash algorithm name ('sha256', 'sha512', 'md5').
- 42:         retries:     Number of retry attempts if file is temporarily locked.
- 43:         retry_delay: Initial delay in seconds between retries.
- 44:         force_full:  If True, forces full byte hashing even for large files.
- 45: 
- 46:     Returns:
- 47:         Hex digest string, or None if the file cannot be read.
- 48:     """
- 49:     if not filepath:
- 50:         return None
- 51: 
- 52:     for attempt in range(max(1, retries)):
- 53:         try:
- 54:             if not os.path.exists(filepath):
- 55:                 return None
- 56: 
- 57:             file_size = os.path.getsize(filepath)
- 58: 
- 59:             # Sparse Hashing Optimization for Large Files (>50 MB)
- 60:             if not force_full and file_size > SPARSE_HASH_THRESHOLD:
- 61:                 return _compute_sparse_hash(filepath, file_size, algorithm)
- 62: 
- 63:             # Standard Full Hash for normal files
- 64:             h = hashlib.new(algorithm)
- 65:             with open(filepath, "rb") as f:
- 66:                 while chunk := f.read(HASH_CHUNK_SIZE):
- 67:                     h.update(chunk)
- 68:             return h.hexdigest()
- 69: 
- 70:         except PermissionError:
- 71:             # Windows file locking (WinError 32) during active application flush
- 72:             if attempt < retries - 1:
- 73:                 time.sleep(retry_delay * (attempt + 1))
- 74:             else:
- 75:                 return None
- 76:         except (FileNotFoundError, OSError, ValueError):
- 77:             return None
- 78:     return None
- 79: 
- 80: 
- 81: def _compute_sparse_hash(filepath: str, file_size: int, algorithm: str) -> str:
- 82:     """
- 83:     Compute a fast sparse tri-point hash:
- 84:     Samples 1 MB from header, 1 MB from midpoint, and 1 MB from footer,
- 85:     combined with file size and modification time.
- 86:     """
- 87:     h = hashlib.new(algorithm)
- 88:     mtime = os.path.getmtime(filepath)
- 89:     h.update(f"SPARSE_V1:{file_size}:{mtime}:".encode("utf-8"))
- 90: 
- 91:     with open(filepath, "rb") as f:
- 92:         # 1. Header chunk (1 MB)
- 93:         h.update(f.read(SPARSE_CHUNK_SIZE))
- 94: 
- 95:         # 2. Middle chunk (1 MB)
- 96:         mid_offset = max(0, (file_size // 2) - (SPARSE_CHUNK_SIZE // 2))
- 97:         f.seek(mid_offset)
- 98:         h.update(f.read(SPARSE_CHUNK_SIZE))
- 99: 
-100:         # 3. Footer chunk (1 MB)
-101:         tail_offset = max(0, file_size - SPARSE_CHUNK_SIZE)
-102:         f.seek(tail_offset)
-103:         h.update(f.read(SPARSE_CHUNK_SIZE))
-104: 
-105:     return h.hexdigest()
-106: 
-107: 
-108: def verify_integrity(pre_hash: str | None, post_hash: str | None) -> tuple[bool, str]:
-109:     """
-110:     Compare pre- and post-transfer hashes.
-111: 
-112:     Returns:
-113:         (True, "INTACT")       if hashes match
-114:         (False, "TAMPERED")    if hashes differ
-115:         (False, "UNAVAILABLE") if either hash is None
-116:     """
-117:     if pre_hash is None or post_hash is None:
-118:         return False, "UNAVAILABLE"
-119:     if pre_hash == post_hash:
-120:         return True, "INTACT"
-121:     return False, "TAMPERED"
-122: 
-123: 
-124: def snapshot_file(filepath: str) -> str | None:
-125:     """Compute and store hash of a file in memory snapshot and persistent database."""
-126:     digest = compute_hash(filepath)
-127:     if digest:
-128:         _hash_snapshot[filepath] = digest
-129:         set_baseline_hash(filepath, digest)
-130:     return digest
-131: 
-132: 
-133: def check_against_snapshot(filepath: str) -> tuple[bool, str, str | None, str | None]:
-134:     pre_hash = _hash_snapshot.get(filepath) or get_baseline_hash(filepath)
-135:     post_hash = compute_hash(filepath)
-136:     ok, status = verify_integrity(pre_hash, post_hash)
-137:     return ok, status, pre_hash, post_hash
-138: 
-139: 
-140: def clear_snapshot(filepath: str = None):
-141:     if filepath:
-142:         _hash_snapshot.pop(filepath, None)
-143:     else:
-144:         _hash_snapshot.clear()
-145: 
-146: 
-147: def get_snapshot() -> dict:
-148:     return dict(_hash_snapshot)
-149: 
-150: 
-151: # ── Baseline Registry Functions (Dual Memory & SQLite Persistence) ───────────
-152: 
-153: def set_baseline_hash(filepath: str, digest: str | None = None) -> str | None:
-154:     """Store or update the baseline hash in memory and persistent SQLite."""
-155:     if not filepath:
-156:         return None
-157:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
-158:     if digest is None:
-159:         digest = compute_hash(filepath)
-160:     if digest:
-161:         _baseline_hashes[norm] = digest
-162:         size = 0
-163:         mtime = 0.0
-164:         try:
-165:             if os.path.exists(filepath):
-166:                 size = os.path.getsize(filepath)
-167:                 mtime = os.path.getmtime(filepath)
-168:         except OSError:
-169:             pass
-170:         db.set_baseline(filepath, digest, size, mtime)
-171:     return digest
-172: 
-173: 
-174: def get_baseline_hash(filepath: str) -> str | None:
-175:     """Retrieve the last recorded baseline hash (memory cache with SQLite fallback)."""
-176:     if not filepath:
-177:         return None
-178:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
-179:     cached = _baseline_hashes.get(norm)
-180:     if cached:
-181:         return cached
-182: 
-183:     # Persistent SQLite lookup
-184:     row = db.get_baseline(filepath)
-185:     if row and row.get("hash"):
-186:         _baseline_hashes[norm] = row["hash"]
-187:         return row["hash"]
-188:     return None
-189: 
-190: 
-191: def remove_baseline_hash(filepath: str) -> str | None:
-192:     """Remove a file from baseline memory cache and persistent SQLite."""
-193:     if not filepath:
-194:         return None
-195:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
-196:     db.remove_baseline(filepath)
-197:     return _baseline_hashes.pop(norm, None)
+243: # ── SOC One-Click Remediation Endpoints ───────────────────────────────────────
+244: 
+245: @app.route("/api/action/quarantine", methods=["POST"])
+246: def api_action_quarantine():
+247:     """Quarantine a flagged file into the encrypted vault."""
+248:     data = request.get_json(force=True, silent=True) or {}
+249:     source = (data.get("source") or data.get("file_path") or data.get("path") or "").strip()
+250:     reason = data.get("reason", "SOC Operator Manual Action")
+251:     if not source:
+252:         return jsonify({"success": False, "error": "Missing file source path"}), 400
+253: 
+254:     res = db.quarantine_file(source, reason)
+255:     if res.get("success"):
+256:         res["quarantine_vault_path"] = res.get("quarantined_path")
+257:     return jsonify(res)
+258: 
+259: 
+260: @app.route("/api/action/terminate", methods=["POST"])
+261: def api_action_terminate():
+262:     """Terminate an unapproved exfiltration process."""
+263:     data = request.get_json(force=True, silent=True) or {}
+264:     pid = data.get("pid")
+265:     if not pid:
+266:         return jsonify({"success": False, "error": "Missing process PID"}), 400
+267: 
+268:     res = process_tracker.terminate_process(int(pid))
+269:     return jsonify(res)
+270: 
+271: 
+272: @app.route("/api/action/allowlist", methods=["POST"])
+273: def api_action_allowlist():
+274:     """Add a file path, extension, or hash to the SOC allowlist."""
+275:     data = request.get_json(force=True, silent=True) or {}
+276:     entry = (data.get("entry") or data.get("path") or "").strip()
+277:     entry_type = data.get("entry_type") or data.get("type") or "path"
+278:     reason = data.get("reason", "Operator Allowed")
+279:     if not entry:
+280:         return jsonify({"success": False, "error": "Missing entry value"}), 400
+281: 
+282:     ok = db.add_to_allowlist(entry, entry_type, reason)
+283:     return jsonify({"success": ok, "message": f"Successfully added '{entry}' to allowlist."})
+284: 
+285: 
+286: @app.route("/api/allowlist", methods=["GET"])
+287: def api_get_allowlist():
+288:     """Return all active allowlist entries."""
+289:     return jsonify({"allowlist": db.get_allowlist()})
+290: 
+291: 
+292: @app.route("/api/quarantine", methods=["GET"])
+293: def api_get_quarantine():
+294:     """Return all quarantined files in vault along with vault directory."""
+295:     files = db.get_quarantined_files()
+296:     return jsonify({
+297:         "vault": files,
+298:         "quarantined_files": files,
+299:         "quarantine_dir": db.QUARANTINE_DIR
+300:     })
+301: 
+302: 
+303: @app.route("/api/quarantine/restore", methods=["POST"])
+304: def api_restore_quarantine():
+305:     """Restore a quarantined file back to its original location."""
+306:     data = request.get_json(force=True, silent=True) or {}
+307:     record_id = data.get("id")
+308:     if not record_id:
+309:         return jsonify({"success": False, "error": "Missing record ID"}), 400
+310:     res = db.restore_quarantined_file(int(record_id))
+311:     return jsonify(res)
+312: 
+313: 
+314: @app.route("/api/quarantine/open-folder", methods=["POST"])
+315: def api_open_quarantine_folder():
+316:     """Open the quarantine vault folder in Windows Explorer."""
+317:     try:
+318:         if sys.platform == "win32":
+319:             os.startfile(db.QUARANTINE_DIR)
+320:             return jsonify({"success": True})
+321:         return jsonify({"success": False, "error": "Folder viewing is only supported on Windows."})
+322:     except Exception as e:
+323:         return jsonify({"success": False, "error": str(e)})
+324: 
+325: 
+326: def run_dashboard(host: str = DASHBOARD_HOST, port: int = DASHBOARD_PORT):
+327:     """Start the Flask development server (blocking call)."""
+328:     print(f"\n  Dashboard → http://{host}:{port}  (local only, no internet needed)")
+329:     app.run(host=host, port=port, debug=DASHBOARD_DEBUG, use_reloader=False)
 </file>
 
 <file path="monitor.py">

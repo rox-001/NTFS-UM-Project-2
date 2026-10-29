@@ -214,7 +214,10 @@
   // ── Stats ────────────────────────────────────────────────────────────────
   async function fetchStats() {
     try {
-      const res  = await fetch("/api/stats");
+      let url = `/api/stats?timeframe=${encodeURIComponent(activeTimePreset)}`;
+      if (activeStartTime) url += `&start_time=${encodeURIComponent(activeStartTime)}`;
+      if (activeEndTime)   url += `&end_time=${encodeURIComponent(activeEndTime)}`;
+      const res  = await fetch(url);
       const data = await res.json();
       document.getElementById("statTotal").textContent    = data.total    ?? 0;
       document.getElementById("statInfo").textContent     = data.info     ?? 0;
@@ -275,22 +278,10 @@
     const customRow = document.getElementById("customTimeRow");
     if (preset !== "custom") {
       customRow.style.display = "none";
-    }
-
-    const now = new Date();
-    if (preset === "all") {
       activeStartTime = null;
       activeEndTime = null;
-    } else if (preset === "1h") {
-      activeStartTime = new Date(now.getTime() - 3600 * 1000).toISOString();
-      activeEndTime = null;
-    } else if (preset === "24h") {
-      activeStartTime = new Date(now.getTime() - 24 * 3600 * 1000).toISOString();
-      activeEndTime = null;
-    } else if (preset === "7d") {
-      activeStartTime = new Date(now.getTime() - 7 * 24 * 3600 * 1000).toISOString();
-      activeEndTime = null;
     }
+    fetchStats();
     fetchLogs(1);
   }
 
@@ -308,8 +299,10 @@
   function applyCustomTime() {
     const startVal = document.getElementById("startTimeInput").value;
     const endVal = document.getElementById("endTimeInput").value;
-    activeStartTime = startVal ? new Date(startVal).toISOString() : null;
-    activeEndTime = endVal ? new Date(endVal).toISOString() : null;
+    activeStartTime = startVal || null;
+    activeEndTime = endVal || null;
+    activeTimePreset = "custom";
+    fetchStats();
     fetchLogs(1);
   }
 
@@ -324,7 +317,7 @@
     const level    = document.getElementById("levelFilter").value;
     const fileType = document.getElementById("fileTypeFilter").value;
     const keyword  = document.getElementById("searchInput").value.trim();
-    let url = `/api/logs?page=${page}&sort_by=${encodeURIComponent(currentSortBy)}&order=${encodeURIComponent(currentOrder)}`;
+    let url = `/api/logs?page=${page}&sort_by=${encodeURIComponent(currentSortBy)}&order=${encodeURIComponent(currentOrder)}&timeframe=${encodeURIComponent(activeTimePreset)}`;
     if (level)    url += `&level=${encodeURIComponent(level)}`;
     if (fileType) url += `&file_type=${encodeURIComponent(fileType)}`;
     if (keyword)  url += `&keyword=${encodeURIComponent(keyword)}`;
@@ -337,8 +330,12 @@
       currentLogs = data.logs || [];
       renderLogs(currentLogs);
       renderPagination(data.page, data.total_pages, data.total);
+      const tfLabel = activeTimePreset === '1h' ? 'Last 1 Hour' :
+                      activeTimePreset === '24h' ? 'Last 24 Hours' :
+                      activeTimePreset === '7d' ? 'Last 7 Days' :
+                      activeTimePreset === 'custom' ? 'Custom Range' : 'All Time';
       document.getElementById("tableMeta").textContent =
-        `Showing ${currentLogs.length} of ${data.total} events`;
+        `Showing ${currentLogs.length} of ${data.total} events (${tfLabel})`;
     } catch (e) {
       document.getElementById("tableMeta").textContent = "Could not load logs.";
     }
@@ -802,6 +799,26 @@
     return parts[parts.length - 1] || path;
   }
 
+  function formatVaultTime(ts) {
+    if (!ts) return "—";
+    if (typeof ts === "number") {
+      return new Date(ts * 1000).toLocaleString();
+    }
+    const d = new Date(ts);
+    if (!isNaN(d.getTime())) {
+      return d.toLocaleString();
+    }
+    return String(ts).replace("T", " ").slice(0, 19);
+  }
+
+  function formatBytes(bytes) {
+    if (!bytes || bytes === 0) return "0 B";
+    const k = 1024;
+    const sizes = ["B", "KB", "MB", "GB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+  }
+
   function escapeQuotes(str) {
     return str.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   }
@@ -991,7 +1008,7 @@
     const upBtn         = document.getElementById("browserUpBtn");
     const useBtn        = document.getElementById("btnUseFolder");
 
-    subfoldersEl.innerHTML = `<div class="text-muted" style="padding:6px; font-size:11px;">Scanning directories…</div>`;
+    subfoldersEl.innerHTML = `<div class="text-muted" style="padding:6px; font-size:11px;">Scanning directory…</div>`;
 
     try {
       const url = path ? `/api/browse-directory?path=${encodeURIComponent(path)}` : `/api/browse-directory`;
@@ -1018,8 +1035,9 @@
         });
         if (data.folders && !path) {
           data.folders.forEach(f => {
-            const name = getBasename(f);
-            quickHtml += `<button type="button" class="browser-quick-pill" onclick="browseDirectory('${encodeURIComponent(f)}')">📁 ${escapeHtml(name)}</button>`;
+            const fPath = typeof f === "object" ? f.path : f;
+            const fName = typeof f === "object" ? f.name : getBasename(fPath);
+            quickHtml += `<button type="button" class="browser-quick-pill" onclick="browseDirectory('${encodeURIComponent(fPath)}')">📁 ${escapeHtml(fName)}</button>`;
           });
         }
         quickBarEl.innerHTML = quickHtml;
@@ -1028,21 +1046,48 @@
         quickBarEl.style.display = "none";
       }
 
-      // Render Subfolders
+      // Render Subfolders and Files
       const folders = data.folders || [];
-      if (folders.length === 0) {
-        subfoldersEl.innerHTML = `<div class="text-muted" style="padding:6px; font-size:11px;">No subdirectories found.</div>`;
+      const files   = data.files || [];
+
+      if (folders.length === 0 && files.length === 0) {
+        subfoldersEl.innerHTML = `<div class="text-muted" style="padding:10px; font-size:11px; text-align:center;">This folder is empty.</div>`;
       } else {
-        subfoldersEl.innerHTML = folders.map(f => {
-          const name = getBasename(f);
-          const encodedF = encodeURIComponent(f);
-          return `
-            <div class="browser-folder-item" onclick="browseDirectory('${encodedF}')">
+        let itemsHtml = "";
+        if (browserCurrentDir) {
+          itemsHtml += `<div class="browser-summary-badge">📁 ${folders.length} folder${folders.length === 1 ? '' : 's'}, 📄 ${files.length} file${files.length === 1 ? '' : 's'}</div>`;
+        }
+
+        // Subfolders
+        folders.forEach(f => {
+          const fPath = typeof f === "object" ? f.path : f;
+          const fName = typeof f === "object" ? f.name : getBasename(fPath);
+          const encodedF = encodeURIComponent(fPath);
+          itemsHtml += `
+            <div class="browser-folder-item" onclick="browseDirectory('${encodedF}')" title="Open ${escapeHtml(fPath)}">
               <span>📁</span>
-              <span class="mono" title="${escapeHtml(f)}">${escapeHtml(name)}</span>
+              <span class="mono" style="font-weight:600;">${escapeHtml(fName)}/</span>
             </div>
           `;
-        }).join("");
+        });
+
+        // Files
+        files.forEach(f => {
+          const fPath = f.path;
+          const fName = f.name;
+          const fSize = formatBytes(f.size);
+          itemsHtml += `
+            <div class="browser-file-item" title="${escapeHtml(fPath)}">
+              <div class="browser-file-left">
+                <span>📄</span>
+                <span class="mono browser-file-name">${escapeHtml(fName)}</span>
+              </div>
+              <span class="browser-file-size">${fSize}</span>
+            </div>
+          `;
+        });
+
+        subfoldersEl.innerHTML = itemsHtml;
       }
 
       // Update Use Button
@@ -1127,28 +1172,92 @@
     document.getElementById("vaultModal").style.display = "none";
   }
 
+  async function openVaultInExplorer() {
+    try {
+      const res = await fetch("/api/quarantine/open-folder", { method: "POST" });
+      const data = await res.json();
+      if (!data.success) {
+        alert("Could not open folder in Explorer: " + (data.error || "Unknown error"));
+      }
+    } catch (e) {
+      alert("Request failed: " + e.message);
+    }
+  }
+
+  async function restoreQuarantinedFile(recordId, encodedOrigPath) {
+    const origPath = decodeURIComponent(encodedOrigPath || "");
+    if (!confirm(`Are you sure you want to restore this quarantined file back to its original location?\n\n${origPath}`)) return;
+    try {
+      const res = await fetch("/api/quarantine/restore", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: recordId })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        alert(data.message || "✓ File restored successfully.");
+        loadVault();
+        fetchAll();
+      } else {
+        alert(`⚠️ Restore failed: ${data.error || "Unknown error"}`);
+      }
+    } catch (e) {
+      alert(`⚠️ Restore request failed: ${e.message}`);
+    }
+  }
+
   async function loadVault() {
     const listEl = document.getElementById("vaultList");
+    const dirEl  = document.getElementById("vaultDirPath");
     try {
       const res = await fetch("/api/quarantine");
       const data = await res.json();
+      if (dirEl && data.quarantine_dir) {
+        dirEl.textContent = data.quarantine_dir;
+      }
       const files = data.vault || data.quarantined_files || [];
       if (files.length === 0) {
-        listEl.innerHTML = `<div class="text-muted" style="padding: 12px; font-size: 12px; text-align: center;">Quarantine Vault is currently empty.</div>`;
+        listEl.innerHTML = `<div class="text-muted" style="padding: 18px; font-size: 12px; text-align: center;">🛡️ Quarantine Vault is currently empty.<br><span style="font-size:11px; color:var(--text-muted);">Suspicious files isolated via the Incident Drawer will appear here.</span></div>`;
         return;
       }
-      listEl.innerHTML = files.map(f => `
-        <div class="modal-item" style="flex-direction: column; align-items: flex-start; gap: 4px;">
-          <div style="display: flex; justify-content: space-between; width: 100%;">
-            <strong style="color: #ff7b72; font-size: 12px;">${escapeHtml(getBasename(f.original_path))}</strong>
-            <span style="font-size: 10.5px; color: var(--text-muted);">${(f.quarantined_at||"").replace("T"," ").slice(0,19)}</span>
+      listEl.innerHTML = files.map(f => {
+        const origPath = f.original_path || "";
+        const vaultPath = f.quarantined_path || f.quarantine_path || "";
+        const fileName = getBasename(origPath);
+        const dateStr = formatVaultTime(f.quarantined_at);
+        const sizeStr = f.file_size ? formatBytes(f.file_size) : "";
+        const hashStr = f.file_hash ? shortHash(f.file_hash) : "";
+        const encodedOrig = encodeURIComponent(origPath);
+
+        return `
+          <div class="modal-item vault-modal-item">
+            <div class="vault-item-top">
+              <div class="vault-item-name-group">
+                <span class="vault-item-icon">⚠️</span>
+                <strong class="vault-item-name" title="${escapeHtml(origPath)}">${escapeHtml(fileName)}</strong>
+                ${sizeStr ? `<span class="badge-tag">${sizeStr}</span>` : ""}
+                ${hashStr ? `<span class="badge-tag mono">${hashStr}</span>` : ""}
+              </div>
+              <span class="vault-item-time">${dateStr}</span>
+            </div>
+            <div class="vault-item-meta mono">
+              <span class="vault-label">Original:</span>
+              <span class="vault-val" title="${escapeHtml(origPath)}">${escapeHtml(origPath)}</span>
+            </div>
+            <div class="vault-item-meta mono">
+              <span class="vault-label">Vault:</span>
+              <span class="vault-val text-muted" title="${escapeHtml(vaultPath)}">${escapeHtml(vaultPath)}</span>
+            </div>
+            <div class="vault-item-actions">
+              <button class="btn-restore-file" type="button" onclick="restoreQuarantinedFile(${f.id}, '${encodedOrig}')" title="Restore this file to its original path">
+                ↩️ Restore File
+              </button>
+            </div>
           </div>
-          <div class="mono" style="font-size: 11px; color: var(--text-secondary); word-break: break-all;">Original: ${escapeHtml(f.original_path)}</div>
-          <div class="mono" style="font-size: 10.5px; color: var(--text-muted);">Vault: ${escapeHtml(f.quarantine_path)}</div>
-        </div>
-      `).join("");
+        `;
+      }).join("");
     } catch (e) {
-      listEl.innerHTML = `<div class="text-crit" style="padding: 10px; font-size: 12px;">Failed to load vault records.</div>`;
+      listEl.innerHTML = `<div class="text-crit" style="padding: 10px; font-size: 12px;">Failed to load vault records: ${escapeHtml(e.message)}</div>`;
     }
   }
 
@@ -1205,14 +1314,25 @@
 
 <!-- Quarantine Vault Modal -->
 <div class="modal-backdrop" id="vaultModal" style="display: none;" onclick="if(event.target===this) closeVaultModal()">
-  <div class="modal-box">
+  <div class="modal-box" style="width: 640px;">
     <div class="modal-header">
       <div class="modal-title">🛡️ Quarantined Files Vault</div>
       <button class="modal-close" onclick="closeVaultModal()">✕</button>
     </div>
     <div class="modal-body">
-      <div class="modal-section-title">Quarantined File Records</div>
-      <div class="modal-list" id="vaultList">
+      <!-- Vault Storage Location Banner & Explorer Button -->
+      <div class="vault-info-banner">
+        <div class="vault-path-box">
+          <span class="vault-path-label">Storage Location:</span>
+          <span class="vault-path-text mono" id="vaultDirPath">Loading vault path…</span>
+        </div>
+        <button class="btn-open-vault" type="button" onclick="openVaultInExplorer()" title="Open quarantine vault folder in Windows File Explorer">
+          📂 Open in File Explorer
+        </button>
+      </div>
+
+      <div class="modal-section-title" style="margin-top: 8px;">Quarantined File Records</div>
+      <div class="modal-list" id="vaultList" style="max-height: 320px;">
         <div class="text-muted">Loading vault…</div>
       </div>
     </div>

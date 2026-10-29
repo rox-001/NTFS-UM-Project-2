@@ -346,4 +346,86 @@ class TestV2Enhancements(unittest.TestCase):
             import shutil
             shutil.rmtree(test_dir, ignore_errors=True)
 
+    def test_quarantine_and_restore_lifecycle(self):
+        """Test file quarantine and subsequent safe restoration to original location."""
+        import db
+
+        with tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".txt") as f:
+            f.write("Quarantine test payload data")
+            orig_path = f.name
+
+        try:
+            # Quarantine
+            q_res = db.quarantine_file(orig_path, reason="Automated Unit Test")
+            self.assertTrue(q_res["success"])
+            record_id = q_res["record_id"]
+            self.assertFalse(os.path.exists(orig_path))
+
+            # Verify in vault list
+            vault_list = db.get_quarantined_files()
+            self.assertTrue(any(item["id"] == record_id for item in vault_list))
+
+            # Restore
+            rest_res = db.restore_quarantined_file(record_id)
+            self.assertTrue(rest_res["success"])
+            self.assertTrue(os.path.exists(orig_path))
+
+            # Verify removed from vault
+            vault_after = db.get_quarantined_files()
+            self.assertFalse(any(item["id"] == record_id for item in vault_after))
+        finally:
+            if os.path.exists(orig_path):
+                os.unlink(orig_path)
+
+    def test_timeframe_stats_filtering(self):
+        """Test relative timeframe calculation in logger.load_logs and logger.get_stats."""
+        import json
+        import logger
+        from datetime import datetime, timedelta
+
+        orig_log = logger.AUDIT_LOG_PATH
+        test_dir = tempfile.mkdtemp(prefix="test_tf_")
+        test_file = os.path.join(test_dir, "audit.log")
+        logger.AUDIT_LOG_PATH = test_file
+
+        try:
+            now = datetime.now()
+            ts_recent = (now - timedelta(minutes=10)).isoformat()
+            ts_yesterday = (now - timedelta(hours=12)).isoformat()
+            ts_old = (now - timedelta(days=5)).isoformat()
+
+            logger.log_event("CREATED", "C:\\recent.txt", "", "user1", "p1", "", "", "INTACT", "INFO")
+            logger.log_event("MODIFIED", "C:\\yesterday.txt", "", "user2", "p2", "", "", "INTACT", "WARNING")
+            logger.log_event("DELETED", "C:\\old.txt", "", "user3", "p3", "", "", "INTACT", "CRITICAL")
+
+            # Rewrite timestamps in test file to simulate past events
+            entries = []
+            with open(test_file, "r") as f:
+                for line in f:
+                    entries.append(json.loads(line))
+            entries[0]["timestamp"] = ts_recent
+            entries[1]["timestamp"] = ts_yesterday
+            entries[2]["timestamp"] = ts_old
+
+            with open(test_file, "w") as f:
+                for e in entries:
+                    f.write(json.dumps(e) + "\n")
+
+            # 1h should only contain 1 event
+            stats_1h = logger.get_stats(timeframe="1h")
+            self.assertEqual(stats_1h["total"], 1)
+
+            # 24h should contain 2 events
+            stats_24h = logger.get_stats(timeframe="24h")
+            self.assertEqual(stats_24h["total"], 2)
+
+            # all should contain 3 events
+            stats_all = logger.get_stats(timeframe="all")
+            self.assertEqual(stats_all["total"], 3)
+        finally:
+            logger.AUDIT_LOG_PATH = orig_log
+            import shutil
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+
 

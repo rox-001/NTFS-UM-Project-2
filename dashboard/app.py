@@ -43,6 +43,7 @@ def api_logs():
       - directory:  Filter by directory path substring
       - start_time: ISO start timestamp filter (e.g. 2026-10-27T14:00)
       - end_time:   ISO end timestamp filter (e.g. 2026-10-27T18:00)
+      - timeframe:  Quick timeframe preset ('1h', '24h', '7d', 'all')
       - page:       Page number (1-indexed)
     """
     level      = request.args.get("level", "").upper() or None
@@ -53,6 +54,7 @@ def api_logs():
     directory  = request.args.get("directory", "") or None
     start_time = request.args.get("start_time", "") or None
     end_time   = request.args.get("end_time", "") or None
+    timeframe  = request.args.get("timeframe", "") or None
     page       = max(1, int(request.args.get("page", 1)))
 
     entries = logger.load_logs(
@@ -64,6 +66,7 @@ def api_logs():
         directory=directory,
         start_time=start_time,
         end_time=end_time,
+        timeframe=timeframe,
     )
     total = len(entries)
     start = (page - 1) * LOGS_PER_PAGE
@@ -83,8 +86,19 @@ def api_logs():
 
 @app.route("/api/stats")
 def api_stats():
-    """Return summary statistics."""
-    return jsonify(logger.get_stats())
+    """Return summary statistics filtered by timeframe/search."""
+    timeframe  = request.args.get("timeframe", "") or None
+    start_time = request.args.get("start_time", "") or None
+    end_time   = request.args.get("end_time", "") or None
+    keyword    = request.args.get("keyword", "") or None
+    file_type  = request.args.get("file_type", "") or None
+    return jsonify(logger.get_stats(
+        timeframe=timeframe,
+        start_time=start_time,
+        end_time=end_time,
+        keyword=keyword,
+        file_type=file_type,
+    ))
 
 
 @app.route("/api/alerts")
@@ -151,7 +165,7 @@ def api_remove_directory():
 
 @app.route("/api/browse-directory", methods=["GET"])
 def api_browse_directory():
-    """List child directories of a given folder or system drives for GUI browsing."""
+    """List child directories and files of a given folder or system drives for GUI browsing."""
     target = request.args.get("path", "").strip()
     if not target:
         # Return common user roots and drive letters
@@ -165,8 +179,20 @@ def api_browse_directory():
             import ctypes
             bitmask = ctypes.windll.kernel32.GetLogicalDrives()
             drives = [f"{letter}:\\" for i, letter in enumerate(string.ascii_uppercase) if bitmask & (1 << i)]
-            return jsonify({"current": "", "parent": "", "folders": [p for p in common if os.path.isdir(p)], "drives": drives})
-        return jsonify({"current": "", "parent": "", "folders": [p for p in common if os.path.isdir(p)], "drives": []})
+            return jsonify({
+                "current": "",
+                "parent": "",
+                "folders": [{"name": os.path.basename(p), "path": p, "type": "folder"} for p in common if os.path.isdir(p)],
+                "files": [],
+                "drives": drives
+            })
+        return jsonify({
+            "current": "",
+            "parent": "",
+            "folders": [{"name": os.path.basename(p), "path": p, "type": "folder"} for p in common if os.path.isdir(p)],
+            "files": [],
+            "drives": []
+        })
 
     target = os.path.normpath(target)
     if not os.path.isdir(target):
@@ -174,13 +200,42 @@ def api_browse_directory():
 
     try:
         subfolders = []
+        files = []
         for name in os.listdir(target):
+            if name.startswith("$") or name.startswith("."):
+                continue
             full = os.path.join(target, name)
-            if os.path.isdir(full) and not name.startswith("$") and not name.startswith("."):
-                subfolders.append(os.path.normpath(full))
-        subfolders.sort()
+            try:
+                if os.path.isdir(full):
+                    subfolders.append({
+                        "name": name,
+                        "path": os.path.normpath(full),
+                        "type": "folder"
+                    })
+                elif os.path.isfile(full):
+                    size = os.path.getsize(full)
+                    files.append({
+                        "name": name,
+                        "path": os.path.normpath(full),
+                        "size": size,
+                        "type": "file"
+                    })
+            except (OSError, PermissionError):
+                continue
+
+        subfolders.sort(key=lambda x: x["name"].lower())
+        files.sort(key=lambda x: x["name"].lower())
         parent = os.path.dirname(target) if os.path.dirname(target) != target else ""
-        return jsonify({"current": target, "parent": parent, "folders": subfolders[:100], "drives": []})
+
+        return jsonify({
+            "current": target,
+            "parent": parent,
+            "folders": subfolders[:300],
+            "files": files[:300],
+            "total_folders": len(subfolders),
+            "total_files": len(files),
+            "drives": []
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -236,9 +291,36 @@ def api_get_allowlist():
 
 @app.route("/api/quarantine", methods=["GET"])
 def api_get_quarantine():
-    """Return all quarantined files in vault."""
+    """Return all quarantined files in vault along with vault directory."""
     files = db.get_quarantined_files()
-    return jsonify({"vault": files, "quarantined_files": files})
+    return jsonify({
+        "vault": files,
+        "quarantined_files": files,
+        "quarantine_dir": db.QUARANTINE_DIR
+    })
+
+
+@app.route("/api/quarantine/restore", methods=["POST"])
+def api_restore_quarantine():
+    """Restore a quarantined file back to its original location."""
+    data = request.get_json(force=True, silent=True) or {}
+    record_id = data.get("id")
+    if not record_id:
+        return jsonify({"success": False, "error": "Missing record ID"}), 400
+    res = db.restore_quarantined_file(int(record_id))
+    return jsonify(res)
+
+
+@app.route("/api/quarantine/open-folder", methods=["POST"])
+def api_open_quarantine_folder():
+    """Open the quarantine vault folder in Windows Explorer."""
+    try:
+        if sys.platform == "win32":
+            os.startfile(db.QUARANTINE_DIR)
+            return jsonify({"success": True})
+        return jsonify({"success": False, "error": "Folder viewing is only supported on Windows."})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
 
 
 def run_dashboard(host: str = DASHBOARD_HOST, port: int = DASHBOARD_PORT):

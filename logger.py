@@ -9,7 +9,7 @@ from __future__ import annotations   # PEP 563: compatible with Python 3.7+
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from colorama import Fore, Style, init as colorama_init
 
@@ -132,6 +132,7 @@ def load_logs(
     directory: str = None,
     start_time: str = None,
     end_time: str = None,
+    timeframe: str = None,
 ) -> list[dict]:
     """
     Read and parse audit.log entries with multi-criteria filtering,
@@ -139,6 +140,22 @@ def load_logs(
     """
     if not os.path.exists(AUDIT_LOG_PATH):
         return []
+
+    # Calculate dynamic relative timeframe threshold
+    start_threshold = None
+    end_threshold = None
+
+    if timeframe == "1h":
+        start_threshold = (datetime.now() - timedelta(hours=1)).isoformat()
+    elif timeframe == "24h":
+        start_threshold = (datetime.now() - timedelta(hours=24)).isoformat()
+    elif timeframe == "7d":
+        start_threshold = (datetime.now() - timedelta(days=7)).isoformat()
+    elif start_time:
+        start_threshold = start_time.replace("Z", "").split("+")[0]
+
+    if end_time:
+        end_threshold = end_time.replace("Z", "").split("+")[0]
 
     # Parse search tokens if present in keyword (e.g. user:admin ext:pem level:crit)
     token_filters = {}
@@ -163,9 +180,9 @@ def load_logs(
                 ts = entry.get("timestamp", "")
 
                 # 1. Date/Time Window Filter
-                if start_time and ts < start_time:
+                if start_threshold and ts < start_threshold:
                     continue
-                if end_time and ts > end_time:
+                if end_threshold and ts > end_threshold:
                     continue
 
                 # 2. Alert Level Filter
@@ -286,9 +303,21 @@ def load_logs(
     return entries
 
 
-def get_stats() -> dict:
-    """Return summary statistics from the audit log."""
-    entries = load_logs()
+def get_stats(
+    start_time: str = None,
+    end_time: str = None,
+    timeframe: str = None,
+    keyword: str = None,
+    file_type: str = None,
+) -> dict:
+    """Return summary statistics from the audit log, optionally filtered by timeframe/search."""
+    entries = load_logs(
+        start_time=start_time,
+        end_time=end_time,
+        timeframe=timeframe,
+        keyword=keyword,
+        file_type=file_type,
+    )
     stats = {
         "total":              len(entries),
         "info":               sum(1 for e in entries if e.get("alert_level") == "INFO"),

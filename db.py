@@ -232,17 +232,19 @@ def quarantine_file(src_path: str, reason: str = "User Initiated Quarantine") ->
             pass
 
         with _db_lock, _get_connection() as conn:
-            conn.execute("""
+            cursor = conn.execute("""
                 INSERT INTO quarantine_vault (original_path, quarantined_path, quarantined_at, file_size, reason)
                 VALUES (?, ?, ?, ?, ?)
             """, (norm_src, dest_path, time.time(), size, reason))
             conn.commit()
+            record_id = cursor.lastrowid
 
         # Remove from baseline registry
         remove_baseline(norm_src)
 
         return {
             "success": True,
+            "record_id": record_id,
             "original_path": norm_src,
             "quarantined_path": dest_path,
             "size": size,
@@ -259,3 +261,38 @@ def get_quarantined_files() -> list[dict]:
             FROM quarantine_vault ORDER BY quarantined_at DESC
         """).fetchall()
         return [dict(r) for r in rows]
+
+
+def restore_quarantined_file(record_id: int) -> dict:
+    """Safely restore a quarantined file back to its original location."""
+    with _db_lock, _get_connection() as conn:
+        row = conn.execute("SELECT * FROM quarantine_vault WHERE id = ?", (record_id,)).fetchone()
+        if not row:
+            return {"success": False, "error": f"Quarantine record ID {record_id} not found."}
+
+        orig_path = row["original_path"]
+        vault_path = row["quarantined_path"]
+
+        if not os.path.exists(vault_path):
+            return {"success": False, "error": f"Quarantined file missing from vault: '{vault_path}'"}
+
+        try:
+            # Re-enable write permissions
+            try:
+                os.chmod(vault_path, 0o666)
+            except OSError:
+                pass
+
+            os.makedirs(os.path.dirname(orig_path), exist_ok=True)
+            shutil.move(vault_path, orig_path)
+
+            conn.execute("DELETE FROM quarantine_vault WHERE id = ?", (record_id,))
+            conn.commit()
+
+            return {
+                "success": True,
+                "original_path": orig_path,
+                "message": f"Successfully restored '{os.path.basename(orig_path)}' to its original location."
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
