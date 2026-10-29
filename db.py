@@ -210,7 +210,7 @@ def quarantine_file(src_path: str, reason: str = "User Initiated Quarantine") ->
     rename it with .quarantine extension, and make it read-only.
     """
     if not src_path or not os.path.exists(src_path):
-        return {"success": False, "error": "File does not exist"}
+        return {"success": False, "error": f"File does not exist on disk: '{src_path}'"}
 
     norm_src = os.path.normpath(os.path.abspath(src_path))
     try:

@@ -89,661 +89,6 @@ requirements.txt
 <files>
 This section contains the contents of the repository's files.
 
-<file path="db.py">
-  1: """
-  2: db.py - Persistent SQLite Database Engine for FileSentinel
-  3: Manages persistent baseline file hashes, custom monitored directories,
-  4: SOC allowlists, and quarantine vault metadata across system reboots.
-  5: """
-  6: 
-  7: import os
-  8: import sqlite3
-  9: import threading
- 10: import time
- 11: import shutil
- 12: from config import BASE_DIR
- 13: 
- 14: DATA_DIR = os.path.join(BASE_DIR, "data")
- 15: VAULT_DIR = os.path.join(BASE_DIR, "vault")
- 16: QUARANTINE_DIR = os.path.join(VAULT_DIR, "quarantine")
- 17: DB_PATH = os.path.join(DATA_DIR, "filesentinel.db")
- 18: 
- 19: os.makedirs(DATA_DIR, exist_ok=True)
- 20: os.makedirs(QUARANTINE_DIR, exist_ok=True)
- 21: 
- 22: _db_lock = threading.Lock()
- 23: 
- 24: 
- 25: def _get_connection() -> sqlite3.Connection:
- 26:     conn = sqlite3.connect(DB_PATH, timeout=10.0)
- 27:     conn.row_factory = sqlite3.Row
- 28:     return conn
- 29: 
- 30: 
- 31: def init_db():
- 32:     """Create tables and indexes if they do not exist."""
- 33:     with _db_lock, _get_connection() as conn:
- 34:         conn.execute("""
- 35:             CREATE TABLE IF NOT EXISTS baseline_hashes (
- 36:                 norm_path TEXT PRIMARY KEY,
- 37:                 hash TEXT NOT NULL,
- 38:                 size INTEGER NOT NULL,
- 39:                 mtime REAL NOT NULL,
- 40:                 updated_at REAL NOT NULL
- 41:             )
- 42:         """)
- 43:         conn.execute("""
- 44:             CREATE TABLE IF NOT EXISTS monitored_directories (
- 45:                 path TEXT PRIMARY KEY,
- 46:                 added_at REAL NOT NULL,
- 47:                 is_active INTEGER NOT NULL DEFAULT 1
- 48:             )
- 49:         """)
- 50:         conn.execute("""
- 51:             CREATE TABLE IF NOT EXISTS allowlist (
- 52:                 entry TEXT PRIMARY KEY,
- 53:                 entry_type TEXT NOT NULL,
- 54:                 reason TEXT,
- 55:                 added_at REAL NOT NULL
- 56:             )
- 57:         """)
- 58:         conn.execute("""
- 59:             CREATE TABLE IF NOT EXISTS quarantine_vault (
- 60:                 id INTEGER PRIMARY KEY AUTOINCREMENT,
- 61:                 original_path TEXT NOT NULL,
- 62:                 quarantined_path TEXT NOT NULL,
- 63:                 quarantined_at REAL NOT NULL,
- 64:                 file_size INTEGER NOT NULL,
- 65:                 original_hash TEXT,
- 66:                 reason TEXT
- 67:             )
- 68:         """)
- 69:         conn.commit()
- 70: 
- 71: 
- 72: # Initialize database schema immediately on module import
- 73: init_db()
- 74: 
- 75: 
- 76: # ── Baseline Hash Functions ──────────────────────────────────────────────────
- 77: 
- 78: def set_baseline(filepath: str, digest: str, size: int = 0, mtime: float = 0.0):
- 79:     if not filepath or not digest:
- 80:         return
- 81:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
- 82:     now = time.time()
- 83:     with _db_lock, _get_connection() as conn:
- 84:         conn.execute("""
- 85:             INSERT INTO baseline_hashes (norm_path, hash, size, mtime, updated_at)
- 86:             VALUES (?, ?, ?, ?, ?)
- 87:             ON CONFLICT(norm_path) DO UPDATE SET
- 88:                 hash = excluded.hash,
- 89:                 size = excluded.size,
- 90:                 mtime = excluded.mtime,
- 91:                 updated_at = excluded.updated_at
- 92:         """, (norm, digest, size, mtime, now))
- 93:         conn.commit()
- 94: 
- 95: 
- 96: def get_baseline(filepath: str) -> dict | None:
- 97:     if not filepath:
- 98:         return None
- 99:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
-100:     with _db_lock, _get_connection() as conn:
-101:         row = conn.execute(
-102:             "SELECT norm_path, hash, size, mtime, updated_at FROM baseline_hashes WHERE norm_path = ?",
-103:             (norm,)
-104:         ).fetchone()
-105:         if row:
-106:             return dict(row)
-107:     return None
-108: 
-109: 
-110: def remove_baseline(filepath: str):
-111:     if not filepath:
-112:         return
-113:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
-114:     with _db_lock, _get_connection() as conn:
-115:         conn.execute("DELETE FROM baseline_hashes WHERE norm_path = ?", (norm,))
-116:         conn.commit()
-117: 
-118: 
-119: def get_all_baselines() -> dict[str, str]:
-120:     with _db_lock, _get_connection() as conn:
-121:         rows = conn.execute("SELECT norm_path, hash FROM baseline_hashes").fetchall()
-122:         return {r["norm_path"]: r["hash"] for r in rows}
-123: 
-124: 
-125: # ── Monitored Directories Functions ──────────────────────────────────────────
-126: 
-127: def get_monitored_directories() -> list[str]:
-128:     with _db_lock, _get_connection() as conn:
-129:         rows = conn.execute(
-130:             "SELECT path FROM monitored_directories WHERE is_active = 1 ORDER BY path ASC"
-131:         ).fetchall()
-132:         return [r["path"] for r in rows]
-133: 
-134: 
-135: def add_monitored_directory(path: str) -> bool:
-136:     if not path or not os.path.isdir(path):
-137:         return False
-138:     norm = os.path.normpath(os.path.abspath(path))
-139:     with _db_lock, _get_connection() as conn:
-140:         conn.execute("""
-141:             INSERT INTO monitored_directories (path, added_at, is_active)
-142:             VALUES (?, ?, 1)
-143:             ON CONFLICT(path) DO UPDATE SET is_active = 1
-144:         """, (norm, time.time()))
-145:         conn.commit()
-146:     return True
-147: 
-148: 
-149: def remove_monitored_directory(path: str) -> bool:
-150:     if not path:
-151:         return False
-152:     norm = os.path.normpath(os.path.abspath(path))
-153:     with _db_lock, _get_connection() as conn:
-154:         conn.execute("DELETE FROM monitored_directories WHERE path = ?", (norm,))
-155:         conn.commit()
-156:     return True
-157: 
-158: 
-159: # ── Allowlist Functions ──────────────────────────────────────────────────────
-160: 
-161: def add_to_allowlist(entry: str, entry_type: str = "path", reason: str = "") -> bool:
-162:     if not entry:
-163:         return False
-164:     norm = os.path.normcase(os.path.normpath(entry)) if entry_type == "path" else entry.strip().lower()
-165:     with _db_lock, _get_connection() as conn:
-166:         conn.execute("""
-167:             INSERT INTO allowlist (entry, entry_type, reason, added_at)
-168:             VALUES (?, ?, ?, ?)
-169:             ON CONFLICT(entry) DO UPDATE SET reason = excluded.reason
-170:         """, (norm, entry_type, reason, time.time()))
-171:         conn.commit()
-172:     return True
-173: 
-174: 
-175: def is_allowlisted(filepath: str, digest: str = None) -> bool:
-176:     if not filepath:
-177:         return False
-178:     norm_path = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
-179:     _, ext = os.path.splitext(norm_path)
-180: 
-181:     with _db_lock, _get_connection() as conn:
-182:         # Check path
-183:         row = conn.execute("SELECT 1 FROM allowlist WHERE entry = ? AND entry_type = 'path'", (norm_path,)).fetchone()
-184:         if row:
-185:             return True
-186:         # Check extension
-187:         if ext:
-188:             row = conn.execute("SELECT 1 FROM allowlist WHERE entry = ? AND entry_type = 'ext'", (ext,)).fetchone()
-189:             if row:
-190:                 return True
-191:         # Check hash
-192:         if digest:
-193:             row = conn.execute("SELECT 1 FROM allowlist WHERE entry = ? AND entry_type = 'hash'", (digest.lower(),)).fetchone()
-194:             if row:
-195:                 return True
-196:     return False
-197: 
-198: 
-199: def get_allowlist() -> list[dict]:
-200:     with _db_lock, _get_connection() as conn:
-201:         rows = conn.execute("SELECT entry, entry_type, reason, added_at FROM allowlist ORDER BY added_at DESC").fetchall()
-202:         return [dict(r) for r in rows]
-203: 
-204: 
-205: # ── Quarantine Vault Functions ───────────────────────────────────────────────
-206: 
-207: def quarantine_file(src_path: str, reason: str = "User Initiated Quarantine") -> dict:
-208:     """
-209:     Safely relocate a file to the isolated quarantine vault,
-210:     rename it with .quarantine extension, and make it read-only.
-211:     """
-212:     if not src_path or not os.path.exists(src_path):
-213:         return {"success": False, "error": "File does not exist"}
-214: 
-215:     norm_src = os.path.normpath(os.path.abspath(src_path))
-216:     try:
-217:         size = os.path.getsize(norm_src)
-218:     except OSError:
-219:         size = 0
-220: 
-221:     basename = os.path.basename(norm_src)
-222:     ts = int(time.time())
-223:     dest_filename = f"{ts}_{basename}.quarantine"
-224:     dest_path = os.path.join(QUARANTINE_DIR, dest_filename)
-225: 
-226:     try:
-227:         shutil.move(norm_src, dest_path)
-228:         # Set read-only permissions on quarantined file
-229:         try:
-230:             os.chmod(dest_path, 0o444)
-231:         except OSError:
-232:             pass
-233: 
-234:         with _db_lock, _get_connection() as conn:
-235:             conn.execute("""
-236:                 INSERT INTO quarantine_vault (original_path, quarantined_path, quarantined_at, file_size, reason)
-237:                 VALUES (?, ?, ?, ?, ?)
-238:             """, (norm_src, dest_path, time.time(), size, reason))
-239:             conn.commit()
-240: 
-241:         # Remove from baseline registry
-242:         remove_baseline(norm_src)
-243: 
-244:         return {
-245:             "success": True,
-246:             "original_path": norm_src,
-247:             "quarantined_path": dest_path,
-248:             "size": size,
-249:             "message": f"Successfully quarantined {basename} to vault."
-250:         }
-251:     except Exception as e:
-252:         return {"success": False, "error": str(e)}
-253: 
-254: 
-255: def get_quarantined_files() -> list[dict]:
-256:     with _db_lock, _get_connection() as conn:
-257:         rows = conn.execute("""
-258:             SELECT id, original_path, quarantined_path, quarantined_at, file_size, reason
-259:             FROM quarantine_vault ORDER BY quarantined_at DESC
-260:         """).fetchall()
-261:         return [dict(r) for r in rows]
-</file>
-
-<file path="dlp_scanner.py">
-  1: """
-  2: dlp_scanner.py - Content Inspection & True DLP Regex Engine
-  3: Inspects file content for sensitive data leaks:
-  4: - Cryptographic Private Keys
-  5: - Cloud Access Tokens & API Credentials (AWS, GCP, GitHub)
-  6: - Payment Card Numbers with Luhn Checksum Algorithm Validation
-  7: - PII (Social Security Numbers, Aadhaar Numbers)
-  8: """
-  9: 
- 10: from __future__ import annotations
- 11: 
- 12: import os
- 13: import re
- 14: 
- 15: # Max bytes to inspect for DLP regex to ensure zero latency overhead
- 16: _MAX_DLP_INSPECT_BYTES = 512 * 1024  # 512 KB
- 17: 
- 18: # ── Compiled Regular Expressions ─────────────────────────────────────────────
- 19: _RE_PRIVATE_KEY = re.compile(
- 20:     r"-----BEGIN\s+(?:RSA\s+|EC\s+|DSA\s+|OPENSSH\s+)?PRIVATE\s+KEY-----",
- 21:     re.IGNORECASE
- 22: )
- 23: _RE_AWS_KEY = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
- 24: _RE_GCP_KEY = re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b")
- 25: _RE_GITHUB_TOKEN = re.compile(r"\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,255}\b")
- 26: 
- 27: # Credit Card Candidate Pattern (13 to 19 digits with optional spaces or dashes)
- 28: _RE_CREDIT_CARD = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
- 29: 
- 30: # PII Patterns
- 31: _RE_US_SSN = re.compile(r"\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b")
- 32: _RE_AADHAAR = re.compile(r"\b[2-9]\d{3}\s?\d{4}\s?\d{4}\b")
- 33: 
- 34: 
- 35: def _luhn_checksum_valid(number_str: str) -> bool:
- 36:     """Verify Luhn (Mod 10) algorithm to filter out random 16-digit non-card numbers."""
- 37:     digits = [int(c) for c in number_str if c.isdigit()]
- 38:     if len(digits) < 13 or len(digits) > 19:
- 39:         return False
- 40:     # Check leading digit for standard card issuers: 3 (Amex), 4 (Visa), 5 (MasterCard), 6 (Discover)
- 41:     if digits[0] not in (3, 4, 5, 6):
- 42:         return False
- 43: 
- 44:     checksum = 0
- 45:     reverse_digits = digits[::-1]
- 46:     for i, d in enumerate(reverse_digits):
- 47:         if i % 2 == 1:
- 48:             d *= 2
- 49:             if d > 9:
- 50:                 d -= 9
- 51:         checksum += d
- 52:     return (checksum % 10) == 0
- 53: 
- 54: 
- 55: def _mask_secret(val: str) -> str:
- 56:     """Mask secret for safe security report display."""
- 57:     if len(val) <= 8:
- 58:         return "********"
- 59:     return val[:4] + "*" * (len(val) - 8) + val[-4:]
- 60: 
- 61: 
- 62: def scan_file_content(filepath: str) -> dict:
- 63:     """
- 64:     Scan the file content for sensitive DLP patterns.
- 65: 
- 66:     Returns:
- 67:         {
- 68:             "is_violation": bool,
- 69:             "matches": list[dict],      # [{"type": str, "count": int, "sample": str}]
- 70:             "risk_bonus": int,          # 0 to 20
- 71:             "summary": str,
- 72:         }
- 73:     """
- 74:     if not filepath or not os.path.isfile(filepath):
- 75:         return {"is_violation": False, "matches": [], "risk_bonus": 0, "summary": ""}
- 76: 
- 77:     # Check file size before reading
- 78:     try:
- 79:         size = os.path.getsize(filepath)
- 80:         if size == 0:
- 81:             return {"is_violation": False, "matches": [], "risk_bonus": 0, "summary": ""}
- 82:     except OSError:
- 83:         return {"is_violation": False, "matches": [], "risk_bonus": 0, "summary": ""}
- 84: 
- 85:     # Read up to 512 KB
- 86:     content = ""
- 87:     try:
- 88:         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
- 89:             content = f.read(_MAX_DLP_INSPECT_BYTES)
- 90:     except Exception:
- 91:         return {"is_violation": False, "matches": [], "risk_bonus": 0, "summary": ""}
- 92: 
- 93:     if not content:
- 94:         return {"is_violation": False, "matches": [], "risk_bonus": 0, "summary": ""}
- 95: 
- 96:     matches = []
- 97:     risk_bonus = 0
- 98: 
- 99:     # 1. Cryptographic Private Keys
-100:     pk_hits = _RE_PRIVATE_KEY.findall(content)
-101:     if pk_hits:
-102:         matches.append({"type": "Private Key", "count": len(pk_hits), "sample": "-----BEGIN PRIVATE KEY-----"})
-103:         risk_bonus += 20
-104: 
-105:     # 2. Cloud Credentials
-106:     aws_hits = _RE_AWS_KEY.findall(content)
-107:     if aws_hits:
-108:         matches.append({"type": "AWS Access Key", "count": len(aws_hits), "sample": _mask_secret(aws_hits[0])})
-109:         risk_bonus += 20
-110: 
-111:     gcp_hits = _RE_GCP_KEY.findall(content)
-112:     if gcp_hits:
-113:         matches.append({"type": "Google Cloud API Key", "count": len(gcp_hits), "sample": _mask_secret(gcp_hits[0])})
-114:         risk_bonus += 15
-115: 
-116:     gh_hits = _RE_GITHUB_TOKEN.findall(content)
-117:     if gh_hits:
-118:         matches.append({"type": "GitHub Token", "count": len(gh_hits), "sample": "ghp_****************"})
-119:         risk_bonus += 15
-120: 
-121:     # 3. Payment Card Data (with Luhn validation)
-122:     card_candidates = _RE_CREDIT_CARD.findall(content)
-123:     valid_cards = []
-124:     for cand in card_candidates:
-125:         clean_num = re.sub(r"\D", "", cand)
-126:         if _luhn_checksum_valid(clean_num):
-127:             valid_cards.append(_mask_secret(clean_num))
-128:             if len(valid_cards) >= 3:
-129:                 break
-130: 
-131:     if valid_cards:
-132:         matches.append({"type": "Payment Card Number", "count": len(valid_cards), "sample": valid_cards[0]})
-133:         risk_bonus += 20
-134: 
-135:     # 4. PII Data
-136:     ssn_hits = _RE_US_SSN.findall(content)
-137:     if ssn_hits:
-138:         matches.append({"type": "Social Security Number (SSN)", "count": len(ssn_hits), "sample": "***-**-" + ssn_hits[0][-4:]})
-139:         risk_bonus += 15
-140: 
-141:     aadhaar_hits = _RE_AADHAAR.findall(content)
-142:     if aadhaar_hits:
-143:         matches.append({"type": "Aadhaar Identity Number", "count": len(aadhaar_hits), "sample": "**** **** " + aadhaar_hits[0].strip()[-4:]})
-144:         risk_bonus += 15
-145: 
-146:     # Cap risk bonus at 20
-147:     risk_bonus = min(20, risk_bonus)
-148:     is_violation = len(matches) > 0
-149: 
-150:     summary = ", ".join([f"{m['count']}x {m['type']}" for m in matches]) if matches else ""
-151: 
-152:     return {
-153:         "is_violation": is_violation,
-154:         "matches": matches,
-155:         "risk_bonus": risk_bonus,
-156:         "summary": summary,
-157:     }
-</file>
-
-<file path="process_tracker.py">
-  1: """
-  2: process_tracker.py - Windows Restart Manager & Process Lineage Telemetry
-  3: Discovers the exact process holding active file handles using Windows Restart Manager (rstrtmgr.dll),
-  4: extracts parent process lineage and command-line execution arguments, and provides safe termination.
-  5: """
-  6: 
-  7: from __future__ import annotations
-  8: 
-  9: import os
- 10: import sys
- 11: import ctypes
- 12: from ctypes import wintypes
- 13: import psutil
- 14: 
- 15: # Protected system processes that can never be terminated
- 16: _PROTECTED_PROCESSES = frozenset({
- 17:     "csrss.exe", "lsass.exe", "services.exe", "winlogon.exe",
- 18:     "explorer.exe", "svchost.exe", "smss.exe", "dwm.exe",
- 19:     "system", "system idle process"
- 20: })
- 21: 
- 22: 
- 23: # ── Windows Restart Manager Structures & Ctypes ──────────────────────────────
- 24: if sys.platform == "win32":
- 25:     CCH_RM_SESSION_KEY = 32
- 26:     CCH_RM_MAX_APP_NAME = 255
- 27:     CCH_RM_MAX_SVC_NAME = 63
- 28: 
- 29:     class RM_UNIQUE_PROCESS(ctypes.Structure):
- 30:         _fields_ = [
- 31:             ("dwProcessId", wintypes.DWORD),
- 32:             ("ProcessStartTime", wintypes.FILETIME),
- 33:         ]
- 34: 
- 35:     class RM_PROCESS_INFO(ctypes.Structure):
- 36:         _fields_ = [
- 37:             ("Process", RM_UNIQUE_PROCESS),
- 38:             ("strAppName", wintypes.WCHAR * (CCH_RM_MAX_APP_NAME + 1)),
- 39:             ("strServiceShortName", wintypes.WCHAR * (CCH_RM_MAX_SVC_NAME + 1)),
- 40:             ("ApplicationType", wintypes.UINT),
- 41:             ("AppStatus", wintypes.ULONG),
- 42:             ("TSSessionId", wintypes.DWORD),
- 43:             ("bRestartable", wintypes.BOOL),
- 44:         ]
- 45: 
- 46:     try:
- 47:         rstrtmgr = ctypes.windll.rstrtmgr
- 48:     except Exception:
- 49:         rstrtmgr = None
- 50: else:
- 51:     rstrtmgr = None
- 52: 
- 53: 
- 54: def get_file_locking_pids(filepath: str) -> list[int]:
- 55:     """
- 56:     Query the Windows Restart Manager for PIDs currently holding an open handle to filepath.
- 57:     Returns list of PIDs.
- 58:     """
- 59:     if not rstrtmgr or not filepath or not os.path.exists(filepath):
- 60:         return []
- 61: 
- 62:     pids: list[int] = []
- 63:     session_handle = wintypes.DWORD()
- 64:     session_key = (wintypes.WCHAR * (CCH_RM_SESSION_KEY + 1))()
- 65: 
- 66:     res = rstrtmgr.RmStartSession(ctypes.byref(session_handle), 0, session_key)
- 67:     if res != 0:
- 68:         return []
- 69: 
- 70:     try:
- 71:         file_arr = (wintypes.LPCWSTR * 1)(filepath)
- 72:         res = rstrtmgr.RmRegisterResources(session_handle, 1, file_arr, 0, None, 0, None)
- 73:         if res != 0:
- 74:             return []
- 75: 
- 76:         n_proc_info_needed = wintypes.UINT(0)
- 77:         n_proc_info = wintypes.UINT(0)
- 78:         reboot_reasons = wintypes.DWORD()
- 79: 
- 80:         # First call to get required buffer size
- 81:         res = rstrtmgr.RmGetList(
- 82:             session_handle,
- 83:             ctypes.byref(n_proc_info_needed),
- 84:             ctypes.byref(n_proc_info),
- 85:             None,
- 86:             ctypes.byref(reboot_reasons)
- 87:         )
- 88: 
- 89:         if n_proc_info_needed.value > 0:
- 90:             proc_info_arr = (RM_PROCESS_INFO * n_proc_info_needed.value)()
- 91:             n_proc_info.value = n_proc_info_needed.value
- 92: 
- 93:             res = rstrtmgr.RmGetList(
- 94:                 session_handle,
- 95:                 ctypes.byref(n_proc_info_needed),
- 96:                 ctypes.byref(n_proc_info),
- 97:                 proc_info_arr,
- 98:                 ctypes.byref(reboot_reasons)
- 99:             )
-100: 
-101:             if res == 0:
-102:                 for i in range(n_proc_info.value):
-103:                     pid = proc_info_arr[i].Process.dwProcessId
-104:                     if pid and pid != os.getpid():
-105:                         pids.append(pid)
-106:     except Exception:
-107:         pass
-108:     finally:
-109:         rstrtmgr.RmEndSession(session_handle)
-110: 
-111:     return pids
-112: 
-113: 
-114: def get_process_telemetry(filepath: str = "", pid: int | None = None) -> dict:
-115:     """
-116:     Resolve true process attribution, parent lineage, and command-line execution arguments.
-117: 
-118:     Returns:
-119:         {
-120:             "pid": int | None,
-121:             "name": str,
-122:             "cmdline": str,
-123:             "ppid": int | None,
-124:             "parent_name": str,
-125:             "lineage": str,
-126:         }
-127:     """
-128:     target_pid = pid
-129:     if isinstance(filepath, int) and target_pid is None:
-130:         target_pid = filepath
-131:         filepath = ""
-132: 
-133:     # 1. Try Windows Restart Manager on the target file
-134:     if not target_pid and filepath and os.path.exists(filepath):
-135:         pids = get_file_locking_pids(filepath)
-136:         if pids:
-137:             target_pid = pids[0]
-138: 
-139:     # 2. Fallback: Query Foreground Window if available
-140:     if not target_pid and sys.platform == "win32":
-141:         try:
-142:             hwnd = ctypes.windll.user32.GetForegroundWindow()
-143:             if hwnd:
-144:                 win_pid = ctypes.c_ulong()
-145:                 ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
-146:                 if win_pid.value and win_pid.value != os.getpid():
-147:                     target_pid = win_pid.value
-148:         except Exception:
-149:             pass
-150: 
-151:     if not target_pid:
-152:         return {
-153:             "pid": None,
-154:             "name": "System / Background",
-155:             "cmdline": "N/A",
-156:             "ppid": None,
-157:             "parent_name": "N/A",
-158:             "lineage": "System / Background",
-159:         }
-160: 
-161:     try:
-162:         proc = psutil.Process(target_pid)
-163:         proc_name = proc.name()
-164:         try:
-165:             cmdline_list = proc.cmdline()
-166:             cmdline = " ".join(cmdline_list) if cmdline_list else proc_name
-167:         except (psutil.AccessDenied, psutil.ZombieProcess):
-168:             cmdline = proc_name
-169: 
-170:         ppid = proc.ppid()
-171:         parent_name = "N/A"
-172:         try:
-173:             parent = proc.parent()
-174:             if parent:
-175:                 parent_name = parent.name()
-176:         except (psutil.AccessDenied, psutil.NoSuchProcess):
-177:             pass
-178: 
-179:         lineage = f"{parent_name} (PID {ppid}) → {proc_name} (PID {target_pid})" if ppid else f"{proc_name} (PID {target_pid})"
-180: 
-181:         return {
-182:             "pid": target_pid,
-183:             "name": proc_name,
-184:             "cmdline": cmdline[:300],  # cap at 300 chars
-185:             "ppid": ppid,
-186:             "parent_name": parent_name,
-187:             "lineage": lineage,
-188:         }
-189:     except (psutil.NoSuchProcess, psutil.AccessDenied):
-190:         return {
-191:             "pid": target_pid,
-192:             "name": "System / Background",
-193:             "cmdline": "N/A",
-194:             "ppid": None,
-195:             "parent_name": "N/A",
-196:             "lineage": "System / Background",
-197:         }
-198: 
-199: 
-200: def terminate_process(pid: int) -> dict:
-201:     """
-202:     Safely terminate an unapproved exfiltration or suspicious utility process.
-203:     Enforces strict guardrails to prevent terminating core Windows system processes.
-204:     """
-205:     if not pid or pid <= 4 or pid == os.getpid():
-206:         return {"success": False, "error": "Cannot terminate current or root system process."}
-207: 
-208:     try:
-209:         proc = psutil.Process(pid)
-210:         proc_name = proc.name().lower()
-211: 
-212:         if proc_name in _PROTECTED_PROCESSES:
-213:             return {
-214:                 "success": False,
-215:                 "error": f"Protection Policy: Termination of core process '{proc_name}' is forbidden."
-216:             }
-217: 
-218:         proc.kill()
-219:         return {
-220:             "success": True,
-221:             "message": f"Successfully terminated suspicious process '{proc_name}' (PID {pid})."
-222:         }
-223:     except psutil.NoSuchProcess:
-224:         return {"success": False, "error": f"Process PID {pid} is no longer running."}
-225:     except psutil.AccessDenied:
-226:         return {"success": False, "error": f"Access Denied: Insufficient privilege to terminate PID {pid}."}
-227:     except Exception as e:
-228:         return {"success": False, "error": str(e)}
-</file>
-
 <file path="dashboard/__init__.py">
 1: # Empty init — makes dashboard/ a proper Python package so that
 2: # "from dashboard.app import run_dashboard" resolves correctly.
@@ -1365,6 +710,1056 @@ This section contains the contents of the repository's files.
 84:     test_monitor_no_flood()
 </file>
 
+<file path="db.py">
+  1: """
+  2: db.py - Persistent SQLite Database Engine for FileSentinel
+  3: Manages persistent baseline file hashes, custom monitored directories,
+  4: SOC allowlists, and quarantine vault metadata across system reboots.
+  5: """
+  6: 
+  7: import os
+  8: import sqlite3
+  9: import threading
+ 10: import time
+ 11: import shutil
+ 12: from config import BASE_DIR
+ 13: 
+ 14: DATA_DIR = os.path.join(BASE_DIR, "data")
+ 15: VAULT_DIR = os.path.join(BASE_DIR, "vault")
+ 16: QUARANTINE_DIR = os.path.join(VAULT_DIR, "quarantine")
+ 17: DB_PATH = os.path.join(DATA_DIR, "filesentinel.db")
+ 18: 
+ 19: os.makedirs(DATA_DIR, exist_ok=True)
+ 20: os.makedirs(QUARANTINE_DIR, exist_ok=True)
+ 21: 
+ 22: _db_lock = threading.Lock()
+ 23: 
+ 24: 
+ 25: def _get_connection() -> sqlite3.Connection:
+ 26:     conn = sqlite3.connect(DB_PATH, timeout=10.0)
+ 27:     conn.row_factory = sqlite3.Row
+ 28:     return conn
+ 29: 
+ 30: 
+ 31: def init_db():
+ 32:     """Create tables and indexes if they do not exist."""
+ 33:     with _db_lock, _get_connection() as conn:
+ 34:         conn.execute("""
+ 35:             CREATE TABLE IF NOT EXISTS baseline_hashes (
+ 36:                 norm_path TEXT PRIMARY KEY,
+ 37:                 hash TEXT NOT NULL,
+ 38:                 size INTEGER NOT NULL,
+ 39:                 mtime REAL NOT NULL,
+ 40:                 updated_at REAL NOT NULL
+ 41:             )
+ 42:         """)
+ 43:         conn.execute("""
+ 44:             CREATE TABLE IF NOT EXISTS monitored_directories (
+ 45:                 path TEXT PRIMARY KEY,
+ 46:                 added_at REAL NOT NULL,
+ 47:                 is_active INTEGER NOT NULL DEFAULT 1
+ 48:             )
+ 49:         """)
+ 50:         conn.execute("""
+ 51:             CREATE TABLE IF NOT EXISTS allowlist (
+ 52:                 entry TEXT PRIMARY KEY,
+ 53:                 entry_type TEXT NOT NULL,
+ 54:                 reason TEXT,
+ 55:                 added_at REAL NOT NULL
+ 56:             )
+ 57:         """)
+ 58:         conn.execute("""
+ 59:             CREATE TABLE IF NOT EXISTS quarantine_vault (
+ 60:                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+ 61:                 original_path TEXT NOT NULL,
+ 62:                 quarantined_path TEXT NOT NULL,
+ 63:                 quarantined_at REAL NOT NULL,
+ 64:                 file_size INTEGER NOT NULL,
+ 65:                 original_hash TEXT,
+ 66:                 reason TEXT
+ 67:             )
+ 68:         """)
+ 69:         conn.commit()
+ 70: 
+ 71: 
+ 72: # Initialize database schema immediately on module import
+ 73: init_db()
+ 74: 
+ 75: 
+ 76: # ── Baseline Hash Functions ──────────────────────────────────────────────────
+ 77: 
+ 78: def set_baseline(filepath: str, digest: str, size: int = 0, mtime: float = 0.0):
+ 79:     if not filepath or not digest:
+ 80:         return
+ 81:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
+ 82:     now = time.time()
+ 83:     with _db_lock, _get_connection() as conn:
+ 84:         conn.execute("""
+ 85:             INSERT INTO baseline_hashes (norm_path, hash, size, mtime, updated_at)
+ 86:             VALUES (?, ?, ?, ?, ?)
+ 87:             ON CONFLICT(norm_path) DO UPDATE SET
+ 88:                 hash = excluded.hash,
+ 89:                 size = excluded.size,
+ 90:                 mtime = excluded.mtime,
+ 91:                 updated_at = excluded.updated_at
+ 92:         """, (norm, digest, size, mtime, now))
+ 93:         conn.commit()
+ 94: 
+ 95: 
+ 96: def get_baseline(filepath: str) -> dict | None:
+ 97:     if not filepath:
+ 98:         return None
+ 99:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
+100:     with _db_lock, _get_connection() as conn:
+101:         row = conn.execute(
+102:             "SELECT norm_path, hash, size, mtime, updated_at FROM baseline_hashes WHERE norm_path = ?",
+103:             (norm,)
+104:         ).fetchone()
+105:         if row:
+106:             return dict(row)
+107:     return None
+108: 
+109: 
+110: def remove_baseline(filepath: str):
+111:     if not filepath:
+112:         return
+113:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
+114:     with _db_lock, _get_connection() as conn:
+115:         conn.execute("DELETE FROM baseline_hashes WHERE norm_path = ?", (norm,))
+116:         conn.commit()
+117: 
+118: 
+119: def get_all_baselines() -> dict[str, str]:
+120:     with _db_lock, _get_connection() as conn:
+121:         rows = conn.execute("SELECT norm_path, hash FROM baseline_hashes").fetchall()
+122:         return {r["norm_path"]: r["hash"] for r in rows}
+123: 
+124: 
+125: # ── Monitored Directories Functions ──────────────────────────────────────────
+126: 
+127: def get_monitored_directories() -> list[str]:
+128:     with _db_lock, _get_connection() as conn:
+129:         rows = conn.execute(
+130:             "SELECT path FROM monitored_directories WHERE is_active = 1 ORDER BY path ASC"
+131:         ).fetchall()
+132:         return [r["path"] for r in rows]
+133: 
+134: 
+135: def add_monitored_directory(path: str) -> bool:
+136:     if not path or not os.path.isdir(path):
+137:         return False
+138:     norm = os.path.normpath(os.path.abspath(path))
+139:     with _db_lock, _get_connection() as conn:
+140:         conn.execute("""
+141:             INSERT INTO monitored_directories (path, added_at, is_active)
+142:             VALUES (?, ?, 1)
+143:             ON CONFLICT(path) DO UPDATE SET is_active = 1
+144:         """, (norm, time.time()))
+145:         conn.commit()
+146:     return True
+147: 
+148: 
+149: def remove_monitored_directory(path: str) -> bool:
+150:     if not path:
+151:         return False
+152:     norm = os.path.normpath(os.path.abspath(path))
+153:     with _db_lock, _get_connection() as conn:
+154:         conn.execute("DELETE FROM monitored_directories WHERE path = ?", (norm,))
+155:         conn.commit()
+156:     return True
+157: 
+158: 
+159: # ── Allowlist Functions ──────────────────────────────────────────────────────
+160: 
+161: def add_to_allowlist(entry: str, entry_type: str = "path", reason: str = "") -> bool:
+162:     if not entry:
+163:         return False
+164:     norm = os.path.normcase(os.path.normpath(entry)) if entry_type == "path" else entry.strip().lower()
+165:     with _db_lock, _get_connection() as conn:
+166:         conn.execute("""
+167:             INSERT INTO allowlist (entry, entry_type, reason, added_at)
+168:             VALUES (?, ?, ?, ?)
+169:             ON CONFLICT(entry) DO UPDATE SET reason = excluded.reason
+170:         """, (norm, entry_type, reason, time.time()))
+171:         conn.commit()
+172:     return True
+173: 
+174: 
+175: def is_allowlisted(filepath: str, digest: str = None) -> bool:
+176:     if not filepath:
+177:         return False
+178:     norm_path = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
+179:     _, ext = os.path.splitext(norm_path)
+180: 
+181:     with _db_lock, _get_connection() as conn:
+182:         # Check path
+183:         row = conn.execute("SELECT 1 FROM allowlist WHERE entry = ? AND entry_type = 'path'", (norm_path,)).fetchone()
+184:         if row:
+185:             return True
+186:         # Check extension
+187:         if ext:
+188:             row = conn.execute("SELECT 1 FROM allowlist WHERE entry = ? AND entry_type = 'ext'", (ext,)).fetchone()
+189:             if row:
+190:                 return True
+191:         # Check hash
+192:         if digest:
+193:             row = conn.execute("SELECT 1 FROM allowlist WHERE entry = ? AND entry_type = 'hash'", (digest.lower(),)).fetchone()
+194:             if row:
+195:                 return True
+196:     return False
+197: 
+198: 
+199: def get_allowlist() -> list[dict]:
+200:     with _db_lock, _get_connection() as conn:
+201:         rows = conn.execute("SELECT entry, entry_type, reason, added_at FROM allowlist ORDER BY added_at DESC").fetchall()
+202:         return [dict(r) for r in rows]
+203: 
+204: 
+205: # ── Quarantine Vault Functions ───────────────────────────────────────────────
+206: 
+207: def quarantine_file(src_path: str, reason: str = "User Initiated Quarantine") -> dict:
+208:     """
+209:     Safely relocate a file to the isolated quarantine vault,
+210:     rename it with .quarantine extension, and make it read-only.
+211:     """
+212:     if not src_path or not os.path.exists(src_path):
+213:         return {"success": False, "error": f"File does not exist on disk: '{src_path}'"}
+214: 
+215:     norm_src = os.path.normpath(os.path.abspath(src_path))
+216:     try:
+217:         size = os.path.getsize(norm_src)
+218:     except OSError:
+219:         size = 0
+220: 
+221:     basename = os.path.basename(norm_src)
+222:     ts = int(time.time())
+223:     dest_filename = f"{ts}_{basename}.quarantine"
+224:     dest_path = os.path.join(QUARANTINE_DIR, dest_filename)
+225: 
+226:     try:
+227:         shutil.move(norm_src, dest_path)
+228:         # Set read-only permissions on quarantined file
+229:         try:
+230:             os.chmod(dest_path, 0o444)
+231:         except OSError:
+232:             pass
+233: 
+234:         with _db_lock, _get_connection() as conn:
+235:             conn.execute("""
+236:                 INSERT INTO quarantine_vault (original_path, quarantined_path, quarantined_at, file_size, reason)
+237:                 VALUES (?, ?, ?, ?, ?)
+238:             """, (norm_src, dest_path, time.time(), size, reason))
+239:             conn.commit()
+240: 
+241:         # Remove from baseline registry
+242:         remove_baseline(norm_src)
+243: 
+244:         return {
+245:             "success": True,
+246:             "original_path": norm_src,
+247:             "quarantined_path": dest_path,
+248:             "size": size,
+249:             "message": f"Successfully quarantined {basename} to vault."
+250:         }
+251:     except Exception as e:
+252:         return {"success": False, "error": str(e)}
+253: 
+254: 
+255: def get_quarantined_files() -> list[dict]:
+256:     with _db_lock, _get_connection() as conn:
+257:         rows = conn.execute("""
+258:             SELECT id, original_path, quarantined_path, quarantined_at, file_size, reason
+259:             FROM quarantine_vault ORDER BY quarantined_at DESC
+260:         """).fetchall()
+261:         return [dict(r) for r in rows]
+</file>
+
+<file path="diff_tracker.py">
+  1: """
+  2: diff_tracker.py - Exact File Content Diff & Change Tracking Engine
+  3: Tracks before-and-after content modifications for files in real time.
+  4: Computes unified diffs for text/code/config files and byte deltas for binary documents.
+  5: """
+  6: 
+  7: from __future__ import annotations
+  8: 
+  9: import difflib
+ 10: import os
+ 11: import time
+ 12: 
+ 13: # In-memory baseline content & size caches: {norm_path: text_content}
+ 14: _content_cache: dict[str, str] = {}
+ 15: _size_cache: dict[str, int] = {}
+ 16: 
+ 17: # Max file size to cache text content for diffing (1 MB)
+ 18: _MAX_DIFF_TEXT_SIZE = 1024 * 1024
+ 19: 
+ 20: 
+ 21: def _is_binary_file(filepath: str) -> bool:
+ 22:     """Return True if file is binary (contains null bytes or non-text extension)."""
+ 23:     _, ext = os.path.splitext(filepath.lower())
+ 24:     if ext in {
+ 25:         ".docx", ".xlsx", ".pptx", ".pdf", ".zip", ".rar", ".tar", ".gz",
+ 26:         ".7z", ".db", ".sqlite", ".png", ".jpg", ".jpeg", ".ico", ".exe",
+ 27:         ".dll", ".bin", ".dat", ".pfx", ".p12"
+ 28:     }:
+ 29:         return True
+ 30: 
+ 31:     try:
+ 32:         with open(filepath, "rb") as f:
+ 33:             chunk = f.read(1024)
+ 34:             if b"\x00" in chunk:
+ 35:                 return True
+ 36:     except Exception:
+ 37:         return True
+ 38:     return False
+ 39: 
+ 40: 
+ 41: def _read_text_safely(filepath: str, retries: int = 3) -> str | None:
+ 42:     """Read file as text with encoding fallbacks and Windows file-lock retry backoff."""
+ 43:     for attempt in range(max(1, retries)):
+ 44:         try:
+ 45:             with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+ 46:                 return f.read()
+ 47:         except PermissionError:
+ 48:             if attempt < retries - 1:
+ 49:                 time.sleep(0.05 * (attempt + 1))
+ 50:             else:
+ 51:                 return None
+ 52:         except Exception:
+ 53:             return None
+ 54:     return None
+ 55: 
+ 56: 
+ 57: def record_initial_state(filepath: str):
+ 58:     """Snapshot a file's initial content/size when first observed."""
+ 59:     if not filepath or not os.path.isfile(filepath):
+ 60:         return
+ 61:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
+ 62:     try:
+ 63:         size = os.path.getsize(filepath)
+ 64:         _size_cache[norm] = size
+ 65:         if size <= _MAX_DIFF_TEXT_SIZE and not _is_binary_file(filepath):
+ 66:             content = _read_text_safely(filepath)
+ 67:             if content is not None:
+ 68:                 _content_cache[norm] = content
+ 69:     except Exception:
+ 70:         pass
+ 71: 
+ 72: 
+ 73: def compute_file_diff(event_type: str, src_path: str, dest_path: str = "") -> dict:
+ 74:     """
+ 75:     Compute what actually changed in the file during an event.
+ 76: 
+ 77:     Returns a structured dictionary:
+ 78:       - type: 'text' | 'binary' | 'lifecycle'
+ 79:       - summary: Brief human-readable delta (e.g. '+3 lines, -1 line (+48 bytes)')
+ 80:       - added_count: Number of added lines (for text)
+ 81:       - removed_count: Number of deleted lines (for text)
+ 82:       - snippet: Formatted unified diff or binary status string
+ 83:       - size_delta: Byte difference (positive or negative)
+ 84:     """
+ 85:     target_path = dest_path if (event_type == "MOVED" and dest_path) else src_path
+ 86:     if not target_path:
+ 87:         return {"type": "none", "summary": "No target path", "snippet": ""}
+ 88: 
+ 89:     norm = os.path.normcase(os.path.normpath(os.path.abspath(target_path)))
+ 90:     src_norm = os.path.normcase(os.path.normpath(os.path.abspath(src_path)))
+ 91: 
+ 92:     # 1. CREATED
+ 93:     if event_type in ("CREATED", "CREATED_DIR"):
+ 94:         size = 0
+ 95:         try:
+ 96:             if os.path.exists(target_path):
+ 97:                 size = os.path.getsize(target_path)
+ 98:         except OSError:
+ 99:             pass
+100: 
+101:         _size_cache[norm] = size
+102:         if not _is_binary_file(target_path) and size <= _MAX_DIFF_TEXT_SIZE:
+103:             content = _read_text_safely(target_path) or ""
+104:             _content_cache[norm] = content
+105:             line_count = len(content.splitlines())
+106:             return {
+107:                 "type": "text",
+108:                 "summary": f"Initial file created ({line_count} lines, {size:,} bytes)",
+109:                 "added_count": line_count,
+110:                 "removed_count": 0,
+111:                 "size_delta": size,
+112:                 "snippet": f"+++ Initial File Content ({line_count} lines, {size:,} bytes) +++",
+113:             }
+114:         return {
+115:             "type": "binary",
+116:             "summary": f"New file created ({size:,} bytes)",
+117:             "added_count": 0,
+118:             "removed_count": 0,
+119:             "size_delta": size,
+120:             "snippet": f"[Binary payload established: {size:,} bytes]",
+121:         }
+122: 
+123:     # 2. DELETED
+124:     if event_type in ("DELETED", "DELETED_DIR"):
+125:         old_size = _size_cache.pop(src_norm, 0)
+126:         _content_cache.pop(src_norm, None)
+127:         return {
+128:             "type": "lifecycle",
+129:             "summary": f"File deleted from disk ({old_size:,} bytes removed)",
+130:             "added_count": 0,
+131:             "removed_count": 0,
+132:             "size_delta": -old_size,
+133:             "snippet": f"--- File Removed ({old_size:,} bytes) ---",
+134:         }
+135: 
+136:     # 3. MOVED
+137:     if event_type in ("MOVED", "MOVED_DIR"):
+138:         old_size = _size_cache.pop(src_norm, 0)
+139:         old_content = _content_cache.pop(src_norm, None)
+140: 
+141:         new_size = old_size
+142:         try:
+143:             if os.path.exists(target_path):
+144:                 new_size = os.path.getsize(target_path)
+145:         except OSError:
+146:             pass
+147: 
+148:         _size_cache[norm] = new_size
+149:         if old_content is not None:
+150:             _content_cache[norm] = old_content
+151: 
+152:         dest_name = os.path.basename(dest_path) if dest_path else "new destination"
+153:         return {
+154:             "type": "lifecycle",
+155:             "summary": f"Relocated to: {dest_path or target_path} ({new_size:,} bytes)",
+156:             "added_count": 0,
+157:             "removed_count": 0,
+158:             "size_delta": 0,
+159:             "snippet": f"→ Transferred to {dest_name}",
+160:         }
+161: 
+162:     # 4. MODIFIED
+163:     old_size = _size_cache.get(norm, 0)
+164:     new_size = old_size
+165:     try:
+166:         if os.path.exists(target_path):
+167:             new_size = os.path.getsize(target_path)
+168:     except OSError:
+169:         pass
+170:     size_delta = new_size - old_size
+171:     _size_cache[norm] = new_size
+172: 
+173:     # Check if text file for unified diff
+174:     if not _is_binary_file(target_path) and new_size <= _MAX_DIFF_TEXT_SIZE:
+175:         new_content = _read_text_safely(target_path)
+176:         old_content = _content_cache.get(norm)
+177: 
+178:         if new_content is not None and old_content is not None:
+179:             old_lines = old_content.splitlines(keepends=True)
+180:             new_lines = new_content.splitlines(keepends=True)
+181: 
+182:             diff_generator = difflib.unified_diff(
+183:                 old_lines,
+184:                 new_lines,
+185:                 fromfile="previous",
+186:                 tofile="current",
+187:                 n=2,
+188:             )
+189:             diff_lines = list(diff_generator)
+190: 
+191:             added = [l.rstrip("\r\n") for l in diff_lines if l.startswith("+") and not l.startswith("+++")]
+192:             removed = [l.rstrip("\r\n") for l in diff_lines if l.startswith("-") and not l.startswith("---")]
+193: 
+194:             _content_cache[norm] = new_content
+195: 
+196:             if added or removed:
+197:                 delta_sign = "+" if size_delta >= 0 else ""
+198:                 summary = f"+{len(added)} added, -{len(removed)} removed ({delta_sign}{size_delta:,} bytes)"
+199:                 snippet_text = "".join(diff_lines[:40])  # Cap at 40 lines
+200:                 if len(diff_lines) > 40:
+201:                     snippet_text += f"\n... [{len(diff_lines) - 40} additional lines truncated]"
+202:                 return {
+203:                     "type": "text",
+204:                     "summary": summary,
+205:                     "added_count": len(added),
+206:                     "removed_count": len(removed),
+207:                     "added_samples": added[:5],
+208:                     "removed_samples": removed[:5],
+209:                     "size_delta": size_delta,
+210:                     "snippet": snippet_text,
+211:                 }
+212: 
+213:         if new_content is not None:
+214:             _content_cache[norm] = new_content
+215: 
+216:     # Binary or non-diffable file
+217:     delta_sign = "+" if size_delta >= 0 else ""
+218:     summary = f"Binary content modified: {old_size:,} bytes → {new_size:,} bytes ({delta_sign}{size_delta:,} bytes)"
+219:     return {
+220:         "type": "binary",
+221:         "summary": summary,
+222:         "added_count": 0,
+223:         "removed_count": 0,
+224:         "size_delta": size_delta,
+225:         "snippet": f"[Binary Payload: {delta_sign}{size_delta:,} bytes change]",
+226:     }
+</file>
+
+<file path="dlp_scanner.py">
+  1: """
+  2: dlp_scanner.py - Content Inspection & True DLP Regex Engine
+  3: Inspects file content for sensitive data leaks:
+  4: - Cryptographic Private Keys
+  5: - Cloud Access Tokens & API Credentials (AWS, GCP, GitHub)
+  6: - Payment Card Numbers with Luhn Checksum Algorithm Validation
+  7: - PII (Social Security Numbers, Aadhaar Numbers)
+  8: """
+  9: 
+ 10: from __future__ import annotations
+ 11: 
+ 12: import os
+ 13: import re
+ 14: 
+ 15: # Max bytes to inspect for DLP regex to ensure zero latency overhead
+ 16: _MAX_DLP_INSPECT_BYTES = 512 * 1024  # 512 KB
+ 17: 
+ 18: # ── Compiled Regular Expressions ─────────────────────────────────────────────
+ 19: _RE_PRIVATE_KEY = re.compile(
+ 20:     r"-----BEGIN\s+(?:RSA\s+|EC\s+|DSA\s+|OPENSSH\s+)?PRIVATE\s+KEY-----",
+ 21:     re.IGNORECASE
+ 22: )
+ 23: _RE_AWS_KEY = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
+ 24: _RE_GCP_KEY = re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b")
+ 25: _RE_GITHUB_TOKEN = re.compile(r"\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,255}\b")
+ 26: 
+ 27: # Credit Card Candidate Pattern (13 to 19 digits with optional spaces or dashes)
+ 28: _RE_CREDIT_CARD = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
+ 29: 
+ 30: # PII Patterns
+ 31: _RE_US_SSN = re.compile(r"\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b")
+ 32: _RE_AADHAAR = re.compile(r"\b[2-9]\d{3}\s?\d{4}\s?\d{4}\b")
+ 33: 
+ 34: 
+ 35: def _luhn_checksum_valid(number_str: str) -> bool:
+ 36:     """Verify Luhn (Mod 10) algorithm to filter out random 16-digit non-card numbers."""
+ 37:     digits = [int(c) for c in number_str if c.isdigit()]
+ 38:     if len(digits) < 13 or len(digits) > 19:
+ 39:         return False
+ 40:     # Check leading digit for standard card issuers: 3 (Amex), 4 (Visa), 5 (MasterCard), 6 (Discover)
+ 41:     if digits[0] not in (3, 4, 5, 6):
+ 42:         return False
+ 43: 
+ 44:     checksum = 0
+ 45:     reverse_digits = digits[::-1]
+ 46:     for i, d in enumerate(reverse_digits):
+ 47:         if i % 2 == 1:
+ 48:             d *= 2
+ 49:             if d > 9:
+ 50:                 d -= 9
+ 51:         checksum += d
+ 52:     return (checksum % 10) == 0
+ 53: 
+ 54: 
+ 55: def _mask_secret(val: str) -> str:
+ 56:     """Mask secret for safe security report display."""
+ 57:     if len(val) <= 8:
+ 58:         return "********"
+ 59:     return val[:4] + "*" * (len(val) - 8) + val[-4:]
+ 60: 
+ 61: 
+ 62: def scan_file_content(filepath: str) -> dict:
+ 63:     """
+ 64:     Scan the file content for sensitive DLP patterns.
+ 65: 
+ 66:     Returns:
+ 67:         {
+ 68:             "is_violation": bool,
+ 69:             "matches": list[dict],      # [{"type": str, "count": int, "sample": str}]
+ 70:             "risk_bonus": int,          # 0 to 20
+ 71:             "summary": str,
+ 72:         }
+ 73:     """
+ 74:     if not filepath or not os.path.isfile(filepath):
+ 75:         return {"is_violation": False, "matches": [], "risk_bonus": 0, "summary": ""}
+ 76: 
+ 77:     # Check file size before reading
+ 78:     try:
+ 79:         size = os.path.getsize(filepath)
+ 80:         if size == 0:
+ 81:             return {"is_violation": False, "matches": [], "risk_bonus": 0, "summary": ""}
+ 82:     except OSError:
+ 83:         return {"is_violation": False, "matches": [], "risk_bonus": 0, "summary": ""}
+ 84: 
+ 85:     # Read up to 512 KB
+ 86:     content = ""
+ 87:     try:
+ 88:         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+ 89:             content = f.read(_MAX_DLP_INSPECT_BYTES)
+ 90:     except Exception:
+ 91:         return {"is_violation": False, "matches": [], "risk_bonus": 0, "summary": ""}
+ 92: 
+ 93:     if not content:
+ 94:         return {"is_violation": False, "matches": [], "risk_bonus": 0, "summary": ""}
+ 95: 
+ 96:     matches = []
+ 97:     risk_bonus = 0
+ 98: 
+ 99:     # 1. Cryptographic Private Keys
+100:     pk_hits = _RE_PRIVATE_KEY.findall(content)
+101:     if pk_hits:
+102:         matches.append({"type": "Private Key", "count": len(pk_hits), "sample": "-----BEGIN PRIVATE KEY-----"})
+103:         risk_bonus += 20
+104: 
+105:     # 2. Cloud Credentials
+106:     aws_hits = _RE_AWS_KEY.findall(content)
+107:     if aws_hits:
+108:         matches.append({"type": "AWS Access Key", "count": len(aws_hits), "sample": _mask_secret(aws_hits[0])})
+109:         risk_bonus += 20
+110: 
+111:     gcp_hits = _RE_GCP_KEY.findall(content)
+112:     if gcp_hits:
+113:         matches.append({"type": "Google Cloud API Key", "count": len(gcp_hits), "sample": _mask_secret(gcp_hits[0])})
+114:         risk_bonus += 15
+115: 
+116:     gh_hits = _RE_GITHUB_TOKEN.findall(content)
+117:     if gh_hits:
+118:         matches.append({"type": "GitHub Token", "count": len(gh_hits), "sample": "ghp_****************"})
+119:         risk_bonus += 15
+120: 
+121:     # 3. Payment Card Data (with Luhn validation)
+122:     card_candidates = _RE_CREDIT_CARD.findall(content)
+123:     valid_cards = []
+124:     for cand in card_candidates:
+125:         clean_num = re.sub(r"\D", "", cand)
+126:         if _luhn_checksum_valid(clean_num):
+127:             valid_cards.append(_mask_secret(clean_num))
+128:             if len(valid_cards) >= 3:
+129:                 break
+130: 
+131:     if valid_cards:
+132:         matches.append({"type": "Payment Card Number", "count": len(valid_cards), "sample": valid_cards[0]})
+133:         risk_bonus += 20
+134: 
+135:     # 4. PII Data
+136:     ssn_hits = _RE_US_SSN.findall(content)
+137:     if ssn_hits:
+138:         matches.append({"type": "Social Security Number (SSN)", "count": len(ssn_hits), "sample": "***-**-" + ssn_hits[0][-4:]})
+139:         risk_bonus += 15
+140: 
+141:     aadhaar_hits = _RE_AADHAAR.findall(content)
+142:     if aadhaar_hits:
+143:         matches.append({"type": "Aadhaar Identity Number", "count": len(aadhaar_hits), "sample": "**** **** " + aadhaar_hits[0].strip()[-4:]})
+144:         risk_bonus += 15
+145: 
+146:     # Cap risk bonus at 20
+147:     risk_bonus = min(20, risk_bonus)
+148:     is_violation = len(matches) > 0
+149: 
+150:     summary = ", ".join([f"{m['count']}x {m['type']}" for m in matches]) if matches else ""
+151: 
+152:     return {
+153:         "is_violation": is_violation,
+154:         "matches": matches,
+155:         "risk_bonus": risk_bonus,
+156:         "summary": summary,
+157:     }
+</file>
+
+<file path="process_tracker.py">
+  1: """
+  2: process_tracker.py - Windows Restart Manager & Process Lineage Telemetry
+  3: Discovers the exact process holding active file handles using Windows Restart Manager (rstrtmgr.dll),
+  4: extracts parent process lineage and command-line execution arguments, and provides safe termination.
+  5: """
+  6: 
+  7: from __future__ import annotations
+  8: 
+  9: import os
+ 10: import sys
+ 11: import ctypes
+ 12: from ctypes import wintypes
+ 13: import psutil
+ 14: 
+ 15: # Protected system processes that can never be terminated
+ 16: _PROTECTED_PROCESSES = frozenset({
+ 17:     "csrss.exe", "lsass.exe", "services.exe", "winlogon.exe",
+ 18:     "explorer.exe", "svchost.exe", "smss.exe", "dwm.exe",
+ 19:     "system", "system idle process"
+ 20: })
+ 21: 
+ 22: 
+ 23: # ── Windows Restart Manager Structures & Ctypes ──────────────────────────────
+ 24: if sys.platform == "win32":
+ 25:     CCH_RM_SESSION_KEY = 32
+ 26:     CCH_RM_MAX_APP_NAME = 255
+ 27:     CCH_RM_MAX_SVC_NAME = 63
+ 28: 
+ 29:     class RM_UNIQUE_PROCESS(ctypes.Structure):
+ 30:         _fields_ = [
+ 31:             ("dwProcessId", wintypes.DWORD),
+ 32:             ("ProcessStartTime", wintypes.FILETIME),
+ 33:         ]
+ 34: 
+ 35:     class RM_PROCESS_INFO(ctypes.Structure):
+ 36:         _fields_ = [
+ 37:             ("Process", RM_UNIQUE_PROCESS),
+ 38:             ("strAppName", wintypes.WCHAR * (CCH_RM_MAX_APP_NAME + 1)),
+ 39:             ("strServiceShortName", wintypes.WCHAR * (CCH_RM_MAX_SVC_NAME + 1)),
+ 40:             ("ApplicationType", wintypes.UINT),
+ 41:             ("AppStatus", wintypes.ULONG),
+ 42:             ("TSSessionId", wintypes.DWORD),
+ 43:             ("bRestartable", wintypes.BOOL),
+ 44:         ]
+ 45: 
+ 46:     try:
+ 47:         rstrtmgr = ctypes.windll.rstrtmgr
+ 48:     except Exception:
+ 49:         rstrtmgr = None
+ 50: else:
+ 51:     rstrtmgr = None
+ 52: 
+ 53: 
+ 54: def get_file_locking_pids(filepath: str) -> list[int]:
+ 55:     """
+ 56:     Query the Windows Restart Manager for PIDs currently holding an open handle to filepath.
+ 57:     Returns list of PIDs.
+ 58:     """
+ 59:     if not rstrtmgr or not filepath or not os.path.exists(filepath):
+ 60:         return []
+ 61: 
+ 62:     pids: list[int] = []
+ 63:     session_handle = wintypes.DWORD()
+ 64:     session_key = (wintypes.WCHAR * (CCH_RM_SESSION_KEY + 1))()
+ 65: 
+ 66:     res = rstrtmgr.RmStartSession(ctypes.byref(session_handle), 0, session_key)
+ 67:     if res != 0:
+ 68:         return []
+ 69: 
+ 70:     try:
+ 71:         file_arr = (wintypes.LPCWSTR * 1)(filepath)
+ 72:         res = rstrtmgr.RmRegisterResources(session_handle, 1, file_arr, 0, None, 0, None)
+ 73:         if res != 0:
+ 74:             return []
+ 75: 
+ 76:         n_proc_info_needed = wintypes.UINT(0)
+ 77:         n_proc_info = wintypes.UINT(0)
+ 78:         reboot_reasons = wintypes.DWORD()
+ 79: 
+ 80:         # First call to get required buffer size
+ 81:         res = rstrtmgr.RmGetList(
+ 82:             session_handle,
+ 83:             ctypes.byref(n_proc_info_needed),
+ 84:             ctypes.byref(n_proc_info),
+ 85:             None,
+ 86:             ctypes.byref(reboot_reasons)
+ 87:         )
+ 88: 
+ 89:         if n_proc_info_needed.value > 0:
+ 90:             proc_info_arr = (RM_PROCESS_INFO * n_proc_info_needed.value)()
+ 91:             n_proc_info.value = n_proc_info_needed.value
+ 92: 
+ 93:             res = rstrtmgr.RmGetList(
+ 94:                 session_handle,
+ 95:                 ctypes.byref(n_proc_info_needed),
+ 96:                 ctypes.byref(n_proc_info),
+ 97:                 proc_info_arr,
+ 98:                 ctypes.byref(reboot_reasons)
+ 99:             )
+100: 
+101:             if res == 0:
+102:                 for i in range(n_proc_info.value):
+103:                     pid = proc_info_arr[i].Process.dwProcessId
+104:                     if pid and pid != os.getpid():
+105:                         pids.append(pid)
+106:     except Exception:
+107:         pass
+108:     finally:
+109:         rstrtmgr.RmEndSession(session_handle)
+110: 
+111:     return pids
+112: 
+113: 
+114: def get_process_telemetry(filepath: str = "", pid: int | None = None) -> dict:
+115:     """
+116:     Resolve true process attribution, parent lineage, and command-line execution arguments.
+117: 
+118:     Returns:
+119:         {
+120:             "pid": int | None,
+121:             "name": str,
+122:             "cmdline": str,
+123:             "ppid": int | None,
+124:             "parent_name": str,
+125:             "lineage": str,
+126:         }
+127:     """
+128:     target_pid = pid
+129:     if isinstance(filepath, int) and target_pid is None:
+130:         target_pid = filepath
+131:         filepath = ""
+132: 
+133:     # 1. Try Windows Restart Manager on the target file
+134:     if not target_pid and filepath and os.path.exists(filepath):
+135:         pids = get_file_locking_pids(filepath)
+136:         if pids:
+137:             target_pid = pids[0]
+138: 
+139:     # 2. Fallback: Query Foreground Window if available
+140:     if not target_pid and sys.platform == "win32":
+141:         try:
+142:             hwnd = ctypes.windll.user32.GetForegroundWindow()
+143:             if hwnd:
+144:                 win_pid = ctypes.c_ulong()
+145:                 ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
+146:                 if win_pid.value and win_pid.value != os.getpid():
+147:                     target_pid = win_pid.value
+148:         except Exception:
+149:             pass
+150: 
+151:     if not target_pid:
+152:         return {
+153:             "pid": None,
+154:             "name": "System / Background",
+155:             "cmdline": "N/A",
+156:             "ppid": None,
+157:             "parent_name": "N/A",
+158:             "lineage": "System / Background",
+159:         }
+160: 
+161:     try:
+162:         proc = psutil.Process(target_pid)
+163:         proc_name = proc.name()
+164:         try:
+165:             cmdline_list = proc.cmdline()
+166:             cmdline = " ".join(cmdline_list) if cmdline_list else proc_name
+167:         except (psutil.AccessDenied, psutil.ZombieProcess):
+168:             cmdline = proc_name
+169: 
+170:         ppid = proc.ppid()
+171:         parent_name = "N/A"
+172:         try:
+173:             parent = proc.parent()
+174:             if parent:
+175:                 parent_name = parent.name()
+176:         except (psutil.AccessDenied, psutil.NoSuchProcess):
+177:             pass
+178: 
+179:         lineage = f"{parent_name} (PID {ppid}) → {proc_name} (PID {target_pid})" if ppid else f"{proc_name} (PID {target_pid})"
+180: 
+181:         return {
+182:             "pid": target_pid,
+183:             "name": proc_name,
+184:             "cmdline": cmdline[:300],  # cap at 300 chars
+185:             "ppid": ppid,
+186:             "parent_name": parent_name,
+187:             "lineage": lineage,
+188:         }
+189:     except (psutil.NoSuchProcess, psutil.AccessDenied):
+190:         return {
+191:             "pid": target_pid,
+192:             "name": "System / Background",
+193:             "cmdline": "N/A",
+194:             "ppid": None,
+195:             "parent_name": "N/A",
+196:             "lineage": "System / Background",
+197:         }
+198: 
+199: 
+200: def terminate_process(pid: int) -> dict:
+201:     """
+202:     Safely terminate an unapproved exfiltration or suspicious utility process.
+203:     Enforces strict guardrails to prevent terminating core Windows system processes.
+204:     """
+205:     if not pid or pid <= 4 or pid == os.getpid():
+206:         return {"success": False, "error": "Cannot terminate current or root system process."}
+207: 
+208:     try:
+209:         proc = psutil.Process(pid)
+210:         proc_name = proc.name().lower()
+211: 
+212:         if proc_name in _PROTECTED_PROCESSES:
+213:             return {
+214:                 "success": False,
+215:                 "error": f"Protection Policy: Termination of core process '{proc_name}' is forbidden."
+216:             }
+217: 
+218:         proc.kill()
+219:         return {
+220:             "success": True,
+221:             "message": f"Successfully terminated suspicious process '{proc_name}' (PID {pid})."
+222:         }
+223:     except psutil.NoSuchProcess:
+224:         return {"success": False, "error": f"Process PID {pid} is no longer running."}
+225:     except psutil.AccessDenied:
+226:         return {"success": False, "error": f"Access Denied: Insufficient privilege to terminate PID {pid}."}
+227:     except Exception as e:
+228:         return {"success": False, "error": str(e)}
+</file>
+
+<file path="repomix.config.json">
+ 1: {
+ 2:   "$schema": "https://repomix.com/schemas/repomix.config.json",
+ 3:   "output": {
+ 4:     "filePath": "repomix-output.xml",
+ 5:     "style": "xml",
+ 6:     "removeComments": false,
+ 7:     "removeEmptyLines": false,
+ 8:     "showLineNumbers": true,
+ 9:     "topFiles": [
+10:       "README.md",
+11:       "main.py",
+12:       "config.py",
+13:       "monitor.py",
+14:       "detector.py",
+15:       "hasher.py",
+16:       "logger.py",
+17:       "alerter.py",
+18:       "reporter.py",
+19:       "dashboard/app.py",
+20:       "requirements.txt"
+21:     ]
+22:   },
+23:   "include": [
+24:     "**/*"
+25:   ],
+26:   "ignore": {
+27:     "useGitignore": true,
+28:     "useDefaultPatterns": true,
+29:     "customPatterns": [
+30:       "logs/**",
+31:       "reports/**",
+32:       "__pycache__/**",
+33:       "*.pyc",
+34:       "desktop.ini",
+35:       "thumbs.db"
+36:     ]
+37:   }
+38: }
+</file>
+
+<file path="reporter.py">
+  1: """
+  2: reporter.py - Audit Report Generator
+  3: Reads audit.log and produces a formatted text report with summary stats and event table.
+  4: """
+  5: 
+  6: import os
+  7: from datetime import datetime
+  8: from tabulate import tabulate
+  9: 
+ 10: from config import REPORT_DIR, AUDIT_LOG_PATH
+ 11: from logger import load_logs, get_stats
+ 12: 
+ 13: os.makedirs(REPORT_DIR, exist_ok=True)
+ 14: 
+ 15: 
+ 16: def generate_report(output_path: str = None) -> str:
+ 17:     """
+ 18:     Generate a comprehensive audit report from the current audit.log.
+ 19: 
+ 20:     Args:
+ 21:         output_path: Optional custom file path. Defaults to
+ 22:                      reports/audit_report_<timestamp>.txt
+ 23: 
+ 24:     Returns:
+ 25:         Absolute path to the generated report file.
+ 26:     """
+ 27:     if not output_path:
+ 28:         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+ 29:         output_path = os.path.join(REPORT_DIR, f"audit_report_{ts}.txt")
+ 30: 
+ 31:     entries = load_logs()
+ 32:     stats   = get_stats()
+ 33:     now     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+ 34: 
+ 35:     lines = []
+ 36: 
+ 37:     # ─── Header ───────────────────────────────────────────────────────────────
+ 38:     lines.append("=" * 72)
+ 39:     lines.append("  SECURE FILE TRANSFER MONITORING SYSTEM — AUDIT REPORT")
+ 40:     lines.append("=" * 72)
+ 41:     lines.append(f"  Generated : {now}")
+ 42:     lines.append(f"  Log file  : {AUDIT_LOG_PATH}")
+ 43:     lines.append("=" * 72)
+ 44:     lines.append("")
+ 45: 
+ 46:     # ─── Summary Statistics ───────────────────────────────────────────────────
+ 47:     lines.append("[ SUMMARY STATISTICS ]")
+ 48:     lines.append("")
+ 49:     summary_table = [
+ 50:         ["Total Events",            stats["total"]],
+ 51:         ["INFO",                    stats["info"]],
+ 52:         ["WARNING",                 stats["warning"]],
+ 53:         ["CRITICAL",                stats["critical"]],
+ 54:         ["Integrity OK",            stats["integrity_ok"]],
+ 55:         ["Integrity TAMPERED",      stats["integrity_tampered"]],
+ 56:     ]
+ 57:     lines.append(tabulate(summary_table, headers=["Metric", "Count"], tablefmt="grid"))
+ 58:     lines.append("")
+ 59: 
+ 60:     # ─── Top Suspicious Sources ───────────────────────────────────────────────
+ 61:     critical_entries = [e for e in entries if e.get("alert_level") == "CRITICAL"]
+ 62:     warning_entries  = [e for e in entries if e.get("alert_level") == "WARNING"]
+ 63: 
+ 64:     if critical_entries or warning_entries:
+ 65:         lines.append("[ POLICY VIOLATIONS ]")
+ 66:         lines.append("")
+ 67:         violations = []
+ 68:         for e in (critical_entries + warning_entries):
+ 69:             violations.append([
+ 70:                 e.get("timestamp", "")[:19],
+ 71:                 e.get("alert_level", ""),
+ 72:                 e.get("event_type", ""),
+ 73:                 _truncate(e.get("source", ""), 35),
+ 74:                 _truncate(e.get("destination", ""), 25),
+ 75:                 e.get("user", ""),
+ 76:                 e.get("integrity_status", ""),
+ 77:             ])
+ 78:         headers = ["Timestamp", "Level", "Event", "Source", "Destination", "User", "Integrity"]
+ 79:         lines.append(tabulate(violations, headers=headers, tablefmt="grid"))
+ 80:         lines.append("")
+ 81: 
+ 82:     # ─── Full Event Log ───────────────────────────────────────────────────────
+ 83:     lines.append("[ FULL EVENT LOG ]")
+ 84:     lines.append("")
+ 85:     if not entries:
+ 86:         lines.append("  No events recorded.")
+ 87:     else:
+ 88:         rows = []
+ 89:         for e in entries[-100:]:   # Last 100 entries in report
+ 90:             rows.append([
+ 91:                 e.get("timestamp", "")[:19],
+ 92:                 e.get("alert_level", ""),
+ 93:                 e.get("event_type", ""),
+ 94:                 _truncate(e.get("source", ""), 40),
+ 95:                 _truncate(e.get("destination", ""), 30),
+ 96:                 e.get("user", ""),
+ 97:                 e.get("integrity_status", ""),
+ 98:             ])
+ 99:         headers = ["Timestamp", "Level", "Event", "Source", "Destination", "User", "Integrity"]
+100:         lines.append(tabulate(rows, headers=headers, tablefmt="simple"))
+101: 
+102:     lines.append("")
+103:     lines.append("=" * 72)
+104:     lines.append("  END OF REPORT")
+105:     lines.append("=" * 72)
+106: 
+107:     report_text = "\n".join(lines)
+108: 
+109:     # Write to file
+110:     with open(output_path, "w", encoding="utf-8") as f:
+111:         f.write(report_text)
+112: 
+113:     print(report_text)
+114:     print(f"\n  Report saved → {output_path}")
+115:     return output_path
+116: 
+117: 
+118: def _truncate(text: str, max_len: int) -> str:
+119:     """Truncate a string to max_len characters, adding '…' if cut."""
+120:     if not text:
+121:         return ""
+122:     return text if len(text) <= max_len else text[:max_len - 1] + "…"
+</file>
+
 <file path="tests/test_new_features.py">
   1: """
   2: tests/test_new_features.py - Verification Tests for Findings and Enhanced Capabilities
@@ -1715,569 +2110,6 @@ This section contains the contents of the repository's files.
 347:             shutil.rmtree(test_dir, ignore_errors=True)
 </file>
 
-<file path="diff_tracker.py">
-  1: """
-  2: diff_tracker.py - Exact File Content Diff & Change Tracking Engine
-  3: Tracks before-and-after content modifications for files in real time.
-  4: Computes unified diffs for text/code/config files and byte deltas for binary documents.
-  5: """
-  6: 
-  7: from __future__ import annotations
-  8: 
-  9: import difflib
- 10: import os
- 11: import time
- 12: 
- 13: # In-memory baseline content & size caches: {norm_path: text_content}
- 14: _content_cache: dict[str, str] = {}
- 15: _size_cache: dict[str, int] = {}
- 16: 
- 17: # Max file size to cache text content for diffing (1 MB)
- 18: _MAX_DIFF_TEXT_SIZE = 1024 * 1024
- 19: 
- 20: 
- 21: def _is_binary_file(filepath: str) -> bool:
- 22:     """Return True if file is binary (contains null bytes or non-text extension)."""
- 23:     _, ext = os.path.splitext(filepath.lower())
- 24:     if ext in {
- 25:         ".docx", ".xlsx", ".pptx", ".pdf", ".zip", ".rar", ".tar", ".gz",
- 26:         ".7z", ".db", ".sqlite", ".png", ".jpg", ".jpeg", ".ico", ".exe",
- 27:         ".dll", ".bin", ".dat", ".pfx", ".p12"
- 28:     }:
- 29:         return True
- 30: 
- 31:     try:
- 32:         with open(filepath, "rb") as f:
- 33:             chunk = f.read(1024)
- 34:             if b"\x00" in chunk:
- 35:                 return True
- 36:     except Exception:
- 37:         return True
- 38:     return False
- 39: 
- 40: 
- 41: def _read_text_safely(filepath: str, retries: int = 3) -> str | None:
- 42:     """Read file as text with encoding fallbacks and Windows file-lock retry backoff."""
- 43:     for attempt in range(max(1, retries)):
- 44:         try:
- 45:             with open(filepath, "r", encoding="utf-8", errors="replace") as f:
- 46:                 return f.read()
- 47:         except PermissionError:
- 48:             if attempt < retries - 1:
- 49:                 time.sleep(0.05 * (attempt + 1))
- 50:             else:
- 51:                 return None
- 52:         except Exception:
- 53:             return None
- 54:     return None
- 55: 
- 56: 
- 57: def record_initial_state(filepath: str):
- 58:     """Snapshot a file's initial content/size when first observed."""
- 59:     if not filepath or not os.path.isfile(filepath):
- 60:         return
- 61:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
- 62:     try:
- 63:         size = os.path.getsize(filepath)
- 64:         _size_cache[norm] = size
- 65:         if size <= _MAX_DIFF_TEXT_SIZE and not _is_binary_file(filepath):
- 66:             content = _read_text_safely(filepath)
- 67:             if content is not None:
- 68:                 _content_cache[norm] = content
- 69:     except Exception:
- 70:         pass
- 71: 
- 72: 
- 73: def compute_file_diff(event_type: str, src_path: str, dest_path: str = "") -> dict:
- 74:     """
- 75:     Compute what actually changed in the file during an event.
- 76: 
- 77:     Returns a structured dictionary:
- 78:       - type: 'text' | 'binary' | 'lifecycle'
- 79:       - summary: Brief human-readable delta (e.g. '+3 lines, -1 line (+48 bytes)')
- 80:       - added_count: Number of added lines (for text)
- 81:       - removed_count: Number of deleted lines (for text)
- 82:       - snippet: Formatted unified diff or binary status string
- 83:       - size_delta: Byte difference (positive or negative)
- 84:     """
- 85:     target_path = dest_path if (event_type == "MOVED" and dest_path) else src_path
- 86:     if not target_path:
- 87:         return {"type": "none", "summary": "No target path", "snippet": ""}
- 88: 
- 89:     norm = os.path.normcase(os.path.normpath(os.path.abspath(target_path)))
- 90:     src_norm = os.path.normcase(os.path.normpath(os.path.abspath(src_path)))
- 91: 
- 92:     # 1. CREATED
- 93:     if event_type in ("CREATED", "CREATED_DIR"):
- 94:         size = 0
- 95:         try:
- 96:             if os.path.exists(target_path):
- 97:                 size = os.path.getsize(target_path)
- 98:         except OSError:
- 99:             pass
-100: 
-101:         _size_cache[norm] = size
-102:         if not _is_binary_file(target_path) and size <= _MAX_DIFF_TEXT_SIZE:
-103:             content = _read_text_safely(target_path) or ""
-104:             _content_cache[norm] = content
-105:             line_count = len(content.splitlines())
-106:             return {
-107:                 "type": "text",
-108:                 "summary": f"Initial file created ({line_count} lines, {size:,} bytes)",
-109:                 "added_count": line_count,
-110:                 "removed_count": 0,
-111:                 "size_delta": size,
-112:                 "snippet": f"+++ Initial File Content ({line_count} lines, {size:,} bytes) +++",
-113:             }
-114:         return {
-115:             "type": "binary",
-116:             "summary": f"New file created ({size:,} bytes)",
-117:             "added_count": 0,
-118:             "removed_count": 0,
-119:             "size_delta": size,
-120:             "snippet": f"[Binary payload established: {size:,} bytes]",
-121:         }
-122: 
-123:     # 2. DELETED
-124:     if event_type in ("DELETED", "DELETED_DIR"):
-125:         old_size = _size_cache.pop(src_norm, 0)
-126:         _content_cache.pop(src_norm, None)
-127:         return {
-128:             "type": "lifecycle",
-129:             "summary": f"File deleted from disk ({old_size:,} bytes removed)",
-130:             "added_count": 0,
-131:             "removed_count": 0,
-132:             "size_delta": -old_size,
-133:             "snippet": f"--- File Removed ({old_size:,} bytes) ---",
-134:         }
-135: 
-136:     # 3. MOVED
-137:     if event_type in ("MOVED", "MOVED_DIR"):
-138:         old_size = _size_cache.pop(src_norm, 0)
-139:         old_content = _content_cache.pop(src_norm, None)
-140: 
-141:         new_size = old_size
-142:         try:
-143:             if os.path.exists(target_path):
-144:                 new_size = os.path.getsize(target_path)
-145:         except OSError:
-146:             pass
-147: 
-148:         _size_cache[norm] = new_size
-149:         if old_content is not None:
-150:             _content_cache[norm] = old_content
-151: 
-152:         dest_name = os.path.basename(dest_path) if dest_path else "new destination"
-153:         return {
-154:             "type": "lifecycle",
-155:             "summary": f"Relocated to: {dest_path or target_path} ({new_size:,} bytes)",
-156:             "added_count": 0,
-157:             "removed_count": 0,
-158:             "size_delta": 0,
-159:             "snippet": f"→ Transferred to {dest_name}",
-160:         }
-161: 
-162:     # 4. MODIFIED
-163:     old_size = _size_cache.get(norm, 0)
-164:     new_size = old_size
-165:     try:
-166:         if os.path.exists(target_path):
-167:             new_size = os.path.getsize(target_path)
-168:     except OSError:
-169:         pass
-170:     size_delta = new_size - old_size
-171:     _size_cache[norm] = new_size
-172: 
-173:     # Check if text file for unified diff
-174:     if not _is_binary_file(target_path) and new_size <= _MAX_DIFF_TEXT_SIZE:
-175:         new_content = _read_text_safely(target_path)
-176:         old_content = _content_cache.get(norm)
-177: 
-178:         if new_content is not None and old_content is not None:
-179:             old_lines = old_content.splitlines(keepends=True)
-180:             new_lines = new_content.splitlines(keepends=True)
-181: 
-182:             diff_generator = difflib.unified_diff(
-183:                 old_lines,
-184:                 new_lines,
-185:                 fromfile="previous",
-186:                 tofile="current",
-187:                 n=2,
-188:             )
-189:             diff_lines = list(diff_generator)
-190: 
-191:             added = [l.rstrip("\r\n") for l in diff_lines if l.startswith("+") and not l.startswith("+++")]
-192:             removed = [l.rstrip("\r\n") for l in diff_lines if l.startswith("-") and not l.startswith("---")]
-193: 
-194:             _content_cache[norm] = new_content
-195: 
-196:             if added or removed:
-197:                 delta_sign = "+" if size_delta >= 0 else ""
-198:                 summary = f"+{len(added)} added, -{len(removed)} removed ({delta_sign}{size_delta:,} bytes)"
-199:                 snippet_text = "".join(diff_lines[:40])  # Cap at 40 lines
-200:                 if len(diff_lines) > 40:
-201:                     snippet_text += f"\n... [{len(diff_lines) - 40} additional lines truncated]"
-202:                 return {
-203:                     "type": "text",
-204:                     "summary": summary,
-205:                     "added_count": len(added),
-206:                     "removed_count": len(removed),
-207:                     "added_samples": added[:5],
-208:                     "removed_samples": removed[:5],
-209:                     "size_delta": size_delta,
-210:                     "snippet": snippet_text,
-211:                 }
-212: 
-213:         if new_content is not None:
-214:             _content_cache[norm] = new_content
-215: 
-216:     # Binary or non-diffable file
-217:     delta_sign = "+" if size_delta >= 0 else ""
-218:     summary = f"Binary content modified: {old_size:,} bytes → {new_size:,} bytes ({delta_sign}{size_delta:,} bytes)"
-219:     return {
-220:         "type": "binary",
-221:         "summary": summary,
-222:         "added_count": 0,
-223:         "removed_count": 0,
-224:         "size_delta": size_delta,
-225:         "snippet": f"[Binary Payload: {delta_sign}{size_delta:,} bytes change]",
-226:     }
-</file>
-
-<file path="repomix.config.json">
- 1: {
- 2:   "$schema": "https://repomix.com/schemas/repomix.config.json",
- 3:   "output": {
- 4:     "filePath": "repomix-output.xml",
- 5:     "style": "xml",
- 6:     "removeComments": false,
- 7:     "removeEmptyLines": false,
- 8:     "showLineNumbers": true,
- 9:     "topFiles": [
-10:       "README.md",
-11:       "main.py",
-12:       "config.py",
-13:       "monitor.py",
-14:       "detector.py",
-15:       "hasher.py",
-16:       "logger.py",
-17:       "alerter.py",
-18:       "reporter.py",
-19:       "dashboard/app.py",
-20:       "requirements.txt"
-21:     ]
-22:   },
-23:   "include": [
-24:     "**/*"
-25:   ],
-26:   "ignore": {
-27:     "useGitignore": true,
-28:     "useDefaultPatterns": true,
-29:     "customPatterns": [
-30:       "logs/**",
-31:       "reports/**",
-32:       "__pycache__/**",
-33:       "*.pyc",
-34:       "desktop.ini",
-35:       "thumbs.db"
-36:     ]
-37:   }
-38: }
-</file>
-
-<file path="reporter.py">
-  1: """
-  2: reporter.py - Audit Report Generator
-  3: Reads audit.log and produces a formatted text report with summary stats and event table.
-  4: """
-  5: 
-  6: import os
-  7: from datetime import datetime
-  8: from tabulate import tabulate
-  9: 
- 10: from config import REPORT_DIR, AUDIT_LOG_PATH
- 11: from logger import load_logs, get_stats
- 12: 
- 13: os.makedirs(REPORT_DIR, exist_ok=True)
- 14: 
- 15: 
- 16: def generate_report(output_path: str = None) -> str:
- 17:     """
- 18:     Generate a comprehensive audit report from the current audit.log.
- 19: 
- 20:     Args:
- 21:         output_path: Optional custom file path. Defaults to
- 22:                      reports/audit_report_<timestamp>.txt
- 23: 
- 24:     Returns:
- 25:         Absolute path to the generated report file.
- 26:     """
- 27:     if not output_path:
- 28:         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
- 29:         output_path = os.path.join(REPORT_DIR, f"audit_report_{ts}.txt")
- 30: 
- 31:     entries = load_logs()
- 32:     stats   = get_stats()
- 33:     now     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
- 34: 
- 35:     lines = []
- 36: 
- 37:     # ─── Header ───────────────────────────────────────────────────────────────
- 38:     lines.append("=" * 72)
- 39:     lines.append("  SECURE FILE TRANSFER MONITORING SYSTEM — AUDIT REPORT")
- 40:     lines.append("=" * 72)
- 41:     lines.append(f"  Generated : {now}")
- 42:     lines.append(f"  Log file  : {AUDIT_LOG_PATH}")
- 43:     lines.append("=" * 72)
- 44:     lines.append("")
- 45: 
- 46:     # ─── Summary Statistics ───────────────────────────────────────────────────
- 47:     lines.append("[ SUMMARY STATISTICS ]")
- 48:     lines.append("")
- 49:     summary_table = [
- 50:         ["Total Events",            stats["total"]],
- 51:         ["INFO",                    stats["info"]],
- 52:         ["WARNING",                 stats["warning"]],
- 53:         ["CRITICAL",                stats["critical"]],
- 54:         ["Integrity OK",            stats["integrity_ok"]],
- 55:         ["Integrity TAMPERED",      stats["integrity_tampered"]],
- 56:     ]
- 57:     lines.append(tabulate(summary_table, headers=["Metric", "Count"], tablefmt="grid"))
- 58:     lines.append("")
- 59: 
- 60:     # ─── Top Suspicious Sources ───────────────────────────────────────────────
- 61:     critical_entries = [e for e in entries if e.get("alert_level") == "CRITICAL"]
- 62:     warning_entries  = [e for e in entries if e.get("alert_level") == "WARNING"]
- 63: 
- 64:     if critical_entries or warning_entries:
- 65:         lines.append("[ POLICY VIOLATIONS ]")
- 66:         lines.append("")
- 67:         violations = []
- 68:         for e in (critical_entries + warning_entries):
- 69:             violations.append([
- 70:                 e.get("timestamp", "")[:19],
- 71:                 e.get("alert_level", ""),
- 72:                 e.get("event_type", ""),
- 73:                 _truncate(e.get("source", ""), 35),
- 74:                 _truncate(e.get("destination", ""), 25),
- 75:                 e.get("user", ""),
- 76:                 e.get("integrity_status", ""),
- 77:             ])
- 78:         headers = ["Timestamp", "Level", "Event", "Source", "Destination", "User", "Integrity"]
- 79:         lines.append(tabulate(violations, headers=headers, tablefmt="grid"))
- 80:         lines.append("")
- 81: 
- 82:     # ─── Full Event Log ───────────────────────────────────────────────────────
- 83:     lines.append("[ FULL EVENT LOG ]")
- 84:     lines.append("")
- 85:     if not entries:
- 86:         lines.append("  No events recorded.")
- 87:     else:
- 88:         rows = []
- 89:         for e in entries[-100:]:   # Last 100 entries in report
- 90:             rows.append([
- 91:                 e.get("timestamp", "")[:19],
- 92:                 e.get("alert_level", ""),
- 93:                 e.get("event_type", ""),
- 94:                 _truncate(e.get("source", ""), 40),
- 95:                 _truncate(e.get("destination", ""), 30),
- 96:                 e.get("user", ""),
- 97:                 e.get("integrity_status", ""),
- 98:             ])
- 99:         headers = ["Timestamp", "Level", "Event", "Source", "Destination", "User", "Integrity"]
-100:         lines.append(tabulate(rows, headers=headers, tablefmt="simple"))
-101: 
-102:     lines.append("")
-103:     lines.append("=" * 72)
-104:     lines.append("  END OF REPORT")
-105:     lines.append("=" * 72)
-106: 
-107:     report_text = "\n".join(lines)
-108: 
-109:     # Write to file
-110:     with open(output_path, "w", encoding="utf-8") as f:
-111:         f.write(report_text)
-112: 
-113:     print(report_text)
-114:     print(f"\n  Report saved → {output_path}")
-115:     return output_path
-116: 
-117: 
-118: def _truncate(text: str, max_len: int) -> str:
-119:     """Truncate a string to max_len characters, adding '…' if cut."""
-120:     if not text:
-121:         return ""
-122:     return text if len(text) <= max_len else text[:max_len - 1] + "…"
-</file>
-
-<file path=".gitignore">
- 1: # Python bytecode
- 2: __pycache__/
- 3: *.py[cod]
- 4: *$py.class
- 5: 
- 6: # Application runtime logs and reports
- 7: logs/*.log
- 8: reports/*.txt
- 9: data/*.db
-10: data/quarantine/*
-11: 
-12: # Packaging & compiler artifacts
-13: build/
-14: dist/
-15: tools/
-16: *.wixobj
-17: *.wixpdb
-18: 
-19: # OS metadata
-20: desktop.ini
-21: thumbs.db
-22: .DS_Store
-23: 
-24: # Virtual environment / IDE
-25: venv/
-26: .env
-27: .vscode/
-28: .idea/
-</file>
-
-<file path="alerter.py">
-  1: """
-  2: alerter.py - Alert Generation & Policy Violation Notification
-  3: Writes alerts to logs/alerts.log and prints to console (colorama).
-  4: Supports desktop toast notification callbacks when running in Desktop App mode.
-  5: Entirely local — no network dependency. Safe on Windows cp1252.
-  6: """
-  7: 
-  8: import json
-  9: import os
- 10: import sys
- 11: from datetime import datetime
- 12: 
- 13: from colorama import Fore, Back, Style, init as colorama_init
- 14: 
- 15: from config import ALERT_LOG_PATH, LOG_DIR
- 16: 
- 17: colorama_init(autoreset=True)
- 18: os.makedirs(LOG_DIR, exist_ok=True)
- 19: 
- 20: # Console display prefix per level (pure ASCII safe)
- 21: _LEVEL_STYLE = {
- 22:     "INFO":     (Fore.CYAN,   "[INFO] "),
- 23:     "WARNING":  (Fore.YELLOW, "[WARN] "),
- 24:     "CRITICAL": (Fore.RED,    "[CRIT] "),
- 25: }
- 26: 
- 27: # Optional desktop notification callback (registered by desktop app)
- 28: _desktop_notifier = None
- 29: 
- 30: 
- 31: def register_desktop_notifier(callback):
- 32:     """Register a callback function to display native OS notifications."""
- 33:     global _desktop_notifier
- 34:     _desktop_notifier = callback
- 35: 
- 36: 
- 37: def trigger_alert(level: str, message: str, event_data: dict = None, risk_score: int = 0):
- 38:     """
- 39:     Generate an alert at the specified severity level.
- 40: 
- 41:     - Writes to logs/alerts.log (JSON-line format)
- 42:     - Prints a formatted, color-coded message to the console
- 43:     - Prints a full banner for CRITICAL alerts
- 44:     - Dispatches native OS notification if desktop mode is active
- 45: 
- 46:     Args:
- 47:         level:      'INFO', 'WARNING', or 'CRITICAL'
- 48:         message:    Human-readable alert summary
- 49:         event_data: Optional dict of event context (source, destination, etc.)
- 50:         risk_score: Numerical risk score (0-100)
- 51:     """
- 52:     ts = datetime.now().isoformat()
- 53:     alert_entry = {
- 54:         "timestamp":  ts,
- 55:         "level":      level,
- 56:         "risk_score": risk_score,
- 57:         "message":    message,
- 58:         "event_data": event_data or {},
- 59:     }
- 60: 
- 61:     # Write to alerts log
- 62:     with open(ALERT_LOG_PATH, "a", encoding="utf-8") as f:
- 63:         f.write(json.dumps(alert_entry) + "\n")
- 64: 
- 65:     # Console output
- 66:     color, icon = _LEVEL_STYLE.get(level, (Fore.WHITE, "[ALERT]"))
- 67:     ts_short = datetime.now().strftime("%H:%M:%S")
- 68: 
- 69:     if level == "CRITICAL":
- 70:         _print_critical_banner(message, event_data, ts_short, risk_score)
- 71:     else:
- 72:         out = f"{color}{ts_short} {icon} [{level} | Risk {risk_score:02d}] {message}{Style.RESET_ALL}"
- 73:         try:
- 74:             print(out)
- 75:         except UnicodeEncodeError:
- 76:             print(out.encode("ascii", errors="replace").decode("ascii"))
- 77: 
- 78:     # Native desktop toast notification for policy violations
- 79:     if level in ("WARNING", "CRITICAL") and _desktop_notifier:
- 80:         try:
- 81:             _desktop_notifier(level, message, event_data or {})
- 82:         except Exception:
- 83:             pass
- 84: 
- 85: 
- 86: def _print_critical_banner(message: str, event_data: dict, ts: str, risk_score: int = 0):
- 87:     """Print a loud CRITICAL alert banner to the console."""
- 88:     src  = event_data.get("source", "N/A")      if event_data else "N/A"
- 89:     dest = event_data.get("destination", "N/A") if event_data else "N/A"
- 90:     user = event_data.get("user", "N/A")        if event_data else "N/A"
- 91: 
- 92:     line = "=" * 62
- 93:     banner = f"""
- 94: {Fore.RED}{Back.BLACK}
- 95: +{line}+
- 96: |  [!]  CRITICAL SECURITY ALERT (RISK {risk_score:02d}/100)  {ts:>17}  |
- 97: +{line}+
- 98: |  {message[:60]:<60}  |
- 99: |  User   : {user[:52]:<52}  |
-100: |  Source : {src[:52]:<52}  |
-101: |  Dest   : {dest[:52]:<52}  |
-102: +{line}+
-103: {Style.RESET_ALL}"""
-104:     try:
-105:         print(banner)
-106:     except UnicodeEncodeError:
-107:         print(banner.encode("ascii", errors="replace").decode("ascii"))
-108: 
-109: 
-110: def load_alerts(limit: int = 50) -> list[dict]:
-111:     """
-112:     Read the most recent alert entries from alerts.log.
-113: 
-114:     Args:
-115:         limit: Maximum number of alerts to return.
-116: 
-117:     Returns:
-118:         List of alert dicts, most recent last.
-119:     """
-120:     if not os.path.exists(ALERT_LOG_PATH):
-121:         return []
-122: 
-123:     alerts = []
-124:     with open(ALERT_LOG_PATH, "r", encoding="utf-8") as f:
-125:         for line in f:
-126:             line = line.strip()
-127:             if not line:
-128:                 continue
-129:             try:
-130:                 alerts.append(json.loads(line))
-131:             except json.JSONDecodeError:
-132:                 continue
-133: 
-134:     return alerts[-limit:]
-</file>
-
 <file path="app_desktop.py">
   1: """
   2: app_desktop.py - Native Windows Desktop Application for FileSentinel DLP
@@ -2616,6 +2448,425 @@ This section contains the contents of the repository's files.
 107: Write-Host ("  Standalone Executable : {0} ({1:N2} MB)" -f $ExeItem.FullName, ($ExeItem.Length / 1MB)) -ForegroundColor Cyan
 108: Write-Host ("  Windows Installer MSI : {0} ({1:N2} MB)" -f $MsiItem.FullName, ($MsiItem.Length / 1MB)) -ForegroundColor Cyan
 109: Write-Host "========================================================`n" -ForegroundColor Green
+</file>
+
+<file path="FileSentinel.spec">
+ 1: # -*- mode: python ; coding: utf-8 -*-
+ 2: from PyInstaller.utils.hooks import collect_all
+ 3: 
+ 4: datas = [('dashboard/templates', 'dashboard/templates'), ('dashboard/static', 'dashboard/static'), ('assets', 'assets')]
+ 5: binaries = []
+ 6: hiddenimports = []
+ 7: tmp_ret = collect_all('webview')
+ 8: datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+ 9: tmp_ret = collect_all('pystray')
+10: datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+11: 
+12: 
+13: a = Analysis(
+14:     ['main.py'],
+15:     pathex=[],
+16:     binaries=binaries,
+17:     datas=datas,
+18:     hiddenimports=hiddenimports,
+19:     hookspath=[],
+20:     hooksconfig={},
+21:     runtime_hooks=[],
+22:     excludes=[],
+23:     noarchive=False,
+24:     optimize=0,
+25: )
+26: pyz = PYZ(a.pure)
+27: 
+28: exe = EXE(
+29:     pyz,
+30:     a.scripts,
+31:     a.binaries,
+32:     a.datas,
+33:     [],
+34:     name='FileSentinel',
+35:     debug=False,
+36:     bootloader_ignore_signals=False,
+37:     strip=False,
+38:     upx=True,
+39:     upx_exclude=[],
+40:     runtime_tmpdir=None,
+41:     console=False,
+42:     disable_windowed_traceback=False,
+43:     argv_emulation=False,
+44:     target_arch=None,
+45:     codesign_identity=None,
+46:     entitlements_file=None,
+47:     version='C:/Users/Sven/Desktop/NTFS UM Project 2/installer/version_info.txt',
+48:     icon=['assets/icon.ico'],
+49: )
+</file>
+
+<file path="requirements.txt">
+ 1: # Secure File Transfer Monitoring System - Dependencies
+ 2: # hashlib is a Python built-in - NOT listed here, no install needed
+ 3: 
+ 4: # Core Engine
+ 5: watchdog>=3.0.0        # Filesystem event monitoring
+ 6: psutil>=5.9.0          # Process tracking (optional - for process name lookup)
+ 7: flask>=3.0.0           # Local web dashboard (no internet required)
+ 8: tabulate>=0.9.0        # Formatted tables in reports
+ 9: colorama>=0.4.6        # Colored console output (always-on, works without network)
+10: 
+11: # Desktop Application & GUI
+12: pywebview>=5.0.0       # Native Windows desktop window for dashboard (Edge/Chromium)
+13: pystray>=0.19.0        # System tray icon & native Windows notifications
+14: Pillow>=10.0.0         # Icon rendering & graphics processing
+</file>
+
+<file path=".gitignore">
+ 1: # Python bytecode
+ 2: __pycache__/
+ 3: *.py[cod]
+ 4: *$py.class
+ 5: 
+ 6: # Application runtime logs and reports
+ 7: logs/*.log
+ 8: reports/*.txt
+ 9: data/*.db
+10: data/quarantine/*
+11: vault/
+12: 
+13: # Packaging & compiler artifacts
+14: build/
+15: dist/
+16: tools/
+17: *.wixobj
+18: *.wixpdb
+19: 
+20: # OS metadata
+21: desktop.ini
+22: thumbs.db
+23: .DS_Store
+24: 
+25: # Virtual environment / IDE
+26: venv/
+27: .env
+28: .vscode/
+29: .idea/
+</file>
+
+<file path="alerter.py">
+  1: """
+  2: alerter.py - Alert Generation & Policy Violation Notification
+  3: Writes alerts to logs/alerts.log and prints to console (colorama).
+  4: Supports desktop toast notification callbacks when running in Desktop App mode.
+  5: Entirely local — no network dependency. Safe on Windows cp1252.
+  6: """
+  7: 
+  8: import json
+  9: import os
+ 10: import sys
+ 11: from datetime import datetime
+ 12: 
+ 13: from colorama import Fore, Back, Style, init as colorama_init
+ 14: 
+ 15: from config import ALERT_LOG_PATH, LOG_DIR
+ 16: 
+ 17: colorama_init(autoreset=True)
+ 18: os.makedirs(LOG_DIR, exist_ok=True)
+ 19: 
+ 20: # Console display prefix per level (pure ASCII safe)
+ 21: _LEVEL_STYLE = {
+ 22:     "INFO":     (Fore.CYAN,   "[INFO] "),
+ 23:     "WARNING":  (Fore.YELLOW, "[WARN] "),
+ 24:     "CRITICAL": (Fore.RED,    "[CRIT] "),
+ 25: }
+ 26: 
+ 27: # Optional desktop notification callback (registered by desktop app)
+ 28: _desktop_notifier = None
+ 29: 
+ 30: 
+ 31: def register_desktop_notifier(callback):
+ 32:     """Register a callback function to display native OS notifications."""
+ 33:     global _desktop_notifier
+ 34:     _desktop_notifier = callback
+ 35: 
+ 36: 
+ 37: def trigger_alert(level: str, message: str, event_data: dict = None, risk_score: int = 0):
+ 38:     """
+ 39:     Generate an alert at the specified severity level.
+ 40: 
+ 41:     - Writes to logs/alerts.log (JSON-line format)
+ 42:     - Prints a formatted, color-coded message to the console
+ 43:     - Prints a full banner for CRITICAL alerts
+ 44:     - Dispatches native OS notification if desktop mode is active
+ 45: 
+ 46:     Args:
+ 47:         level:      'INFO', 'WARNING', or 'CRITICAL'
+ 48:         message:    Human-readable alert summary
+ 49:         event_data: Optional dict of event context (source, destination, etc.)
+ 50:         risk_score: Numerical risk score (0-100)
+ 51:     """
+ 52:     ts = datetime.now().isoformat()
+ 53:     alert_entry = {
+ 54:         "timestamp":  ts,
+ 55:         "level":      level,
+ 56:         "risk_score": risk_score,
+ 57:         "message":    message,
+ 58:         "event_data": event_data or {},
+ 59:     }
+ 60: 
+ 61:     # Write to alerts log
+ 62:     with open(ALERT_LOG_PATH, "a", encoding="utf-8") as f:
+ 63:         f.write(json.dumps(alert_entry) + "\n")
+ 64: 
+ 65:     # Console output
+ 66:     color, icon = _LEVEL_STYLE.get(level, (Fore.WHITE, "[ALERT]"))
+ 67:     ts_short = datetime.now().strftime("%H:%M:%S")
+ 68: 
+ 69:     if level == "CRITICAL":
+ 70:         _print_critical_banner(message, event_data, ts_short, risk_score)
+ 71:     else:
+ 72:         out = f"{color}{ts_short} {icon} [{level} | Risk {risk_score:02d}] {message}{Style.RESET_ALL}"
+ 73:         try:
+ 74:             print(out)
+ 75:         except UnicodeEncodeError:
+ 76:             print(out.encode("ascii", errors="replace").decode("ascii"))
+ 77: 
+ 78:     # Native desktop toast notification for policy violations
+ 79:     if level in ("WARNING", "CRITICAL") and _desktop_notifier:
+ 80:         try:
+ 81:             _desktop_notifier(level, message, event_data or {})
+ 82:         except Exception:
+ 83:             pass
+ 84: 
+ 85: 
+ 86: def _print_critical_banner(message: str, event_data: dict, ts: str, risk_score: int = 0):
+ 87:     """Print a loud CRITICAL alert banner to the console."""
+ 88:     src  = event_data.get("source", "N/A")      if event_data else "N/A"
+ 89:     dest = event_data.get("destination", "N/A") if event_data else "N/A"
+ 90:     user = event_data.get("user", "N/A")        if event_data else "N/A"
+ 91: 
+ 92:     line = "=" * 62
+ 93:     banner = f"""
+ 94: {Fore.RED}{Back.BLACK}
+ 95: +{line}+
+ 96: |  [!]  CRITICAL SECURITY ALERT (RISK {risk_score:02d}/100)  {ts:>17}  |
+ 97: +{line}+
+ 98: |  {message[:60]:<60}  |
+ 99: |  User   : {user[:52]:<52}  |
+100: |  Source : {src[:52]:<52}  |
+101: |  Dest   : {dest[:52]:<52}  |
+102: +{line}+
+103: {Style.RESET_ALL}"""
+104:     try:
+105:         print(banner)
+106:     except UnicodeEncodeError:
+107:         print(banner.encode("ascii", errors="replace").decode("ascii"))
+108: 
+109: 
+110: def load_alerts(limit: int = 50) -> list[dict]:
+111:     """
+112:     Read the most recent alert entries from alerts.log.
+113: 
+114:     Args:
+115:         limit: Maximum number of alerts to return.
+116: 
+117:     Returns:
+118:         List of alert dicts, most recent last.
+119:     """
+120:     if not os.path.exists(ALERT_LOG_PATH):
+121:         return []
+122: 
+123:     alerts = []
+124:     with open(ALERT_LOG_PATH, "r", encoding="utf-8") as f:
+125:         for line in f:
+126:             line = line.strip()
+127:             if not line:
+128:                 continue
+129:             try:
+130:                 alerts.append(json.loads(line))
+131:             except json.JSONDecodeError:
+132:                 continue
+133: 
+134:     return alerts[-limit:]
+</file>
+
+<file path="config.py">
+  1: """
+  2: config.py - Central Configuration for Secure File Transfer Monitoring System
+  3: Adjust these values to match your environment before running.
+  4: """
+  5: 
+  6: import os
+  7: import sys
+  8: 
+  9: # =============================================================================
+ 10: # MONITORING TARGETS & DYNAMIC RESOLUTION
+ 11: # =============================================================================
+ 12: # Baseline directories to watch
+ 13: DEFAULT_MONITORED_DIRECTORIES = [
+ 14:     os.path.expanduser("~/Desktop"),
+ 15:     os.path.expanduser("~/Documents"),
+ 16:     os.path.expanduser("~/Downloads"),
+ 17: ]
+ 18: 
+ 19: 
+ 20: def get_auto_discovered_targets() -> list[str]:
+ 21:     """
+ 22:     Dynamically discover all relevant monitoring targets:
+ 23:       1. Default user folders (Desktop, Documents, Downloads).
+ 24:       2. OneDrive redirected folders (e.g. %OneDrive%\\Desktop).
+ 25:       3. Active Cloud-sync roots (Dropbox, Google Drive, iCloud, Nextcloud).
+ 26:       4. Active Removable Media (USB flash drives, external drives).
+ 27:     """
+ 28:     targets: set[str] = set()
+ 29: 
+ 30:     # 1. Base user profile paths
+ 31:     for p in DEFAULT_MONITORED_DIRECTORIES:
+ 32:         expanded = os.path.normpath(os.path.abspath(os.path.expanduser(p)))
+ 33:         if os.path.isdir(expanded):
+ 34:             targets.add(expanded)
+ 35: 
+ 36:     user_home = os.path.expanduser("~")
+ 37: 
+ 38:     # 2. Known cloud sync directories
+ 39:     cloud_candidates = [
+ 40:         os.environ.get("OneDrive"),
+ 41:         os.environ.get("OneDriveConsumer"),
+ 42:         os.environ.get("OneDriveCommercial"),
+ 43:         os.path.join(user_home, "Dropbox"),
+ 44:         os.path.join(user_home, "Google Drive"),
+ 45:         os.path.join(user_home, "iCloudDrive"),
+ 46:         os.path.join(user_home, "Box"),
+ 47:         os.path.join(user_home, "Nextcloud"),
+ 48:     ]
+ 49: 
+ 50:     for candidate in cloud_candidates:
+ 51:         if candidate and os.path.isdir(candidate):
+ 52:             targets.add(os.path.normpath(os.path.abspath(candidate)))
+ 53: 
+ 54:     # 3. Dynamic Windows Removable Drive Discovery (USB drives, network drives)
+ 55:     if sys.platform == "win32":
+ 56:         try:
+ 57:             import ctypes
+ 58:             # GetLogicalDrives returns a bitmask of available drives (bit 0 = A, bit 1 = B, etc.)
+ 59:             bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+ 60:             for i in range(26):
+ 61:                 if bitmask & (1 << i):
+ 62:                     drive_letter = f"{chr(65 + i)}:\\"
+ 63:                     dtype = ctypes.windll.kernel32.GetDriveTypeW(drive_letter)
+ 64:                     # 2 = DRIVE_REMOVABLE (USB flash drives, SD cards)
+ 65:                     # 4 = DRIVE_REMOTE    (Mapped network drives)
+ 66:                     if dtype in (2, 4) and os.path.isdir(drive_letter):
+ 67:                         targets.add(os.path.normpath(drive_letter))
+ 68:         except Exception:
+ 69:             pass
+ 70: 
+ 71:     return sorted(list(targets))
+ 72: 
+ 73: 
+ 74: MONITORED_DIRECTORIES = get_auto_discovered_targets()
+ 75: 
+ 76: # =============================================================================
+ 77: # SENSITIVE FILE CRITERIA
+ 78: # =============================================================================
+ 79: SENSITIVE_EXTENSIONS = [
+ 80:     ".key", ".pem", ".pfx", ".p12",          # Cryptographic keys / certs
+ 81:     ".docx", ".xlsx", ".pptx", ".pdf",       # Office documents
+ 82:     ".db", ".sqlite", ".sql",                 # Databases
+ 83:     ".csv", ".json", ".xml",                  # Data files
+ 84:     ".py", ".sh", ".bat", ".ps1",            # Scripts
+ 85:     ".zip", ".rar", ".tar", ".gz", ".7z",   # Archives (potential exfil containers)
+ 86:     ".env", ".cfg", ".ini", ".conf",         # Config / secrets
+ 87:     ".bak", ".backup",                        # Backup files
+ 88: ]
+ 89: 
+ 90: # Dedicated directories containing confidential or restricted data
+ 91: SENSITIVE_DIRECTORIES = [
+ 92:     os.path.expanduser("~/Documents/Confidential"),
+ 93:     os.path.expanduser("~/Desktop/Confidential"),
+ 94: ]
+ 95: 
+ 96: # =============================================================================
+ 97: # IGNORED FILES & SYSTEM NOISE
+ 98: # =============================================================================
+ 99: IGNORED_EXTENSIONS = [
+100:     ".tmp", ".crdownload", ".part", ".lock", ".swp",
+101: ]
+102: 
+103: IGNORED_FILENAMES = [
+104:     "desktop.ini", "thumbs.db", ".ds_store",
+105: ]
+106: 
+107: # =============================================================================
+108: # SUSPICIOUS DESTINATIONS
+109: # =============================================================================
+110: # Fallback drive letters for non-Windows or offline environments
+111: SUSPICIOUS_DRIVE_LETTERS = ["D:\\", "E:\\", "F:\\", "G:\\", "H:\\"]
+112: 
+113: SUSPICIOUS_PATH_KEYWORDS = [
+114:     "OneDrive", "Dropbox", "Google Drive", "iCloud", "Box",
+115:     "RECYCLER", "$Recycle.Bin",
+116:     "Temp", "tmp",
+117: ]
+118: 
+119: SUSPICIOUS_NETWORK_PREFIXES = [
+120:     "\\\\", "//",
+121: ]
+122: 
+123: # =============================================================================
+124: # ALERT LEVELS
+125: # =============================================================================
+126: ALERT_LEVELS = {
+127:     "INFO":     "INFO",
+128:     "WARNING":  "WARNING",
+129:     "CRITICAL": "CRITICAL",
+130: }
+131: 
+132: # =============================================================================
+133: # LOGGING & OUTPUT PATHS & RESOURCE RESOLUTION (PyInstaller Frozen Support)
+134: # =============================================================================
+135: if getattr(sys, "frozen", False):
+136:     RESOURCE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+137:     _exe_dir = os.path.dirname(sys.executable)
+138:     try:
+139:         _test_file = os.path.join(_exe_dir, ".perm_test")
+140:         with open(_test_file, "w") as _f:
+141:             _f.write("1")
+142:         os.remove(_test_file)
+143:         BASE_DIR = _exe_dir
+144:     except (PermissionError, OSError):
+145:         BASE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "FileSentinel")
+146: else:
+147:     RESOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+148:     BASE_DIR = RESOURCE_DIR
+149: 
+150: LOG_DIR         = os.path.join(BASE_DIR, "logs")
+151: REPORT_DIR      = os.path.join(BASE_DIR, "reports")
+152: 
+153: AUDIT_LOG_PATH  = os.path.join(LOG_DIR, "audit.log")
+154: ALERT_LOG_PATH  = os.path.join(LOG_DIR, "alerts.log")
+155: 
+156: # Ensure log and report directories exist
+157: os.makedirs(LOG_DIR, exist_ok=True)
+158: os.makedirs(REPORT_DIR, exist_ok=True)
+159: 
+160: # =============================================================================
+161: # HASHING
+162: # =============================================================================
+163: HASH_ALGORITHM  = "sha256"
+164: HASH_CHUNK_SIZE = 65536
+165: 
+166: # =============================================================================
+167: # DASHBOARD SETTINGS
+168: # =============================================================================
+169: DASHBOARD_ENABLED   = True
+170: DASHBOARD_HOST      = "127.0.0.1"
+171: DASHBOARD_PORT      = 5000
+172: DASHBOARD_DEBUG     = False
+173: LOGS_PER_PAGE       = 50
+174: 
+175: # =============================================================================
+176: # PROCESS TRACKING
+177: # =============================================================================
+178: ENABLE_PROCESS_TRACKING = True
 </file>
 
 <file path="detector.py">
@@ -2981,58 +3232,6 @@ This section contains the contents of the repository's files.
 360:     return score, level
 </file>
 
-<file path="FileSentinel.spec">
- 1: # -*- mode: python ; coding: utf-8 -*-
- 2: from PyInstaller.utils.hooks import collect_all
- 3: 
- 4: datas = [('dashboard/templates', 'dashboard/templates'), ('dashboard/static', 'dashboard/static'), ('assets', 'assets')]
- 5: binaries = []
- 6: hiddenimports = []
- 7: tmp_ret = collect_all('webview')
- 8: datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
- 9: tmp_ret = collect_all('pystray')
-10: datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-11: 
-12: 
-13: a = Analysis(
-14:     ['main.py'],
-15:     pathex=[],
-16:     binaries=binaries,
-17:     datas=datas,
-18:     hiddenimports=hiddenimports,
-19:     hookspath=[],
-20:     hooksconfig={},
-21:     runtime_hooks=[],
-22:     excludes=[],
-23:     noarchive=False,
-24:     optimize=0,
-25: )
-26: pyz = PYZ(a.pure)
-27: 
-28: exe = EXE(
-29:     pyz,
-30:     a.scripts,
-31:     a.binaries,
-32:     a.datas,
-33:     [],
-34:     name='FileSentinel',
-35:     debug=False,
-36:     bootloader_ignore_signals=False,
-37:     strip=False,
-38:     upx=True,
-39:     upx_exclude=[],
-40:     runtime_tmpdir=None,
-41:     console=False,
-42:     disable_windowed_traceback=False,
-43:     argv_emulation=False,
-44:     target_arch=None,
-45:     codesign_identity=None,
-46:     entitlements_file=None,
-47:     version='C:/Users/Sven/Desktop/NTFS UM Project 2/installer/version_info.txt',
-48:     icon=['assets/icon.ico'],
-49: )
-</file>
-
 <file path="logger.py">
   1: """
   2: logger.py - Structured Audit Logging Module
@@ -3351,21 +3550,178 @@ This section contains the contents of the repository's files.
 315:         print(banner.encode("ascii", errors="replace").decode("ascii"))
 </file>
 
-<file path="requirements.txt">
- 1: # Secure File Transfer Monitoring System - Dependencies
- 2: # hashlib is a Python built-in - NOT listed here, no install needed
- 3: 
- 4: # Core Engine
- 5: watchdog>=3.0.0        # Filesystem event monitoring
- 6: psutil>=5.9.0          # Process tracking (optional - for process name lookup)
- 7: flask>=3.0.0           # Local web dashboard (no internet required)
- 8: tabulate>=0.9.0        # Formatted tables in reports
- 9: colorama>=0.4.6        # Colored console output (always-on, works without network)
-10: 
-11: # Desktop Application & GUI
-12: pywebview>=5.0.0       # Native Windows desktop window for dashboard (Edge/Chromium)
-13: pystray>=0.19.0        # System tray icon & native Windows notifications
-14: Pillow>=10.0.0         # Icon rendering & graphics processing
+<file path="main.py">
+  1: """
+  2: main.py - Secure File Transfer Monitoring System — Entry Point
+  3: Usage:
+  4:   python main.py                        # Default: Launch native Windows Desktop App
+  5:   python main.py --desktop              # Launch full native Windows Desktop App (Window + Tray + Alerts)
+  6:   python main.py --monitor              # Monitor + colorama console (no dashboard)
+  7:   python main.py --monitor --dashboard  # Monitor + console + web dashboard in browser
+  8:   python main.py --dashboard-only       # Dashboard only (view existing logs in browser)
+  9:   python main.py --report               # Generate text audit report
+ 10:   python main.py --test-hash <file>     # Compute and print hash of a file
+ 11: """
+ 12: 
+ 13: import argparse
+ 14: import sys
+ 15: import os
+ 16: import threading
+ 17: import time
+ 18: 
+ 19: # Ensure parent directory is importable
+ 20: sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ 21: 
+ 22: from logger import print_banner
+ 23: from monitor import FileMonitor
+ 24: from hasher import compute_hash
+ 25: from reporter import generate_report
+ 26: from config import DASHBOARD_HOST, DASHBOARD_PORT, HASH_ALGORITHM
+ 27: 
+ 28: 
+ 29: def cmd_desktop():
+ 30:     """Launch the native desktop window application."""
+ 31:     print_banner()
+ 32:     try:
+ 33:         from app_desktop import launch_desktop_app
+ 34:         launch_desktop_app()
+ 35:     except (KeyboardInterrupt, SystemExit):
+ 36:         print("\n  [+] FileSentinel shutdown requested. Exiting...")
+ 37:         os._exit(0)
+ 38:     except ImportError as e:
+ 39:         print(f"  [ERROR] Desktop GUI dependency missing: {e}")
+ 40:         print("  Install desktop dependencies with: pip install pywebview pystray Pillow")
+ 41:         sys.exit(1)
+ 42: 
+ 43: 
+ 44: def cmd_monitor(with_dashboard: bool):
+ 45:     """Start filesystem monitoring with optional dashboard."""
+ 46:     print_banner()
+ 47:     monitor = FileMonitor()
+ 48: 
+ 49:     if with_dashboard:
+ 50:         _launch_dashboard_thread()
+ 51: 
+ 52:     try:
+ 53:         monitor.start()
+ 54:         while True:
+ 55:             time.sleep(0.5)
+ 56:     except (KeyboardInterrupt, SystemExit):
+ 57:         try:
+ 58:             monitor.stop()
+ 59:         except Exception:
+ 60:             pass
+ 61:         print("\n  Logs saved. Run 'python main.py --report' for a full audit report.")
+ 62:         os._exit(0)
+ 63: 
+ 64: 
+ 65: def cmd_dashboard_only():
+ 66:     """Launch dashboard without starting the file monitor."""
+ 67:     print_banner()
+ 68:     print("  [Dashboard-only mode] File monitoring is NOT active.\n")
+ 69:     try:
+ 70:         _launch_dashboard_blocking()
+ 71:     except (KeyboardInterrupt, SystemExit):
+ 72:         print("\n  Dashboard stopped.")
+ 73:         os._exit(0)
+ 74: 
+ 75: 
+ 76: def cmd_report():
+ 77:     """Generate and print a text audit report."""
+ 78:     print_banner()
+ 79:     generate_report()
+ 80: 
+ 81: 
+ 82: def cmd_test_hash(filepath: str):
+ 83:     """Compute and display the hash of a single file."""
+ 84:     if not os.path.isfile(filepath):
+ 85:         print(f"  [ERROR] File not found: {filepath}")
+ 86:         sys.exit(1)
+ 87: 
+ 88:     digest = compute_hash(filepath, HASH_ALGORITHM)
+ 89:     size   = os.path.getsize(filepath)
+ 90:     print(f"\n  File      : {filepath}")
+ 91:     print(f"  Size      : {size:,} bytes")
+ 92:     print(f"  Algorithm : {HASH_ALGORITHM.upper()}")
+ 93:     print(f"  Hash      : {digest}\n")
+ 94: 
+ 95: 
+ 96: def _launch_dashboard_thread():
+ 97:     """Start the Flask dashboard in a background daemon thread."""
+ 98:     try:
+ 99:         from dashboard.app import run_dashboard
+100:         thread = threading.Thread(
+101:             target=run_dashboard,
+102:             kwargs={"host": DASHBOARD_HOST, "port": DASHBOARD_PORT},
+103:             daemon=True,
+104:         )
+105:         thread.start()
+106:         time.sleep(1)  # Brief pause to let Flask bind before monitor prints
+107:     except ImportError as e:
+108:         print(f"  [WARNING] Dashboard skipped: {e}")
+109:         print("  Run 'pip install flask' to enable the dashboard.")
+110: 
+111: 
+112: def _launch_dashboard_blocking():
+113:     """Start the Flask dashboard (blocking — main thread)."""
+114:     try:
+115:         from dashboard.app import run_dashboard
+116:         run_dashboard(host=DASHBOARD_HOST, port=DASHBOARD_PORT)
+117:     except ImportError:
+118:         print("  [ERROR] Flask is not installed. Run 'pip install flask' first.")
+119:         sys.exit(1)
+120: 
+121: 
+122: # ── CLI Argument Parser ───────────────────────────────────────────────────────
+123: def main():
+124:     # If launched with no arguments (e.g. double-clicked executable / shortcut),
+125:     # launch the native desktop application by default.
+126:     if len(sys.argv) == 1:
+127:         cmd_desktop()
+128:         return
+129: 
+130:     parser = argparse.ArgumentParser(
+131:         prog="FileSentinel",
+132:         description="Secure File Transfer Monitoring & DLP System",
+133:         formatter_class=argparse.RawDescriptionHelpFormatter,
+134:         epilog="""
+135: Examples:
+136:   python main.py                            # Launch native Windows Desktop App (default)
+137:   python main.py --desktop                  # Launch native Windows Desktop App
+138:   python main.py --monitor                  # Console monitoring only
+139:   python main.py --monitor --dashboard      # Monitor + web dashboard in browser
+140:   python main.py --dashboard-only           # View logs in browser
+141:   python main.py --report                   # Generate audit report
+142:   python main.py --test-hash secret.docx   # Hash a specific file
+143:         """,
+144:     )
+145: 
+146:     group = parser.add_mutually_exclusive_group(required=True)
+147:     group.add_argument("--desktop", "--gui", action="store_true", help="Launch native Windows desktop application")
+148:     group.add_argument("--monitor",          action="store_true", help="Start filesystem monitoring")
+149:     group.add_argument("--dashboard-only",   action="store_true", help="Launch dashboard without monitoring")
+150:     group.add_argument("--report",           action="store_true", help="Generate audit report")
+151:     group.add_argument("--test-hash",        metavar="FILE",      help="Compute SHA256 hash of a file")
+152: 
+153:     parser.add_argument("--dashboard", action="store_true",
+154:                         help="[with --monitor] Also launch the web dashboard in browser")
+155: 
+156:     args = parser.parse_args()
+157: 
+158:     if args.desktop:
+159:         cmd_desktop()
+160:     elif args.monitor:
+161:         cmd_monitor(with_dashboard=args.dashboard)
+162:     elif args.dashboard_only:
+163:         cmd_dashboard_only()
+164:     elif args.report:
+165:         cmd_report()
+166:     elif args.test_hash:
+167:         cmd_test_hash(args.test_hash)
+168: 
+169: 
+170: if __name__ == "__main__":
+171:     main()
 </file>
 
 <file path="dashboard/static/style.css">
@@ -4620,6 +4976,169 @@ This section contains the contents of the repository's files.
 1249:   color: #ff7b72;
 1250:   border: 1px solid rgba(248, 81, 73, 0.3);
 1251: }
+1252: 
+1253: /* ═══════════════════════════════════════════════════════════════════════
+1254:    Folder Browser in Monitored Directories Modal
+1255:    ═══════════════════════════════════════════════════════════════════════ */
+1256: .btn-modal-browse {
+1257:   background: var(--bg-card);
+1258:   border: 1px solid var(--border);
+1259:   color: var(--text-primary);
+1260:   padding: 7px 12px;
+1261:   border-radius: var(--radius);
+1262:   font-size: 12px;
+1263:   font-weight: 600;
+1264:   cursor: pointer;
+1265:   white-space: nowrap;
+1266:   transition: all 0.15s ease;
+1267: }
+1268: .btn-modal-browse:hover {
+1269:   background: var(--bg-hover);
+1270:   border-color: var(--accent);
+1271:   color: #fff;
+1272: }
+1273: .browser-panel {
+1274:   background: var(--bg-card);
+1275:   border: 1px solid var(--border);
+1276:   border-radius: var(--radius);
+1277:   padding: 10px 12px;
+1278:   margin-top: 8px;
+1279:   display: flex;
+1280:   flex-direction: column;
+1281:   gap: 8px;
+1282: }
+1283: .browser-header {
+1284:   display: flex;
+1285:   justify-content: space-between;
+1286:   align-items: center;
+1287: }
+1288: .browser-title {
+1289:   font-size: 11px;
+1290:   font-weight: 700;
+1291:   text-transform: uppercase;
+1292:   color: var(--accent);
+1293:   letter-spacing: 0.5px;
+1294: }
+1295: .btn-browser-nav {
+1296:   background: var(--bg-elevated);
+1297:   border: 1px solid var(--border);
+1298:   color: var(--text-primary);
+1299:   padding: 2px 8px;
+1300:   border-radius: 4px;
+1301:   cursor: pointer;
+1302:   font-size: 11px;
+1303:   font-weight: 500;
+1304: }
+1305: .btn-browser-nav:hover:not(:disabled) {
+1306:   background: var(--bg-hover);
+1307:   border-color: var(--accent);
+1308: }
+1309: .browser-current-path {
+1310:   font-size: 11px;
+1311:   color: #a5d6ff;
+1312:   background: var(--bg-base);
+1313:   border: 1px solid var(--border-subtle);
+1314:   padding: 5px 8px;
+1315:   border-radius: 4px;
+1316:   word-break: break-all;
+1317: }
+1318: .browser-quick-bar {
+1319:   display: flex;
+1320:   gap: 6px;
+1321:   flex-wrap: wrap;
+1322: }
+1323: .browser-quick-pill {
+1324:   background: var(--bg-elevated);
+1325:   border: 1px solid var(--border-subtle);
+1326:   color: var(--text-secondary);
+1327:   padding: 3px 8px;
+1328:   border-radius: 12px;
+1329:   font-size: 11px;
+1330:   cursor: pointer;
+1331:   transition: all 0.15s ease;
+1332: }
+1333: .browser-quick-pill:hover {
+1334:   background: var(--info-bg);
+1335:   color: var(--accent);
+1336:   border-color: var(--accent);
+1337: }
+1338: .browser-subfolder-list {
+1339:   max-height: 150px;
+1340:   overflow-y: auto;
+1341:   display: flex;
+1342:   flex-direction: column;
+1343:   gap: 2px;
+1344:   background: var(--bg-base);
+1345:   border: 1px solid var(--border-subtle);
+1346:   border-radius: 4px;
+1347:   padding: 4px;
+1348: }
+1349: .browser-folder-item {
+1350:   display: flex;
+1351:   align-items: center;
+1352:   gap: 6px;
+1353:   padding: 5px 8px;
+1354:   border-radius: 4px;
+1355:   font-size: 11.5px;
+1356:   color: var(--text-primary);
+1357:   cursor: pointer;
+1358:   transition: background 0.15s;
+1359: }
+1360: .browser-folder-item:hover {
+1361:   background: var(--bg-hover);
+1362:   color: var(--accent);
+1363: }
+1364: .browser-footer {
+1365:   display: flex;
+1366:   justify-content: flex-end;
+1367:   margin-top: 2px;
+1368: }
+1369: .btn-use-folder {
+1370:   background: rgba(63, 185, 80, 0.15);
+1371:   border: 1px solid rgba(63, 185, 80, 0.4);
+1372:   color: #56d364;
+1373:   padding: 5px 12px;
+1374:   border-radius: var(--radius);
+1375:   font-size: 11.5px;
+1376:   font-weight: 600;
+1377:   cursor: pointer;
+1378: }
+1379: .btn-use-folder:hover:not(:disabled) {
+1380:   background: rgba(63, 185, 80, 0.3);
+1381:   color: #fff;
+1382: }
+1383: .btn-use-folder:disabled {
+1384:   opacity: 0.5;
+1385:   cursor: not-allowed;
+1386: }
+1387: 
+1388: /* Directory item badges */
+1389: .badge-status {
+1390:   padding: 1px 5px;
+1391:   border-radius: 8px;
+1392:   font-size: 10px;
+1393:   font-weight: 600;
+1394: }
+1395: .badge-status.active {
+1396:   background: rgba(63, 185, 80, 0.15);
+1397:   color: #56d364;
+1398: }
+1399: .badge-status.inactive {
+1400:   background: rgba(139, 148, 158, 0.15);
+1401:   color: #8b949e;
+1402: }
+1403: .badge-tag {
+1404:   background: var(--bg-elevated);
+1405:   border: 1px solid var(--border-subtle);
+1406:   color: var(--text-muted);
+1407:   padding: 1px 5px;
+1408:   border-radius: 8px;
+1409:   font-size: 10px;
+1410: }
+1411: .badge-tag.default {
+1412:   color: var(--info-color);
+1413:   border-color: rgba(88, 166, 255, 0.3);
+1414: }
 </file>
 
 <file path="dashboard/templates/index.html">
@@ -5288,14 +5807,14 @@ This section contains the contents of the repository's files.
  663:       <div class="remediation-box">
  664:         <div class="remediation-title">SOC One-Click Remediation</div>
  665:         <div class="remediation-btn-row">
- 666:           <button class="btn-remedy btn-quarantine" onclick="actionQuarantine('${escapeQuotes(e.source || "")}')">
+ 666:           <button class="btn-remedy btn-quarantine" onclick="actionQuarantine('${encodeURIComponent(e.source || "")}')">
  667:             🛡️ Quarantine File
  668:           </button>
  669:           ${e.process_pid && e.process_pid > 4 ? `
- 670:           <button class="btn-remedy btn-terminate" onclick="actionTerminate(${e.process_pid}, '${escapeQuotes(e.process || "")}')">
+ 670:           <button class="btn-remedy btn-terminate" onclick="actionTerminate(${e.process_pid}, '${encodeURIComponent(e.process || "")}')">
  671:             🛑 Terminate Process
  672:           </button>` : ""}
- 673:           <button class="btn-remedy btn-allowlist" onclick="actionAllowlist('${escapeQuotes(e.source || "")}', 'path')">
+ 673:           <button class="btn-remedy btn-allowlist" onclick="actionAllowlist('${encodeURIComponent(e.source || "")}', 'path')">
  674:             ✅ Add to Allowlist
  675:           </button>
  676:         </div>
@@ -5303,7 +5822,7 @@ This section contains the contents of the repository's files.
  678: 
  679:       <div class="action-footer">
  680:         <button class="btn-action" onclick="copyLogJson('${encodeURIComponent(JSON.stringify(e))}')">📋 Copy JSON</button>
- 681:         <button class="btn-action" onclick="copyText('${escapeQuotes(e.source || "")}')">📁 Copy Source</button>
+ 681:         <button class="btn-action" onclick="copyText('${encodeURIComponent(e.source || "")}')">📁 Copy Source</button>
  682:         <button class="btn-action secondary" onclick="closeDrawer()">✕ Close</button>
  683:       </div>
  684:     `;
@@ -5451,260 +5970,404 @@ This section contains the contents of the repository's files.
  826:     }
  827:   }
  828: 
- 829:   function copyText(txt) {
- 830:     navigator.clipboard.writeText(txt);
- 831:     alert("✓ Copied to clipboard:\n" + txt);
- 832:   }
- 833: 
- 834:   function setConnected(ok) {
- 835:     isConnected = ok;
- 836:     document.getElementById("statusDot").className   = "status-dot " + (ok ? "online" : "offline");
- 837:     document.getElementById("statusLabel").textContent = ok ? "Monitoring Active" : "Disconnected";
- 838:   }
- 839: 
- 840:   // ── Search / filter listeners ─────────────────────────────────────────────
- 841:   let searchDebounce;
- 842:   document.getElementById("searchInput").addEventListener("input", () => {
- 843:     clearTimeout(searchDebounce);
- 844:     searchDebounce = setTimeout(() => fetchLogs(1), 400);
- 845:   });
- 846:   document.getElementById("levelFilter").addEventListener("change", () => fetchLogs(1));
- 847:   document.getElementById("fileTypeFilter").addEventListener("change", () => fetchLogs(1));
- 848: 
- 849:   // ── Auto-refresh every 5 seconds ──────────────────────────────────────────
- 850:   function startRefresh() {
- 851:     fetchAll();
- 852:     refreshTimer = setInterval(fetchAll, 5000);
- 853:   }
- 854: 
- 855:   // ── SOC Remediation Handlers ─────────────────────────────────────────────
- 856:   async function actionQuarantine(filePath) {
- 857:     if (!filePath || filePath === "—") return;
- 858:     if (!confirm(`Are you sure you want to isolate & quarantine this file?\n\n${filePath}`)) return;
- 859:     try {
- 860:       const res = await fetch("/api/action/quarantine", {
- 861:         method: "POST",
- 862:         headers: { "Content-Type": "application/json" },
- 863:         body: JSON.stringify({ file_path: filePath })
- 864:       });
- 865:       const data = await res.json();
- 866:       if (res.ok && data.success) {
- 867:         alert(`✓ File successfully moved to Quarantine Vault:\nVault: ${data.quarantine_vault_path}`);
- 868:         fetchAll();
- 869:       } else {
- 870:         alert(`⚠️ Quarantine failed: ${data.error || "Unknown error"}`);
- 871:       }
- 872:     } catch (e) {
- 873:       alert(`⚠️ Quarantine request failed: ${e.message}`);
- 874:     }
- 875:   }
- 876: 
- 877:   async function actionTerminate(pid, procName) {
- 878:     if (!pid || pid <= 4) {
- 879:       alert("No valid process PID available for termination.");
- 880:       return;
- 881:     }
- 882:     if (!confirm(`⚠️ CRITICAL SOC ACTION:\nTerminate process "${procName}" (PID: ${pid})?`)) return;
- 883:     try {
- 884:       const res = await fetch("/api/action/terminate", {
- 885:         method: "POST",
- 886:         headers: { "Content-Type": "application/json" },
- 887:         body: JSON.stringify({ pid: pid })
- 888:       });
- 889:       const data = await res.json();
- 890:       if (res.ok && data.success) {
- 891:         alert(`✓ Process ${pid} (${procName}) terminated successfully.`);
- 892:       } else {
- 893:         alert(`⚠️ Termination failed: ${data.error || "Could not terminate process."}`);
- 894:       }
- 895:     } catch (e) {
- 896:       alert(`⚠️ Terminate request failed: ${e.message}`);
- 897:     }
- 898:   }
- 899: 
- 900:   async function actionAllowlist(entry, entryType = "path") {
- 901:     if (!entry) return;
- 902:     if (!confirm(`Add ${entryType} to Allowlist to suppress future alerts?\n\n${entry}`)) return;
- 903:     try {
- 904:       const res = await fetch("/api/action/allowlist", {
- 905:         method: "POST",
- 906:         headers: { "Content-Type": "application/json" },
- 907:         body: JSON.stringify({ entry: entry, entry_type: entryType, reason: "Added from Incident Drawer" })
- 908:       });
- 909:       const data = await res.json();
- 910:       if (res.ok && data.success) {
- 911:         alert(`✓ Entry added to Allowlist.`);
- 912:       } else {
- 913:         alert(`⚠️ Could not add to allowlist: ${data.error || "Unknown error"}`);
- 914:       }
- 915:     } catch (e) {
- 916:       alert(`⚠️ Allowlist request failed: ${e.message}`);
- 917:     }
- 918:   }
- 919: 
- 920:   // ── Monitored Directories Modal Handlers ──────────────────────────────────
- 921:   async function openDirectoriesModal() {
- 922:     document.getElementById("dirsModal").style.display = "flex";
- 923:     loadDirectories();
- 924:   }
- 925: 
- 926:   function closeDirectoriesModal() {
- 927:     document.getElementById("dirsModal").style.display = "none";
- 928:     document.getElementById("dirsFeedback").style.display = "none";
- 929:   }
+ 829:   function copyText(encodedTxt) {
+ 830:     const txt = decodeURIComponent(encodedTxt || "");
+ 831:     navigator.clipboard.writeText(txt);
+ 832:     alert("✓ Copied to clipboard:\n" + txt);
+ 833:   }
+ 834: 
+ 835:   function setConnected(ok) {
+ 836:     isConnected = ok;
+ 837:     document.getElementById("statusDot").className   = "status-dot " + (ok ? "online" : "offline");
+ 838:     document.getElementById("statusLabel").textContent = ok ? "Monitoring Active" : "Disconnected";
+ 839:   }
+ 840: 
+ 841:   // ── Search / filter listeners ─────────────────────────────────────────────
+ 842:   let searchDebounce;
+ 843:   document.getElementById("searchInput").addEventListener("input", () => {
+ 844:     clearTimeout(searchDebounce);
+ 845:     searchDebounce = setTimeout(() => fetchLogs(1), 400);
+ 846:   });
+ 847:   document.getElementById("levelFilter").addEventListener("change", () => fetchLogs(1));
+ 848:   document.getElementById("fileTypeFilter").addEventListener("change", () => fetchLogs(1));
+ 849: 
+ 850:   // ── Auto-refresh every 5 seconds ──────────────────────────────────────────
+ 851:   function startRefresh() {
+ 852:     fetchAll();
+ 853:     refreshTimer = setInterval(fetchAll, 5000);
+ 854:   }
+ 855: 
+ 856:   // ── SOC Remediation Handlers ─────────────────────────────────────────────
+ 857:   async function actionQuarantine(encodedFilePath) {
+ 858:     const filePath = decodeURIComponent(encodedFilePath || "");
+ 859:     if (!filePath || filePath === "—") {
+ 860:       alert("⚠️ No valid file path associated with this event.");
+ 861:       return;
+ 862:     }
+ 863:     if (!confirm(`Are you sure you want to isolate & quarantine this file?\n\n${filePath}`)) return;
+ 864:     try {
+ 865:       const res = await fetch("/api/action/quarantine", {
+ 866:         method: "POST",
+ 867:         headers: { "Content-Type": "application/json" },
+ 868:         body: JSON.stringify({ source: filePath, file_path: filePath, path: filePath })
+ 869:       });
+ 870:       const data = await res.json();
+ 871:       if (res.ok && data.success) {
+ 872:         alert(`✓ File successfully moved to Quarantine Vault:\nVault: ${data.quarantined_path || data.quarantine_vault_path || data.message}`);
+ 873:         fetchAll();
+ 874:       } else {
+ 875:         alert(`⚠️ Quarantine failed: ${data.error || "Unknown error"}`);
+ 876:       }
+ 877:     } catch (e) {
+ 878:       alert(`⚠️ Quarantine request failed: ${e.message}`);
+ 879:     }
+ 880:   }
+ 881: 
+ 882:   async function actionTerminate(pid, encodedProcName) {
+ 883:     const procName = decodeURIComponent(encodedProcName || "");
+ 884:     if (!pid || pid <= 4) {
+ 885:       alert("No valid process PID available for termination.");
+ 886:       return;
+ 887:     }
+ 888:     if (!confirm(`⚠️ CRITICAL SOC ACTION:\nTerminate process "${procName}" (PID: ${pid})?`)) return;
+ 889:     try {
+ 890:       const res = await fetch("/api/action/terminate", {
+ 891:         method: "POST",
+ 892:         headers: { "Content-Type": "application/json" },
+ 893:         body: JSON.stringify({ pid: pid })
+ 894:       });
+ 895:       const data = await res.json();
+ 896:       if (res.ok && data.success) {
+ 897:         alert(`✓ Process ${pid} (${procName}) terminated successfully.`);
+ 898:       } else {
+ 899:         alert(`⚠️ Termination failed: ${data.error || "Could not terminate process."}`);
+ 900:       }
+ 901:     } catch (e) {
+ 902:       alert(`⚠️ Terminate request failed: ${e.message}`);
+ 903:     }
+ 904:   }
+ 905: 
+ 906:   async function actionAllowlist(encodedEntry, entryType = "path") {
+ 907:     const entry = decodeURIComponent(encodedEntry || "");
+ 908:     if (!entry) return;
+ 909:     if (!confirm(`Add ${entryType} to Allowlist to suppress future alerts?\n\n${entry}`)) return;
+ 910:     try {
+ 911:       const res = await fetch("/api/action/allowlist", {
+ 912:         method: "POST",
+ 913:         headers: { "Content-Type": "application/json" },
+ 914:         body: JSON.stringify({ entry: entry, type: entryType, entry_type: entryType, reason: "Added from Incident Drawer" })
+ 915:       });
+ 916:       const data = await res.json();
+ 917:       if (res.ok && data.success) {
+ 918:         alert(`✓ Entry added to Allowlist.`);
+ 919:       } else {
+ 920:         alert(`⚠️ Could not add to allowlist: ${data.error || "Unknown error"}`);
+ 921:       }
+ 922:     } catch (e) {
+ 923:       alert(`⚠️ Allowlist request failed: ${e.message}`);
+ 924:     }
+ 925:   }
+ 926: 
+ 927:   // ── Monitored Directories Modal & Browsing Handlers ───────────────────────
+ 928:   let browserCurrentDir = "";
+ 929:   let browserParentDir  = "";
  930: 
- 931:   async function loadDirectories() {
- 932:     const listEl = document.getElementById("dirsList");
- 933:     try {
- 934:       const res = await fetch("/api/directories");
- 935:       const data = await res.json();
- 936:       const dirs = data.directories || [];
- 937:       if (dirs.length === 0) {
- 938:         listEl.innerHTML = `<div class="text-muted" style="padding: 10px; font-size: 12px;">No custom directories monitored yet.</div>`;
- 939:         return;
- 940:       }
- 941:       listEl.innerHTML = dirs.map(d => `
- 942:         <div class="modal-item">
- 943:           <span class="modal-item-path" title="${escapeHtml(d)}">${escapeHtml(d)}</span>
- 944:           <button class="btn-item-del" onclick="removeDirectory('${escapeQuotes(d)}')" title="Stop monitoring this folder">🗑️ Remove</button>
- 945:         </div>
- 946:       `).join("");
- 947:     } catch (e) {
- 948:       listEl.innerHTML = `<div class="text-crit" style="padding: 10px; font-size: 12px;">Failed to load directories.</div>`;
- 949:     }
- 950:   }
- 951: 
- 952:   async function addDirectory() {
- 953:     const input = document.getElementById("newDirInput");
- 954:     const dir = input.value.trim();
- 955:     const fb = document.getElementById("dirsFeedback");
- 956:     if (!dir) return;
- 957:     try {
- 958:       const res = await fetch("/api/directories/add", {
- 959:         method: "POST",
- 960:         headers: { "Content-Type": "application/json" },
- 961:         body: JSON.stringify({ directory: dir })
- 962:       });
- 963:       const data = await res.json();
- 964:       if (res.ok && data.success) {
- 965:         fb.textContent = `✓ Added: ${dir}`;
- 966:         fb.className = "modal-feedback success";
- 967:         input.value = "";
- 968:         loadDirectories();
- 969:       } else {
- 970:         fb.textContent = `⚠️ Error: ${data.error || "Failed to add directory"}`;
- 971:         fb.className = "modal-feedback error";
- 972:       }
- 973:     } catch (e) {
- 974:       fb.textContent = `⚠️ Network error: ${e.message}`;
- 975:       fb.className = "modal-feedback error";
- 976:     }
- 977:   }
- 978: 
- 979:   async function removeDirectory(dir) {
- 980:     if (!confirm(`Stop monitoring folder?\n${dir}`)) return;
- 981:     try {
- 982:       const res = await fetch("/api/directories/remove", {
- 983:         method: "POST",
- 984:         headers: { "Content-Type": "application/json" },
- 985:         body: JSON.stringify({ directory: dir })
- 986:       });
- 987:       const data = await res.json();
- 988:       if (res.ok && data.success) {
- 989:         loadDirectories();
- 990:       } else {
- 991:         alert(`⚠️ Error: ${data.error || "Failed to remove directory"}`);
- 992:       }
- 993:     } catch (e) {
- 994:       alert(`⚠️ Network error: ${e.message}`);
- 995:     }
- 996:   }
- 997: 
- 998:   // ── Quarantine Vault Modal Handlers ───────────────────────────────────────
- 999:   async function openVaultModal() {
-1000:     document.getElementById("vaultModal").style.display = "flex";
-1001:     loadVault();
-1002:   }
-1003: 
-1004:   function closeVaultModal() {
-1005:     document.getElementById("vaultModal").style.display = "none";
-1006:   }
-1007: 
-1008:   async function loadVault() {
-1009:     const listEl = document.getElementById("vaultList");
-1010:     try {
-1011:       const res = await fetch("/api/quarantine");
-1012:       const data = await res.json();
-1013:       const files = data.vault || data.quarantined_files || [];
-1014:       if (files.length === 0) {
-1015:         listEl.innerHTML = `<div class="text-muted" style="padding: 12px; font-size: 12px; text-align: center;">Quarantine Vault is currently empty.</div>`;
-1016:         return;
-1017:       }
-1018:       listEl.innerHTML = files.map(f => `
-1019:         <div class="modal-item" style="flex-direction: column; align-items: flex-start; gap: 4px;">
-1020:           <div style="display: flex; justify-content: space-between; width: 100%;">
-1021:             <strong style="color: #ff7b72; font-size: 12px;">${escapeHtml(getBasename(f.original_path))}</strong>
-1022:             <span style="font-size: 10.5px; color: var(--text-muted);">${(f.quarantined_at||"").replace("T"," ").slice(0,19)}</span>
-1023:           </div>
-1024:           <div class="mono" style="font-size: 11px; color: var(--text-secondary); word-break: break-all;">Original: ${escapeHtml(f.original_path)}</div>
-1025:           <div class="mono" style="font-size: 10.5px; color: var(--text-muted);">Vault: ${escapeHtml(f.quarantine_path)}</div>
-1026:         </div>
-1027:       `).join("");
-1028:     } catch (e) {
-1029:       listEl.innerHTML = `<div class="text-crit" style="padding: 10px; font-size: 12px;">Failed to load vault records.</div>`;
-1030:     }
-1031:   }
-1032: 
-1033:   startRefresh();
-1034: </script>
-1035: 
-1036: <!-- ═════════════════════════════ MODALS ══════════════════════════════════ -->
-1037: <!-- Monitored Directories Modal -->
-1038: <div class="modal-backdrop" id="dirsModal" style="display: none;" onclick="if(event.target===this) closeDirectoriesModal()">
-1039:   <div class="modal-box">
-1040:     <div class="modal-header">
-1041:       <div class="modal-title">📁 Monitored Directories</div>
-1042:       <button class="modal-close" onclick="closeDirectoriesModal()">✕</button>
-1043:     </div>
-1044:     <div class="modal-body">
-1045:       <div class="modal-section-title">Active Monitored Directories</div>
-1046:       <div class="modal-list" id="dirsList">
-1047:         <div class="text-muted">Loading monitored directories…</div>
-1048:       </div>
-1049:       <div class="modal-section-title" style="margin-top: 10px;">Add New Directory</div>
-1050:       <div class="modal-add-form">
-1051:         <input type="text" id="newDirInput" class="modal-input" placeholder="e.g. C:\Users\YourUser\Documents" />
-1052:         <button class="btn-modal-add" onclick="addDirectory()">➕ Add Folder</button>
-1053:       </div>
-1054:       <div class="modal-feedback" id="dirsFeedback"></div>
-1055:     </div>
-1056:     <div class="modal-footer">
-1057:       <button class="btn-action secondary" onclick="closeDirectoriesModal()">Close</button>
-1058:     </div>
-1059:   </div>
-1060: </div>
-1061: 
-1062: <!-- Quarantine Vault Modal -->
-1063: <div class="modal-backdrop" id="vaultModal" style="display: none;" onclick="if(event.target===this) closeVaultModal()">
-1064:   <div class="modal-box">
-1065:     <div class="modal-header">
-1066:       <div class="modal-title">🛡️ Quarantined Files Vault</div>
-1067:       <button class="modal-close" onclick="closeVaultModal()">✕</button>
-1068:     </div>
-1069:     <div class="modal-body">
-1070:       <div class="modal-section-title">Quarantined File Records</div>
-1071:       <div class="modal-list" id="vaultList">
-1072:         <div class="text-muted">Loading vault…</div>
-1073:       </div>
-1074:     </div>
-1075:     <div class="modal-footer">
-1076:       <button class="btn-action secondary" onclick="closeVaultModal()">Close</button>
-1077:     </div>
-1078:   </div>
-1079: </div>
-1080: 
-1081: </body>
-1082: </html>
+ 931:   async function openDirectoriesModal() {
+ 932:     document.getElementById("dirsModal").style.display = "flex";
+ 933:     loadDirectories();
+ 934:   }
+ 935: 
+ 936:   function closeDirectoriesModal() {
+ 937:     document.getElementById("dirsModal").style.display = "none";
+ 938:     document.getElementById("dirsFeedback").style.display = "none";
+ 939:     const panel = document.getElementById("browserPanel");
+ 940:     if (panel) panel.style.display = "none";
+ 941:   }
+ 942: 
+ 943:   async function loadDirectories() {
+ 944:     const listEl = document.getElementById("dirsList");
+ 945:     try {
+ 946:       const res = await fetch("/api/directories");
+ 947:       const data = await res.json();
+ 948:       const dirs = data.directories || [];
+ 949:       if (dirs.length === 0) {
+ 950:         listEl.innerHTML = `<div class="text-muted" style="padding: 10px; font-size: 12px;">No custom directories monitored yet.</div>`;
+ 951:         return;
+ 952:       }
+ 953:       listEl.innerHTML = dirs.map(d => {
+ 954:         const pathStr = typeof d === "string" ? d : (d.path || "");
+ 955:         const isCustom = typeof d === "object" ? d.is_custom : true;
+ 956:         const isActive = typeof d === "object" ? d.is_active : true;
+ 957:         const encodedPath = encodeURIComponent(pathStr);
+ 958:         return `
+ 959:           <div class="modal-item">
+ 960:             <div style="display:flex; flex-direction:column; gap:2px; flex:1; min-width:0;">
+ 961:               <span class="modal-item-path" title="${escapeHtml(pathStr)}">${escapeHtml(pathStr)}</span>
+ 962:               <div style="display:flex; gap:6px; font-size:10.5px;">
+ 963:                 <span class="badge-status ${isActive ? 'active' : 'inactive'}">${isActive ? '● Active' : '○ Inactive'}</span>
+ 964:                 ${isCustom ? '<span class="badge-tag">Custom</span>' : '<span class="badge-tag default">Default</span>'}
+ 965:               </div>
+ 966:             </div>
+ 967:             ${isCustom ? `<button class="btn-item-del" onclick="removeDirectory('${encodedPath}')" title="Stop monitoring this folder">🗑️ Remove</button>` : `<span style="font-size:11px; color:var(--text-muted); padding:3px 6px;">Protected</span>`}
+ 968:           </div>
+ 969:         `;
+ 970:       }).join("");
+ 971:     } catch (e) {
+ 972:       listEl.innerHTML = `<div class="text-crit" style="padding: 10px; font-size: 12px;">Failed to load directories: ${escapeHtml(e.message)}</div>`;
+ 973:     }
+ 974:   }
+ 975: 
+ 976:   function toggleFolderBrowser() {
+ 977:     const panel = document.getElementById("browserPanel");
+ 978:     if (panel.style.display === "none" || !panel.style.display) {
+ 979:       panel.style.display = "flex";
+ 980:       const existing = document.getElementById("newDirInput").value.trim();
+ 981:       browseDirectory(existing || "");
+ 982:     } else {
+ 983:       panel.style.display = "none";
+ 984:     }
+ 985:   }
+ 986: 
+ 987:   async function browseDirectory(path = "") {
+ 988:     const currentPathEl = document.getElementById("browserCurrentPath");
+ 989:     const subfoldersEl  = document.getElementById("browserSubfolders");
+ 990:     const quickBarEl    = document.getElementById("browserQuickBar");
+ 991:     const upBtn         = document.getElementById("browserUpBtn");
+ 992:     const useBtn        = document.getElementById("btnUseFolder");
+ 993: 
+ 994:     subfoldersEl.innerHTML = `<div class="text-muted" style="padding:6px; font-size:11px;">Scanning directories…</div>`;
+ 995: 
+ 996:     try {
+ 997:       const url = path ? `/api/browse-directory?path=${encodeURIComponent(path)}` : `/api/browse-directory`;
+ 998:       const res = await fetch(url);
+ 999:       const data = await res.json();
+1000: 
+1001:       if (!res.ok) {
+1002:         subfoldersEl.innerHTML = `<div class="text-crit" style="padding:6px; font-size:11px;">${escapeHtml(data.error || "Cannot access folder")}</div>`;
+1003:         return;
+1004:       }
+1005: 
+1006:       browserCurrentDir = data.current || "";
+1007:       browserParentDir  = data.parent || "";
+1008: 
+1009:       currentPathEl.textContent = browserCurrentDir || "System Drives & User Folders";
+1010:       upBtn.disabled = !browserCurrentDir;
+1011:       upBtn.style.opacity = browserCurrentDir ? "1" : "0.5";
+1012: 
+1013:       // Render Quick Picks (Drives + Common User Folders)
+1014:       if (data.drives && data.drives.length > 0) {
+1015:         let quickHtml = "";
+1016:         data.drives.forEach(drv => {
+1017:           quickHtml += `<button type="button" class="browser-quick-pill" onclick="browseDirectory('${encodeURIComponent(drv)}')">💾 ${escapeHtml(drv)}</button>`;
+1018:         });
+1019:         if (data.folders && !path) {
+1020:           data.folders.forEach(f => {
+1021:             const name = getBasename(f);
+1022:             quickHtml += `<button type="button" class="browser-quick-pill" onclick="browseDirectory('${encodeURIComponent(f)}')">📁 ${escapeHtml(name)}</button>`;
+1023:           });
+1024:         }
+1025:         quickBarEl.innerHTML = quickHtml;
+1026:         quickBarEl.style.display = "flex";
+1027:       } else if (!path) {
+1028:         quickBarEl.style.display = "none";
+1029:       }
+1030: 
+1031:       // Render Subfolders
+1032:       const folders = data.folders || [];
+1033:       if (folders.length === 0) {
+1034:         subfoldersEl.innerHTML = `<div class="text-muted" style="padding:6px; font-size:11px;">No subdirectories found.</div>`;
+1035:       } else {
+1036:         subfoldersEl.innerHTML = folders.map(f => {
+1037:           const name = getBasename(f);
+1038:           const encodedF = encodeURIComponent(f);
+1039:           return `
+1040:             <div class="browser-folder-item" onclick="browseDirectory('${encodedF}')">
+1041:               <span>📁</span>
+1042:               <span class="mono" title="${escapeHtml(f)}">${escapeHtml(name)}</span>
+1043:             </div>
+1044:           `;
+1045:         }).join("");
+1046:       }
+1047: 
+1048:       // Update Use Button
+1049:       if (browserCurrentDir) {
+1050:         useBtn.disabled = false;
+1051:         useBtn.textContent = `✓ Use: ${getBasename(browserCurrentDir)}`;
+1052:       } else {
+1053:         useBtn.disabled = true;
+1054:         useBtn.textContent = `Select a folder above`;
+1055:       }
+1056:     } catch (e) {
+1057:       subfoldersEl.innerHTML = `<div class="text-crit" style="padding:6px; font-size:11px;">Error browsing directory: ${escapeHtml(e.message)}</div>`;
+1058:     }
+1059:   }
+1060: 
+1061:   function navigateBrowserUp() {
+1062:     browseDirectory(browserParentDir);
+1063:   }
+1064: 
+1065:   function selectCurrentBrowserFolder() {
+1066:     if (!browserCurrentDir) return;
+1067:     document.getElementById("newDirInput").value = browserCurrentDir;
+1068:     document.getElementById("browserPanel").style.display = "none";
+1069:   }
+1070: 
+1071:   async function addDirectory() {
+1072:     const input = document.getElementById("newDirInput");
+1073:     const dir = input.value.trim();
+1074:     const fb = document.getElementById("dirsFeedback");
+1075:     if (!dir) return;
+1076:     try {
+1077:       const res = await fetch("/api/directories/add", {
+1078:         method: "POST",
+1079:         headers: { "Content-Type": "application/json" },
+1080:         body: JSON.stringify({ directory: dir, path: dir })
+1081:       });
+1082:       const data = await res.json();
+1083:       if (res.ok && data.success) {
+1084:         fb.textContent = `✓ Added: ${dir}`;
+1085:         fb.className = "modal-feedback success";
+1086:         input.value = "";
+1087:         const panel = document.getElementById("browserPanel");
+1088:         if (panel) panel.style.display = "none";
+1089:         loadDirectories();
+1090:       } else {
+1091:         fb.textContent = `⚠️ Error: ${data.error || "Failed to add directory"}`;
+1092:         fb.className = "modal-feedback error";
+1093:       }
+1094:     } catch (e) {
+1095:       fb.textContent = `⚠️ Network error: ${e.message}`;
+1096:       fb.className = "modal-feedback error";
+1097:     }
+1098:   }
+1099: 
+1100:   async function removeDirectory(encodedDir) {
+1101:     const dir = decodeURIComponent(encodedDir || "");
+1102:     if (!confirm(`Stop monitoring folder?\n${dir}`)) return;
+1103:     try {
+1104:       const res = await fetch("/api/directories/remove", {
+1105:         method: "POST",
+1106:         headers: { "Content-Type": "application/json" },
+1107:         body: JSON.stringify({ directory: dir, path: dir })
+1108:       });
+1109:       const data = await res.json();
+1110:       if (res.ok && data.success) {
+1111:         loadDirectories();
+1112:       } else {
+1113:         alert(`⚠️ Error: ${data.error || "Failed to remove directory"}`);
+1114:       }
+1115:     } catch (e) {
+1116:       alert(`⚠️ Network error: ${e.message}`);
+1117:     }
+1118:   }
+1119: 
+1120:   // ── Quarantine Vault Modal Handlers ───────────────────────────────────────
+1121:   async function openVaultModal() {
+1122:     document.getElementById("vaultModal").style.display = "flex";
+1123:     loadVault();
+1124:   }
+1125: 
+1126:   function closeVaultModal() {
+1127:     document.getElementById("vaultModal").style.display = "none";
+1128:   }
+1129: 
+1130:   async function loadVault() {
+1131:     const listEl = document.getElementById("vaultList");
+1132:     try {
+1133:       const res = await fetch("/api/quarantine");
+1134:       const data = await res.json();
+1135:       const files = data.vault || data.quarantined_files || [];
+1136:       if (files.length === 0) {
+1137:         listEl.innerHTML = `<div class="text-muted" style="padding: 12px; font-size: 12px; text-align: center;">Quarantine Vault is currently empty.</div>`;
+1138:         return;
+1139:       }
+1140:       listEl.innerHTML = files.map(f => `
+1141:         <div class="modal-item" style="flex-direction: column; align-items: flex-start; gap: 4px;">
+1142:           <div style="display: flex; justify-content: space-between; width: 100%;">
+1143:             <strong style="color: #ff7b72; font-size: 12px;">${escapeHtml(getBasename(f.original_path))}</strong>
+1144:             <span style="font-size: 10.5px; color: var(--text-muted);">${(f.quarantined_at||"").replace("T"," ").slice(0,19)}</span>
+1145:           </div>
+1146:           <div class="mono" style="font-size: 11px; color: var(--text-secondary); word-break: break-all;">Original: ${escapeHtml(f.original_path)}</div>
+1147:           <div class="mono" style="font-size: 10.5px; color: var(--text-muted);">Vault: ${escapeHtml(f.quarantine_path)}</div>
+1148:         </div>
+1149:       `).join("");
+1150:     } catch (e) {
+1151:       listEl.innerHTML = `<div class="text-crit" style="padding: 10px; font-size: 12px;">Failed to load vault records.</div>`;
+1152:     }
+1153:   }
+1154: 
+1155:   startRefresh();
+1156: </script>
+1157: 
+1158: <!-- ═════════════════════════════ MODALS ══════════════════════════════════ -->
+1159: <!-- Monitored Directories Modal -->
+1160: <div class="modal-backdrop" id="dirsModal" style="display: none;" onclick="if(event.target===this) closeDirectoriesModal()">
+1161:   <div class="modal-box" style="width: 620px;">
+1162:     <div class="modal-header">
+1163:       <div class="modal-title">📁 Manage Monitored Directories</div>
+1164:       <button class="modal-close" onclick="closeDirectoriesModal()">✕</button>
+1165:     </div>
+1166:     <div class="modal-body">
+1167:       <div class="modal-section-title">Active Monitored Directories</div>
+1168:       <div class="modal-list" id="dirsList">
+1169:         <div class="text-muted">Loading monitored directories…</div>
+1170:       </div>
+1171:       
+1172:       <div class="modal-section-title" style="margin-top: 14px;">Add New Monitored Directory</div>
+1173:       <div class="modal-add-form">
+1174:         <input type="text" id="newDirInput" class="modal-input" placeholder="Type path or click Browse below..." />
+1175:         <button class="btn-modal-browse" type="button" onclick="toggleFolderBrowser()">📁 Browse...</button>
+1176:         <button class="btn-modal-add" type="button" onclick="addDirectory()">➕ Add Folder</button>
+1177:       </div>
+1178: 
+1179:       <!-- Interactive Folder Browser Drawer / Panel -->
+1180:       <div id="browserPanel" class="browser-panel" style="display: none;">
+1181:         <div class="browser-header">
+1182:           <span class="browser-title">📂 Folder Browser</span>
+1183:           <button class="btn-browser-nav" id="browserUpBtn" type="button" onclick="navigateBrowserUp()" title="Go to parent directory">⬆️ Up</button>
+1184:         </div>
+1185:         <div class="browser-current-path mono" id="browserCurrentPath">Select a drive or quick folder</div>
+1186:         
+1187:         <!-- Quick Picks: Drives & User Folders -->
+1188:         <div class="browser-quick-bar" id="browserQuickBar"></div>
+1189: 
+1190:         <!-- Subfolders List -->
+1191:         <div class="browser-subfolder-list" id="browserSubfolders"></div>
+1192: 
+1193:         <div class="browser-footer">
+1194:           <button class="btn-use-folder" id="btnUseFolder" type="button" onclick="selectCurrentBrowserFolder()">✓ Use This Folder</button>
+1195:         </div>
+1196:       </div>
+1197: 
+1198:       <div class="modal-feedback" id="dirsFeedback"></div>
+1199:     </div>
+1200:     <div class="modal-footer">
+1201:       <button class="btn-action secondary" onclick="closeDirectoriesModal()">Close</button>
+1202:     </div>
+1203:   </div>
+1204: </div>
+1205: 
+1206: <!-- Quarantine Vault Modal -->
+1207: <div class="modal-backdrop" id="vaultModal" style="display: none;" onclick="if(event.target===this) closeVaultModal()">
+1208:   <div class="modal-box">
+1209:     <div class="modal-header">
+1210:       <div class="modal-title">🛡️ Quarantined Files Vault</div>
+1211:       <button class="modal-close" onclick="closeVaultModal()">✕</button>
+1212:     </div>
+1213:     <div class="modal-body">
+1214:       <div class="modal-section-title">Quarantined File Records</div>
+1215:       <div class="modal-list" id="vaultList">
+1216:         <div class="text-muted">Loading vault…</div>
+1217:       </div>
+1218:     </div>
+1219:     <div class="modal-footer">
+1220:       <button class="btn-action secondary" onclick="closeVaultModal()">Close</button>
+1221:     </div>
+1222:   </div>
+1223: </div>
+1224: 
+1225: </body>
+1226: </html>
 </file>
 
 <file path="dashboard/app.py">
@@ -5823,9 +6486,9 @@ This section contains the contents of the repository's files.
 113: def api_add_directory():
 114:     """Add and schedule a new monitored directory dynamically."""
 115:     data = request.get_json(force=True, silent=True) or {}
-116:     path = data.get("path", "").strip()
+116:     path = (data.get("path") or data.get("directory") or "").strip()
 117:     if not path or not os.path.isdir(path):
-118:         return jsonify({"success": False, "error": "Invalid or non-existent directory path."}), 400
+118:         return jsonify({"success": False, "error": f"Invalid or non-existent directory path: '{path}'"}), 400
 119: 
 120:     monitor = get_active_monitor()
 121:     if monitor:
@@ -5843,7 +6506,7 @@ This section contains the contents of the repository's files.
 133: def api_remove_directory():
 134:     """Remove and unschedule a monitored directory."""
 135:     data = request.get_json(force=True, silent=True) or {}
-136:     path = data.get("path", "").strip()
+136:     path = (data.get("path") or data.get("directory") or "").strip()
 137:     if not path:
 138:         return jsonify({"success": False, "error": "Missing directory path."}), 400
 139: 
@@ -5867,272 +6530,94 @@ This section contains the contents of the repository's files.
 157:         # Return common user roots and drive letters
 158:         import string
 159:         common = [
-160:             os.path.expanduser("~/Desktop"),
-161:             os.path.expanduser("~/Documents"),
-162:             os.path.expanduser("~/Downloads"),
+160:             os.path.normpath(os.path.expanduser("~/Desktop")),
+161:             os.path.normpath(os.path.expanduser("~/Documents")),
+162:             os.path.normpath(os.path.expanduser("~/Downloads")),
 163:         ]
 164:         if sys.platform == "win32":
 165:             import ctypes
 166:             bitmask = ctypes.windll.kernel32.GetLogicalDrives()
 167:             drives = [f"{letter}:\\" for i, letter in enumerate(string.ascii_uppercase) if bitmask & (1 << i)]
-168:             return jsonify({"parent": "", "folders": [p for p in common if os.path.isdir(p)], "drives": drives})
-169:         return jsonify({"parent": "", "folders": [p for p in common if os.path.isdir(p)]})
+168:             return jsonify({"current": "", "parent": "", "folders": [p for p in common if os.path.isdir(p)], "drives": drives})
+169:         return jsonify({"current": "", "parent": "", "folders": [p for p in common if os.path.isdir(p)], "drives": []})
 170: 
-171:     if not os.path.isdir(target):
-172:         return jsonify({"error": "Path is not a valid directory"}), 400
-173: 
-174:     try:
-175:         subfolders = []
-176:         for name in os.listdir(target):
-177:             full = os.path.join(target, name)
-178:             if os.path.isdir(full) and not name.startswith("$") and not name.startswith("."):
-179:                 subfolders.append(full)
-180:         subfolders.sort()
-181:         parent = os.path.dirname(os.path.normpath(target))
-182:         return jsonify({"current": target, "parent": parent, "folders": subfolders[:100]})
-183:     except Exception as e:
-184:         return jsonify({"error": str(e)}), 500
-185: 
-186: 
-187: # ── SOC One-Click Remediation Endpoints ───────────────────────────────────────
-188: 
-189: @app.route("/api/action/quarantine", methods=["POST"])
-190: def api_action_quarantine():
-191:     """Quarantine a flagged file into the encrypted vault."""
-192:     data = request.get_json(force=True, silent=True) or {}
-193:     source = data.get("source", "").strip()
-194:     reason = data.get("reason", "SOC Operator Manual Action")
-195:     if not source:
-196:         return jsonify({"success": False, "error": "Missing file source path"}), 400
-197: 
-198:     res = db.quarantine_file(source, reason)
-199:     return jsonify(res)
-200: 
-201: 
-202: @app.route("/api/action/terminate", methods=["POST"])
-203: def api_action_terminate():
-204:     """Terminate an unapproved exfiltration process."""
-205:     data = request.get_json(force=True, silent=True) or {}
-206:     pid = data.get("pid")
-207:     if not pid:
-208:         return jsonify({"success": False, "error": "Missing process PID"}), 400
-209: 
-210:     res = process_tracker.terminate_process(int(pid))
-211:     return jsonify(res)
-212: 
-213: 
-214: @app.route("/api/action/allowlist", methods=["POST"])
-215: def api_action_allowlist():
-216:     """Add a file path, extension, or hash to the SOC allowlist."""
-217:     data = request.get_json(force=True, silent=True) or {}
-218:     entry = data.get("entry", "").strip()
-219:     entry_type = data.get("type", "path")
-220:     reason = data.get("reason", "Operator Allowed")
-221:     if not entry:
-222:         return jsonify({"success": False, "error": "Missing entry value"}), 400
-223: 
-224:     ok = db.add_to_allowlist(entry, entry_type, reason)
-225:     return jsonify({"success": ok, "message": f"Successfully added '{entry}' to allowlist."})
-226: 
-227: 
-228: @app.route("/api/allowlist", methods=["GET"])
-229: def api_get_allowlist():
-230:     """Return all active allowlist entries."""
-231:     return jsonify({"allowlist": db.get_allowlist()})
-232: 
-233: 
-234: @app.route("/api/quarantine", methods=["GET"])
-235: def api_get_quarantine():
-236:     """Return all quarantined files in vault."""
-237:     files = db.get_quarantined_files()
-238:     return jsonify({"vault": files, "quarantined_files": files})
-239: 
-240: 
-241: def run_dashboard(host: str = DASHBOARD_HOST, port: int = DASHBOARD_PORT):
-242:     """Start the Flask development server (blocking call)."""
-243:     print(f"\n  Dashboard → http://{host}:{port}  (local only, no internet needed)")
-244:     app.run(host=host, port=port, debug=DASHBOARD_DEBUG, use_reloader=False)
-</file>
-
-<file path="config.py">
-  1: """
-  2: config.py - Central Configuration for Secure File Transfer Monitoring System
-  3: Adjust these values to match your environment before running.
-  4: """
-  5: 
-  6: import os
-  7: import sys
-  8: 
-  9: # =============================================================================
- 10: # MONITORING TARGETS & DYNAMIC RESOLUTION
- 11: # =============================================================================
- 12: # Baseline directories to watch
- 13: DEFAULT_MONITORED_DIRECTORIES = [
- 14:     os.path.expanduser("~/Desktop"),
- 15:     os.path.expanduser("~/Documents"),
- 16:     os.path.expanduser("~/Downloads"),
- 17: ]
- 18: 
- 19: 
- 20: def get_auto_discovered_targets() -> list[str]:
- 21:     """
- 22:     Dynamically discover all relevant monitoring targets:
- 23:       1. Default user folders (Desktop, Documents, Downloads).
- 24:       2. OneDrive redirected folders (e.g. %OneDrive%\\Desktop).
- 25:       3. Active Cloud-sync roots (Dropbox, Google Drive, iCloud, Nextcloud).
- 26:       4. Active Removable Media (USB flash drives, external drives).
- 27:     """
- 28:     targets: set[str] = set()
- 29: 
- 30:     # 1. Base user profile paths
- 31:     for p in DEFAULT_MONITORED_DIRECTORIES:
- 32:         expanded = os.path.normpath(os.path.abspath(os.path.expanduser(p)))
- 33:         if os.path.isdir(expanded):
- 34:             targets.add(expanded)
- 35: 
- 36:     user_home = os.path.expanduser("~")
- 37: 
- 38:     # 2. Known cloud sync directories
- 39:     cloud_candidates = [
- 40:         os.environ.get("OneDrive"),
- 41:         os.environ.get("OneDriveConsumer"),
- 42:         os.environ.get("OneDriveCommercial"),
- 43:         os.path.join(user_home, "Dropbox"),
- 44:         os.path.join(user_home, "Google Drive"),
- 45:         os.path.join(user_home, "iCloudDrive"),
- 46:         os.path.join(user_home, "Box"),
- 47:         os.path.join(user_home, "Nextcloud"),
- 48:     ]
- 49: 
- 50:     for candidate in cloud_candidates:
- 51:         if candidate and os.path.isdir(candidate):
- 52:             targets.add(os.path.normpath(os.path.abspath(candidate)))
- 53: 
- 54:     # 3. Dynamic Windows Removable Drive Discovery (USB drives, network drives)
- 55:     if sys.platform == "win32":
- 56:         try:
- 57:             import ctypes
- 58:             # GetLogicalDrives returns a bitmask of available drives (bit 0 = A, bit 1 = B, etc.)
- 59:             bitmask = ctypes.windll.kernel32.GetLogicalDrives()
- 60:             for i in range(26):
- 61:                 if bitmask & (1 << i):
- 62:                     drive_letter = f"{chr(65 + i)}:\\"
- 63:                     dtype = ctypes.windll.kernel32.GetDriveTypeW(drive_letter)
- 64:                     # 2 = DRIVE_REMOVABLE (USB flash drives, SD cards)
- 65:                     # 4 = DRIVE_REMOTE    (Mapped network drives)
- 66:                     if dtype in (2, 4) and os.path.isdir(drive_letter):
- 67:                         targets.add(os.path.normpath(drive_letter))
- 68:         except Exception:
- 69:             pass
- 70: 
- 71:     return sorted(list(targets))
- 72: 
- 73: 
- 74: MONITORED_DIRECTORIES = get_auto_discovered_targets()
- 75: 
- 76: # =============================================================================
- 77: # SENSITIVE FILE CRITERIA
- 78: # =============================================================================
- 79: SENSITIVE_EXTENSIONS = [
- 80:     ".key", ".pem", ".pfx", ".p12",          # Cryptographic keys / certs
- 81:     ".docx", ".xlsx", ".pptx", ".pdf",       # Office documents
- 82:     ".db", ".sqlite", ".sql",                 # Databases
- 83:     ".csv", ".json", ".xml",                  # Data files
- 84:     ".py", ".sh", ".bat", ".ps1",            # Scripts
- 85:     ".zip", ".rar", ".tar", ".gz", ".7z",   # Archives (potential exfil containers)
- 86:     ".env", ".cfg", ".ini", ".conf",         # Config / secrets
- 87:     ".bak", ".backup",                        # Backup files
- 88: ]
- 89: 
- 90: # Dedicated directories containing confidential or restricted data
- 91: SENSITIVE_DIRECTORIES = [
- 92:     os.path.expanduser("~/Documents/Confidential"),
- 93:     os.path.expanduser("~/Desktop/Confidential"),
- 94: ]
- 95: 
- 96: # =============================================================================
- 97: # IGNORED FILES & SYSTEM NOISE
- 98: # =============================================================================
- 99: IGNORED_EXTENSIONS = [
-100:     ".tmp", ".crdownload", ".part", ".lock", ".swp",
-101: ]
-102: 
-103: IGNORED_FILENAMES = [
-104:     "desktop.ini", "thumbs.db", ".ds_store",
-105: ]
-106: 
-107: # =============================================================================
-108: # SUSPICIOUS DESTINATIONS
-109: # =============================================================================
-110: # Fallback drive letters for non-Windows or offline environments
-111: SUSPICIOUS_DRIVE_LETTERS = ["D:\\", "E:\\", "F:\\", "G:\\", "H:\\"]
-112: 
-113: SUSPICIOUS_PATH_KEYWORDS = [
-114:     "OneDrive", "Dropbox", "Google Drive", "iCloud", "Box",
-115:     "RECYCLER", "$Recycle.Bin",
-116:     "Temp", "tmp",
-117: ]
-118: 
-119: SUSPICIOUS_NETWORK_PREFIXES = [
-120:     "\\\\", "//",
-121: ]
-122: 
-123: # =============================================================================
-124: # ALERT LEVELS
-125: # =============================================================================
-126: ALERT_LEVELS = {
-127:     "INFO":     "INFO",
-128:     "WARNING":  "WARNING",
-129:     "CRITICAL": "CRITICAL",
-130: }
-131: 
-132: # =============================================================================
-133: # LOGGING & OUTPUT PATHS & RESOURCE RESOLUTION (PyInstaller Frozen Support)
-134: # =============================================================================
-135: if getattr(sys, "frozen", False):
-136:     RESOURCE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-137:     _exe_dir = os.path.dirname(sys.executable)
-138:     try:
-139:         _test_file = os.path.join(_exe_dir, ".perm_test")
-140:         with open(_test_file, "w") as _f:
-141:             _f.write("1")
-142:         os.remove(_test_file)
-143:         BASE_DIR = _exe_dir
-144:     except (PermissionError, OSError):
-145:         BASE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "FileSentinel")
-146: else:
-147:     RESOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
-148:     BASE_DIR = RESOURCE_DIR
-149: 
-150: LOG_DIR         = os.path.join(BASE_DIR, "logs")
-151: REPORT_DIR      = os.path.join(BASE_DIR, "reports")
-152: 
-153: AUDIT_LOG_PATH  = os.path.join(LOG_DIR, "audit.log")
-154: ALERT_LOG_PATH  = os.path.join(LOG_DIR, "alerts.log")
-155: 
-156: # Ensure log and report directories exist
-157: os.makedirs(LOG_DIR, exist_ok=True)
-158: os.makedirs(REPORT_DIR, exist_ok=True)
-159: 
-160: # =============================================================================
-161: # HASHING
-162: # =============================================================================
-163: HASH_ALGORITHM  = "sha256"
-164: HASH_CHUNK_SIZE = 65536
-165: 
-166: # =============================================================================
-167: # DASHBOARD SETTINGS
-168: # =============================================================================
-169: DASHBOARD_ENABLED   = True
-170: DASHBOARD_HOST      = "127.0.0.1"
-171: DASHBOARD_PORT      = 5000
-172: DASHBOARD_DEBUG     = False
-173: LOGS_PER_PAGE       = 50
+171:     target = os.path.normpath(target)
+172:     if not os.path.isdir(target):
+173:         return jsonify({"error": f"Path is not a valid directory: '{target}'"}), 400
 174: 
-175: # =============================================================================
-176: # PROCESS TRACKING
-177: # =============================================================================
-178: ENABLE_PROCESS_TRACKING = True
+175:     try:
+176:         subfolders = []
+177:         for name in os.listdir(target):
+178:             full = os.path.join(target, name)
+179:             if os.path.isdir(full) and not name.startswith("$") and not name.startswith("."):
+180:                 subfolders.append(os.path.normpath(full))
+181:         subfolders.sort()
+182:         parent = os.path.dirname(target) if os.path.dirname(target) != target else ""
+183:         return jsonify({"current": target, "parent": parent, "folders": subfolders[:100], "drives": []})
+184:     except Exception as e:
+185:         return jsonify({"error": str(e)}), 500
+186: 
+187: 
+188: # ── SOC One-Click Remediation Endpoints ───────────────────────────────────────
+189: 
+190: @app.route("/api/action/quarantine", methods=["POST"])
+191: def api_action_quarantine():
+192:     """Quarantine a flagged file into the encrypted vault."""
+193:     data = request.get_json(force=True, silent=True) or {}
+194:     source = (data.get("source") or data.get("file_path") or data.get("path") or "").strip()
+195:     reason = data.get("reason", "SOC Operator Manual Action")
+196:     if not source:
+197:         return jsonify({"success": False, "error": "Missing file source path"}), 400
+198: 
+199:     res = db.quarantine_file(source, reason)
+200:     if res.get("success"):
+201:         res["quarantine_vault_path"] = res.get("quarantined_path")
+202:     return jsonify(res)
+203: 
+204: 
+205: @app.route("/api/action/terminate", methods=["POST"])
+206: def api_action_terminate():
+207:     """Terminate an unapproved exfiltration process."""
+208:     data = request.get_json(force=True, silent=True) or {}
+209:     pid = data.get("pid")
+210:     if not pid:
+211:         return jsonify({"success": False, "error": "Missing process PID"}), 400
+212: 
+213:     res = process_tracker.terminate_process(int(pid))
+214:     return jsonify(res)
+215: 
+216: 
+217: @app.route("/api/action/allowlist", methods=["POST"])
+218: def api_action_allowlist():
+219:     """Add a file path, extension, or hash to the SOC allowlist."""
+220:     data = request.get_json(force=True, silent=True) or {}
+221:     entry = (data.get("entry") or data.get("path") or "").strip()
+222:     entry_type = data.get("entry_type") or data.get("type") or "path"
+223:     reason = data.get("reason", "Operator Allowed")
+224:     if not entry:
+225:         return jsonify({"success": False, "error": "Missing entry value"}), 400
+226: 
+227:     ok = db.add_to_allowlist(entry, entry_type, reason)
+228:     return jsonify({"success": ok, "message": f"Successfully added '{entry}' to allowlist."})
+229: 
+230: 
+231: @app.route("/api/allowlist", methods=["GET"])
+232: def api_get_allowlist():
+233:     """Return all active allowlist entries."""
+234:     return jsonify({"allowlist": db.get_allowlist()})
+235: 
+236: 
+237: @app.route("/api/quarantine", methods=["GET"])
+238: def api_get_quarantine():
+239:     """Return all quarantined files in vault."""
+240:     files = db.get_quarantined_files()
+241:     return jsonify({"vault": files, "quarantined_files": files})
+242: 
+243: 
+244: def run_dashboard(host: str = DASHBOARD_HOST, port: int = DASHBOARD_PORT):
+245:     """Start the Flask development server (blocking call)."""
+246:     print(f"\n  Dashboard → http://{host}:{port}  (local only, no internet needed)")
+247:     app.run(host=host, port=port, debug=DASHBOARD_DEBUG, use_reloader=False)
 </file>
 
 <file path="hasher.py">
@@ -6333,180 +6818,6 @@ This section contains the contents of the repository's files.
 195:     norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
 196:     db.remove_baseline(filepath)
 197:     return _baseline_hashes.pop(norm, None)
-</file>
-
-<file path="main.py">
-  1: """
-  2: main.py - Secure File Transfer Monitoring System — Entry Point
-  3: Usage:
-  4:   python main.py                        # Default: Launch native Windows Desktop App
-  5:   python main.py --desktop              # Launch full native Windows Desktop App (Window + Tray + Alerts)
-  6:   python main.py --monitor              # Monitor + colorama console (no dashboard)
-  7:   python main.py --monitor --dashboard  # Monitor + console + web dashboard in browser
-  8:   python main.py --dashboard-only       # Dashboard only (view existing logs in browser)
-  9:   python main.py --report               # Generate text audit report
- 10:   python main.py --test-hash <file>     # Compute and print hash of a file
- 11: """
- 12: 
- 13: import argparse
- 14: import sys
- 15: import os
- 16: import threading
- 17: import time
- 18: 
- 19: # Ensure parent directory is importable
- 20: sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
- 21: 
- 22: from logger import print_banner
- 23: from monitor import FileMonitor
- 24: from hasher import compute_hash
- 25: from reporter import generate_report
- 26: from config import DASHBOARD_HOST, DASHBOARD_PORT, HASH_ALGORITHM
- 27: 
- 28: 
- 29: def cmd_desktop():
- 30:     """Launch the native desktop window application."""
- 31:     print_banner()
- 32:     try:
- 33:         from app_desktop import launch_desktop_app
- 34:         launch_desktop_app()
- 35:     except (KeyboardInterrupt, SystemExit):
- 36:         print("\n  [+] FileSentinel shutdown requested. Exiting...")
- 37:         os._exit(0)
- 38:     except ImportError as e:
- 39:         print(f"  [ERROR] Desktop GUI dependency missing: {e}")
- 40:         print("  Install desktop dependencies with: pip install pywebview pystray Pillow")
- 41:         sys.exit(1)
- 42: 
- 43: 
- 44: def cmd_monitor(with_dashboard: bool):
- 45:     """Start filesystem monitoring with optional dashboard."""
- 46:     print_banner()
- 47:     monitor = FileMonitor()
- 48: 
- 49:     if with_dashboard:
- 50:         _launch_dashboard_thread()
- 51: 
- 52:     try:
- 53:         monitor.start()
- 54:         while True:
- 55:             time.sleep(0.5)
- 56:     except (KeyboardInterrupt, SystemExit):
- 57:         try:
- 58:             monitor.stop()
- 59:         except Exception:
- 60:             pass
- 61:         print("\n  Logs saved. Run 'python main.py --report' for a full audit report.")
- 62:         os._exit(0)
- 63: 
- 64: 
- 65: def cmd_dashboard_only():
- 66:     """Launch dashboard without starting the file monitor."""
- 67:     print_banner()
- 68:     print("  [Dashboard-only mode] File monitoring is NOT active.\n")
- 69:     try:
- 70:         _launch_dashboard_blocking()
- 71:     except (KeyboardInterrupt, SystemExit):
- 72:         print("\n  Dashboard stopped.")
- 73:         os._exit(0)
- 74: 
- 75: 
- 76: def cmd_report():
- 77:     """Generate and print a text audit report."""
- 78:     print_banner()
- 79:     generate_report()
- 80: 
- 81: 
- 82: def cmd_test_hash(filepath: str):
- 83:     """Compute and display the hash of a single file."""
- 84:     if not os.path.isfile(filepath):
- 85:         print(f"  [ERROR] File not found: {filepath}")
- 86:         sys.exit(1)
- 87: 
- 88:     digest = compute_hash(filepath, HASH_ALGORITHM)
- 89:     size   = os.path.getsize(filepath)
- 90:     print(f"\n  File      : {filepath}")
- 91:     print(f"  Size      : {size:,} bytes")
- 92:     print(f"  Algorithm : {HASH_ALGORITHM.upper()}")
- 93:     print(f"  Hash      : {digest}\n")
- 94: 
- 95: 
- 96: def _launch_dashboard_thread():
- 97:     """Start the Flask dashboard in a background daemon thread."""
- 98:     try:
- 99:         from dashboard.app import run_dashboard
-100:         thread = threading.Thread(
-101:             target=run_dashboard,
-102:             kwargs={"host": DASHBOARD_HOST, "port": DASHBOARD_PORT},
-103:             daemon=True,
-104:         )
-105:         thread.start()
-106:         time.sleep(1)  # Brief pause to let Flask bind before monitor prints
-107:     except ImportError as e:
-108:         print(f"  [WARNING] Dashboard skipped: {e}")
-109:         print("  Run 'pip install flask' to enable the dashboard.")
-110: 
-111: 
-112: def _launch_dashboard_blocking():
-113:     """Start the Flask dashboard (blocking — main thread)."""
-114:     try:
-115:         from dashboard.app import run_dashboard
-116:         run_dashboard(host=DASHBOARD_HOST, port=DASHBOARD_PORT)
-117:     except ImportError:
-118:         print("  [ERROR] Flask is not installed. Run 'pip install flask' first.")
-119:         sys.exit(1)
-120: 
-121: 
-122: # ── CLI Argument Parser ───────────────────────────────────────────────────────
-123: def main():
-124:     # If launched with no arguments (e.g. double-clicked executable / shortcut),
-125:     # launch the native desktop application by default.
-126:     if len(sys.argv) == 1:
-127:         cmd_desktop()
-128:         return
-129: 
-130:     parser = argparse.ArgumentParser(
-131:         prog="FileSentinel",
-132:         description="Secure File Transfer Monitoring & DLP System",
-133:         formatter_class=argparse.RawDescriptionHelpFormatter,
-134:         epilog="""
-135: Examples:
-136:   python main.py                            # Launch native Windows Desktop App (default)
-137:   python main.py --desktop                  # Launch native Windows Desktop App
-138:   python main.py --monitor                  # Console monitoring only
-139:   python main.py --monitor --dashboard      # Monitor + web dashboard in browser
-140:   python main.py --dashboard-only           # View logs in browser
-141:   python main.py --report                   # Generate audit report
-142:   python main.py --test-hash secret.docx   # Hash a specific file
-143:         """,
-144:     )
-145: 
-146:     group = parser.add_mutually_exclusive_group(required=True)
-147:     group.add_argument("--desktop", "--gui", action="store_true", help="Launch native Windows desktop application")
-148:     group.add_argument("--monitor",          action="store_true", help="Start filesystem monitoring")
-149:     group.add_argument("--dashboard-only",   action="store_true", help="Launch dashboard without monitoring")
-150:     group.add_argument("--report",           action="store_true", help="Generate audit report")
-151:     group.add_argument("--test-hash",        metavar="FILE",      help="Compute SHA256 hash of a file")
-152: 
-153:     parser.add_argument("--dashboard", action="store_true",
-154:                         help="[with --monitor] Also launch the web dashboard in browser")
-155: 
-156:     args = parser.parse_args()
-157: 
-158:     if args.desktop:
-159:         cmd_desktop()
-160:     elif args.monitor:
-161:         cmd_monitor(with_dashboard=args.dashboard)
-162:     elif args.dashboard_only:
-163:         cmd_dashboard_only()
-164:     elif args.report:
-165:         cmd_report()
-166:     elif args.test_hash:
-167:         cmd_test_hash(args.test_hash)
-168: 
-169: 
-170: if __name__ == "__main__":
-171:     main()
 </file>
 
 <file path="monitor.py">

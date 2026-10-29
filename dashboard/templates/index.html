@@ -663,14 +663,14 @@
       <div class="remediation-box">
         <div class="remediation-title">SOC One-Click Remediation</div>
         <div class="remediation-btn-row">
-          <button class="btn-remedy btn-quarantine" onclick="actionQuarantine('${escapeQuotes(e.source || "")}')">
+          <button class="btn-remedy btn-quarantine" onclick="actionQuarantine('${encodeURIComponent(e.source || "")}')">
             🛡️ Quarantine File
           </button>
           ${e.process_pid && e.process_pid > 4 ? `
-          <button class="btn-remedy btn-terminate" onclick="actionTerminate(${e.process_pid}, '${escapeQuotes(e.process || "")}')">
+          <button class="btn-remedy btn-terminate" onclick="actionTerminate(${e.process_pid}, '${encodeURIComponent(e.process || "")}')">
             🛑 Terminate Process
           </button>` : ""}
-          <button class="btn-remedy btn-allowlist" onclick="actionAllowlist('${escapeQuotes(e.source || "")}', 'path')">
+          <button class="btn-remedy btn-allowlist" onclick="actionAllowlist('${encodeURIComponent(e.source || "")}', 'path')">
             ✅ Add to Allowlist
           </button>
         </div>
@@ -678,7 +678,7 @@
 
       <div class="action-footer">
         <button class="btn-action" onclick="copyLogJson('${encodeURIComponent(JSON.stringify(e))}')">📋 Copy JSON</button>
-        <button class="btn-action" onclick="copyText('${escapeQuotes(e.source || "")}')">📁 Copy Source</button>
+        <button class="btn-action" onclick="copyText('${encodeURIComponent(e.source || "")}')">📁 Copy Source</button>
         <button class="btn-action secondary" onclick="closeDrawer()">✕ Close</button>
       </div>
     `;
@@ -826,7 +826,8 @@
     }
   }
 
-  function copyText(txt) {
+  function copyText(encodedTxt) {
+    const txt = decodeURIComponent(encodedTxt || "");
     navigator.clipboard.writeText(txt);
     alert("✓ Copied to clipboard:\n" + txt);
   }
@@ -853,18 +854,22 @@
   }
 
   // ── SOC Remediation Handlers ─────────────────────────────────────────────
-  async function actionQuarantine(filePath) {
-    if (!filePath || filePath === "—") return;
+  async function actionQuarantine(encodedFilePath) {
+    const filePath = decodeURIComponent(encodedFilePath || "");
+    if (!filePath || filePath === "—") {
+      alert("⚠️ No valid file path associated with this event.");
+      return;
+    }
     if (!confirm(`Are you sure you want to isolate & quarantine this file?\n\n${filePath}`)) return;
     try {
       const res = await fetch("/api/action/quarantine", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ file_path: filePath })
+        body: JSON.stringify({ source: filePath, file_path: filePath, path: filePath })
       });
       const data = await res.json();
       if (res.ok && data.success) {
-        alert(`✓ File successfully moved to Quarantine Vault:\nVault: ${data.quarantine_vault_path}`);
+        alert(`✓ File successfully moved to Quarantine Vault:\nVault: ${data.quarantined_path || data.quarantine_vault_path || data.message}`);
         fetchAll();
       } else {
         alert(`⚠️ Quarantine failed: ${data.error || "Unknown error"}`);
@@ -874,7 +879,8 @@
     }
   }
 
-  async function actionTerminate(pid, procName) {
+  async function actionTerminate(pid, encodedProcName) {
+    const procName = decodeURIComponent(encodedProcName || "");
     if (!pid || pid <= 4) {
       alert("No valid process PID available for termination.");
       return;
@@ -897,14 +903,15 @@
     }
   }
 
-  async function actionAllowlist(entry, entryType = "path") {
+  async function actionAllowlist(encodedEntry, entryType = "path") {
+    const entry = decodeURIComponent(encodedEntry || "");
     if (!entry) return;
     if (!confirm(`Add ${entryType} to Allowlist to suppress future alerts?\n\n${entry}`)) return;
     try {
       const res = await fetch("/api/action/allowlist", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ entry: entry, entry_type: entryType, reason: "Added from Incident Drawer" })
+        body: JSON.stringify({ entry: entry, type: entryType, entry_type: entryType, reason: "Added from Incident Drawer" })
       });
       const data = await res.json();
       if (res.ok && data.success) {
@@ -917,7 +924,10 @@
     }
   }
 
-  // ── Monitored Directories Modal Handlers ──────────────────────────────────
+  // ── Monitored Directories Modal & Browsing Handlers ───────────────────────
+  let browserCurrentDir = "";
+  let browserParentDir  = "";
+
   async function openDirectoriesModal() {
     document.getElementById("dirsModal").style.display = "flex";
     loadDirectories();
@@ -926,6 +936,8 @@
   function closeDirectoriesModal() {
     document.getElementById("dirsModal").style.display = "none";
     document.getElementById("dirsFeedback").style.display = "none";
+    const panel = document.getElementById("browserPanel");
+    if (panel) panel.style.display = "none";
   }
 
   async function loadDirectories() {
@@ -938,15 +950,122 @@
         listEl.innerHTML = `<div class="text-muted" style="padding: 10px; font-size: 12px;">No custom directories monitored yet.</div>`;
         return;
       }
-      listEl.innerHTML = dirs.map(d => `
-        <div class="modal-item">
-          <span class="modal-item-path" title="${escapeHtml(d)}">${escapeHtml(d)}</span>
-          <button class="btn-item-del" onclick="removeDirectory('${escapeQuotes(d)}')" title="Stop monitoring this folder">🗑️ Remove</button>
-        </div>
-      `).join("");
+      listEl.innerHTML = dirs.map(d => {
+        const pathStr = typeof d === "string" ? d : (d.path || "");
+        const isCustom = typeof d === "object" ? d.is_custom : true;
+        const isActive = typeof d === "object" ? d.is_active : true;
+        const encodedPath = encodeURIComponent(pathStr);
+        return `
+          <div class="modal-item">
+            <div style="display:flex; flex-direction:column; gap:2px; flex:1; min-width:0;">
+              <span class="modal-item-path" title="${escapeHtml(pathStr)}">${escapeHtml(pathStr)}</span>
+              <div style="display:flex; gap:6px; font-size:10.5px;">
+                <span class="badge-status ${isActive ? 'active' : 'inactive'}">${isActive ? '● Active' : '○ Inactive'}</span>
+                ${isCustom ? '<span class="badge-tag">Custom</span>' : '<span class="badge-tag default">Default</span>'}
+              </div>
+            </div>
+            ${isCustom ? `<button class="btn-item-del" onclick="removeDirectory('${encodedPath}')" title="Stop monitoring this folder">🗑️ Remove</button>` : `<span style="font-size:11px; color:var(--text-muted); padding:3px 6px;">Protected</span>`}
+          </div>
+        `;
+      }).join("");
     } catch (e) {
-      listEl.innerHTML = `<div class="text-crit" style="padding: 10px; font-size: 12px;">Failed to load directories.</div>`;
+      listEl.innerHTML = `<div class="text-crit" style="padding: 10px; font-size: 12px;">Failed to load directories: ${escapeHtml(e.message)}</div>`;
     }
+  }
+
+  function toggleFolderBrowser() {
+    const panel = document.getElementById("browserPanel");
+    if (panel.style.display === "none" || !panel.style.display) {
+      panel.style.display = "flex";
+      const existing = document.getElementById("newDirInput").value.trim();
+      browseDirectory(existing || "");
+    } else {
+      panel.style.display = "none";
+    }
+  }
+
+  async function browseDirectory(path = "") {
+    const currentPathEl = document.getElementById("browserCurrentPath");
+    const subfoldersEl  = document.getElementById("browserSubfolders");
+    const quickBarEl    = document.getElementById("browserQuickBar");
+    const upBtn         = document.getElementById("browserUpBtn");
+    const useBtn        = document.getElementById("btnUseFolder");
+
+    subfoldersEl.innerHTML = `<div class="text-muted" style="padding:6px; font-size:11px;">Scanning directories…</div>`;
+
+    try {
+      const url = path ? `/api/browse-directory?path=${encodeURIComponent(path)}` : `/api/browse-directory`;
+      const res = await fetch(url);
+      const data = await res.json();
+
+      if (!res.ok) {
+        subfoldersEl.innerHTML = `<div class="text-crit" style="padding:6px; font-size:11px;">${escapeHtml(data.error || "Cannot access folder")}</div>`;
+        return;
+      }
+
+      browserCurrentDir = data.current || "";
+      browserParentDir  = data.parent || "";
+
+      currentPathEl.textContent = browserCurrentDir || "System Drives & User Folders";
+      upBtn.disabled = !browserCurrentDir;
+      upBtn.style.opacity = browserCurrentDir ? "1" : "0.5";
+
+      // Render Quick Picks (Drives + Common User Folders)
+      if (data.drives && data.drives.length > 0) {
+        let quickHtml = "";
+        data.drives.forEach(drv => {
+          quickHtml += `<button type="button" class="browser-quick-pill" onclick="browseDirectory('${encodeURIComponent(drv)}')">💾 ${escapeHtml(drv)}</button>`;
+        });
+        if (data.folders && !path) {
+          data.folders.forEach(f => {
+            const name = getBasename(f);
+            quickHtml += `<button type="button" class="browser-quick-pill" onclick="browseDirectory('${encodeURIComponent(f)}')">📁 ${escapeHtml(name)}</button>`;
+          });
+        }
+        quickBarEl.innerHTML = quickHtml;
+        quickBarEl.style.display = "flex";
+      } else if (!path) {
+        quickBarEl.style.display = "none";
+      }
+
+      // Render Subfolders
+      const folders = data.folders || [];
+      if (folders.length === 0) {
+        subfoldersEl.innerHTML = `<div class="text-muted" style="padding:6px; font-size:11px;">No subdirectories found.</div>`;
+      } else {
+        subfoldersEl.innerHTML = folders.map(f => {
+          const name = getBasename(f);
+          const encodedF = encodeURIComponent(f);
+          return `
+            <div class="browser-folder-item" onclick="browseDirectory('${encodedF}')">
+              <span>📁</span>
+              <span class="mono" title="${escapeHtml(f)}">${escapeHtml(name)}</span>
+            </div>
+          `;
+        }).join("");
+      }
+
+      // Update Use Button
+      if (browserCurrentDir) {
+        useBtn.disabled = false;
+        useBtn.textContent = `✓ Use: ${getBasename(browserCurrentDir)}`;
+      } else {
+        useBtn.disabled = true;
+        useBtn.textContent = `Select a folder above`;
+      }
+    } catch (e) {
+      subfoldersEl.innerHTML = `<div class="text-crit" style="padding:6px; font-size:11px;">Error browsing directory: ${escapeHtml(e.message)}</div>`;
+    }
+  }
+
+  function navigateBrowserUp() {
+    browseDirectory(browserParentDir);
+  }
+
+  function selectCurrentBrowserFolder() {
+    if (!browserCurrentDir) return;
+    document.getElementById("newDirInput").value = browserCurrentDir;
+    document.getElementById("browserPanel").style.display = "none";
   }
 
   async function addDirectory() {
@@ -958,13 +1077,15 @@
       const res = await fetch("/api/directories/add", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ directory: dir })
+        body: JSON.stringify({ directory: dir, path: dir })
       });
       const data = await res.json();
       if (res.ok && data.success) {
         fb.textContent = `✓ Added: ${dir}`;
         fb.className = "modal-feedback success";
         input.value = "";
+        const panel = document.getElementById("browserPanel");
+        if (panel) panel.style.display = "none";
         loadDirectories();
       } else {
         fb.textContent = `⚠️ Error: ${data.error || "Failed to add directory"}`;
@@ -976,13 +1097,14 @@
     }
   }
 
-  async function removeDirectory(dir) {
+  async function removeDirectory(encodedDir) {
+    const dir = decodeURIComponent(encodedDir || "");
     if (!confirm(`Stop monitoring folder?\n${dir}`)) return;
     try {
       const res = await fetch("/api/directories/remove", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ directory: dir })
+        body: JSON.stringify({ directory: dir, path: dir })
       });
       const data = await res.json();
       if (res.ok && data.success) {
@@ -1036,9 +1158,9 @@
 <!-- ═════════════════════════════ MODALS ══════════════════════════════════ -->
 <!-- Monitored Directories Modal -->
 <div class="modal-backdrop" id="dirsModal" style="display: none;" onclick="if(event.target===this) closeDirectoriesModal()">
-  <div class="modal-box">
+  <div class="modal-box" style="width: 620px;">
     <div class="modal-header">
-      <div class="modal-title">📁 Monitored Directories</div>
+      <div class="modal-title">📁 Manage Monitored Directories</div>
       <button class="modal-close" onclick="closeDirectoriesModal()">✕</button>
     </div>
     <div class="modal-body">
@@ -1046,11 +1168,33 @@
       <div class="modal-list" id="dirsList">
         <div class="text-muted">Loading monitored directories…</div>
       </div>
-      <div class="modal-section-title" style="margin-top: 10px;">Add New Directory</div>
+      
+      <div class="modal-section-title" style="margin-top: 14px;">Add New Monitored Directory</div>
       <div class="modal-add-form">
-        <input type="text" id="newDirInput" class="modal-input" placeholder="e.g. C:\Users\YourUser\Documents" />
-        <button class="btn-modal-add" onclick="addDirectory()">➕ Add Folder</button>
+        <input type="text" id="newDirInput" class="modal-input" placeholder="Type path or click Browse below..." />
+        <button class="btn-modal-browse" type="button" onclick="toggleFolderBrowser()">📁 Browse...</button>
+        <button class="btn-modal-add" type="button" onclick="addDirectory()">➕ Add Folder</button>
       </div>
+
+      <!-- Interactive Folder Browser Drawer / Panel -->
+      <div id="browserPanel" class="browser-panel" style="display: none;">
+        <div class="browser-header">
+          <span class="browser-title">📂 Folder Browser</span>
+          <button class="btn-browser-nav" id="browserUpBtn" type="button" onclick="navigateBrowserUp()" title="Go to parent directory">⬆️ Up</button>
+        </div>
+        <div class="browser-current-path mono" id="browserCurrentPath">Select a drive or quick folder</div>
+        
+        <!-- Quick Picks: Drives & User Folders -->
+        <div class="browser-quick-bar" id="browserQuickBar"></div>
+
+        <!-- Subfolders List -->
+        <div class="browser-subfolder-list" id="browserSubfolders"></div>
+
+        <div class="browser-footer">
+          <button class="btn-use-folder" id="btnUseFolder" type="button" onclick="selectCurrentBrowserFolder()">✓ Use This Folder</button>
+        </div>
+      </div>
+
       <div class="modal-feedback" id="dirsFeedback"></div>
     </div>
     <div class="modal-footer">

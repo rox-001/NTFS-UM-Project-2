@@ -8,6 +8,7 @@ logs/*.log
 reports/*.txt
 data/*.db
 data/quarantine/*
+vault/
 
 # Packaging & compiler artifacts
 build/

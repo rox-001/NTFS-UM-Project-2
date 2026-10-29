@@ -113,9 +113,9 @@ def api_get_directories():
 def api_add_directory():
     """Add and schedule a new monitored directory dynamically."""
     data = request.get_json(force=True, silent=True) or {}
-    path = data.get("path", "").strip()
+    path = (data.get("path") or data.get("directory") or "").strip()
     if not path or not os.path.isdir(path):
-        return jsonify({"success": False, "error": "Invalid or non-existent directory path."}), 400
+        return jsonify({"success": False, "error": f"Invalid or non-existent directory path: '{path}'"}), 400
 
     monitor = get_active_monitor()
     if monitor:
@@ -133,7 +133,7 @@ def api_add_directory():
 def api_remove_directory():
     """Remove and unschedule a monitored directory."""
     data = request.get_json(force=True, silent=True) or {}
-    path = data.get("path", "").strip()
+    path = (data.get("path") or data.get("directory") or "").strip()
     if not path:
         return jsonify({"success": False, "error": "Missing directory path."}), 400
 
@@ -157,29 +157,30 @@ def api_browse_directory():
         # Return common user roots and drive letters
         import string
         common = [
-            os.path.expanduser("~/Desktop"),
-            os.path.expanduser("~/Documents"),
-            os.path.expanduser("~/Downloads"),
+            os.path.normpath(os.path.expanduser("~/Desktop")),
+            os.path.normpath(os.path.expanduser("~/Documents")),
+            os.path.normpath(os.path.expanduser("~/Downloads")),
         ]
         if sys.platform == "win32":
             import ctypes
             bitmask = ctypes.windll.kernel32.GetLogicalDrives()
             drives = [f"{letter}:\\" for i, letter in enumerate(string.ascii_uppercase) if bitmask & (1 << i)]
-            return jsonify({"parent": "", "folders": [p for p in common if os.path.isdir(p)], "drives": drives})
-        return jsonify({"parent": "", "folders": [p for p in common if os.path.isdir(p)]})
+            return jsonify({"current": "", "parent": "", "folders": [p for p in common if os.path.isdir(p)], "drives": drives})
+        return jsonify({"current": "", "parent": "", "folders": [p for p in common if os.path.isdir(p)], "drives": []})
 
+    target = os.path.normpath(target)
     if not os.path.isdir(target):
-        return jsonify({"error": "Path is not a valid directory"}), 400
+        return jsonify({"error": f"Path is not a valid directory: '{target}'"}), 400
 
     try:
         subfolders = []
         for name in os.listdir(target):
             full = os.path.join(target, name)
             if os.path.isdir(full) and not name.startswith("$") and not name.startswith("."):
-                subfolders.append(full)
+                subfolders.append(os.path.normpath(full))
         subfolders.sort()
-        parent = os.path.dirname(os.path.normpath(target))
-        return jsonify({"current": target, "parent": parent, "folders": subfolders[:100]})
+        parent = os.path.dirname(target) if os.path.dirname(target) != target else ""
+        return jsonify({"current": target, "parent": parent, "folders": subfolders[:100], "drives": []})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -190,12 +191,14 @@ def api_browse_directory():
 def api_action_quarantine():
     """Quarantine a flagged file into the encrypted vault."""
     data = request.get_json(force=True, silent=True) or {}
-    source = data.get("source", "").strip()
+    source = (data.get("source") or data.get("file_path") or data.get("path") or "").strip()
     reason = data.get("reason", "SOC Operator Manual Action")
     if not source:
         return jsonify({"success": False, "error": "Missing file source path"}), 400
 
     res = db.quarantine_file(source, reason)
+    if res.get("success"):
+        res["quarantine_vault_path"] = res.get("quarantined_path")
     return jsonify(res)
 
 
@@ -215,8 +218,8 @@ def api_action_terminate():
 def api_action_allowlist():
     """Add a file path, extension, or hash to the SOC allowlist."""
     data = request.get_json(force=True, silent=True) or {}
-    entry = data.get("entry", "").strip()
-    entry_type = data.get("type", "path")
+    entry = (data.get("entry") or data.get("path") or "").strip()
+    entry_type = data.get("entry_type") or data.get("type") or "path"
     reason = data.get("reason", "Operator Allowed")
     if not entry:
         return jsonify({"success": False, "error": "Missing entry value"}), 400
